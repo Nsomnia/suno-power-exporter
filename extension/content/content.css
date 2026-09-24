@@ -1,0 +1,8 @@
+/* content/content.css — inline button + dock overrides (minimal) */
+.sp-inline-dl-btn:hover {
+  background: #a78bfa !important;
+  color: #0d0221 !important;
+}
+.sp-btn-host {
+  pointer-events: auto;
+}

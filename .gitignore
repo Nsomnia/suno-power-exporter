@@ -1,0 +1,23 @@
+# Local/private research artifacts
+scratchpad/
+*.har
+*.zip
+*.requestly*
+*.jsonl
+*.sqlite
+*.sqlite3
+
+# Secrets and local configuration
+.env
+.env.*
+*.pem
+*.key
+
+# Tooling and OS noise
+node_modules/
+.DS_Store
+Thumbs.db
+
+# Build output
+/dist/
+/build/

@@ -1,0 +1,58 @@
+{
+  "manifest_version": 3,
+  "name": "Suno Power Exporter",
+  "version": "1.0.0",
+  "description": "Export your Suno library to local files with advanced controls, metadata, and per-track downloads.",
+  "default_locale": "en",
+  "permissions": [
+    "storage",
+    "downloads",
+    "tabs",
+    "webRequest",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "https://suno.com/*",
+    "https://*.suno.com/*",
+    "https://*.suno.ai/*",
+    "https://clerk.suno.com/*",
+    "https://auth.suno.com/*",
+    "https://studio-api.prod.suno.com/*",
+    "https://studio-api-prod.suno.com/*",
+    "https://cdn1.suno.ai/*",
+    "https://cdn2.suno.ai/*",
+    "https://d2lwuy8qc234o3.cloudfront.net/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Suno Power Exporter",
+    "default_icon": {
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://suno.com/*", "https://*.suno.com/*"],
+      "js": ["content/content.js"],
+      "css": ["content/content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["icons/icon128.png"],
+      "matches": ["https://suno.com/*", "https://*.suno.com/*"]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+  }
+}
