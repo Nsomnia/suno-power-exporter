@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>Suno Master Utility — Settings</title>
+<link rel="stylesheet" href="options.css">
+</head>
+<body>
+
+<a class="skip" href="#sm-main">Skip to settings</a>
+
+<header class="sm-pagehead">
+  <h1>Suno Master Utility <span class="sm-ver" id="sm-version"></span></h1>
+  <p class="sm-lede">
+    Every control below maps to a setting the background worker actually reads.
+    Values are saved when you press Save; nothing is applied optimistically.
+  </p>
+  <p id="sm-status" class="sm-status" role="status" aria-live="polite">Loading settings&hellip;</p>
+</header>
+
+<main id="sm-main">
+
+  <!-- ============================================================ SYNC -->
+  <section class="sm-card" aria-labelledby="sm-h-sync">
+    <h2 class="sm-h2" id="sm-h-sync">Library sync</h2>
+    <p class="sm-note">
+      A sync crawls your Suno feed and writes every clip it finds into a local
+      index. Nothing is downloaded; this only builds the list you filter over.
+    </p>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Sync behaviour</legend>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-sync-max-pages">Max pages per sync</label>
+        <input class="sm-num" id="opt-sync-max-pages" type="number" min="1" max="2000" step="1"
+               aria-describedby="opt-sync-max-pages-h">
+        <p class="sm-hint" id="opt-sync-max-pages-h">
+          Hard cap on feed pages walked in one run (1&ndash;2000). Reaching the cap makes the crawl
+          <strong>truncated</strong>: the library on disk is then INCOMPLETE and every surface says so.
+          Raise it if clips are missing; lower it if a sync takes too long.
+        </p>
+      </div>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-disliked-mode">Downvoted (disliked) clips</label>
+        <select class="sm-sel" id="opt-disliked-mode" aria-describedby="opt-disliked-mode-h">
+          <option value="include">Ignore &mdash; one pass</option>
+          <option value="exclude">Assume unlisted clips are dislikes (one pass)</option>
+          <option value="both">Two passes &mdash; exact include/exclude</option>
+        </select>
+        <p class="sm-hint" id="opt-disliked-mode-h">
+          Suno has <strong>no per-clip dislike field</strong>. A dislike is only known by diffing the
+          feed fetched with dislikes hidden against the feed fetched with them shown. So the honest
+          filter costs two crawls: <strong>both</strong> pages the feed twice and roughly doubles sync
+          time, and that is the only mode that gives you a true include/exclude-downvoted filter.
+          <strong>exclude</strong> guesses that anything not in the shown feed is a dislike (fast, wrong
+          for clips deleted or hidden for other reasons). <strong>include</strong> treats every crawled
+          clip as a keeper (fast, keeps dislikes).
+        </p>
+      </div>
+
+      <div class="sm-row sm-row-inline">
+        <input class="sm-chk" id="opt-auto-sync" type="checkbox" aria-describedby="opt-auto-sync-h">
+        <label class="sm-lbl sm-lbl-inline" for="opt-auto-sync">Sync automatically on a timer</label>
+      </div>
+      <p class="sm-hint sm-hint-indent" id="opt-auto-sync-h">
+        Off by default. When on, the worker keeps a periodic alarm and re-runs a resumable crawl without
+        deleting anything already indexed. The first auto-sync after a long gap still walks every page.
+      </p>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-sync-interval">Auto-sync interval (minutes)</label>
+        <input class="sm-num" id="opt-sync-interval" type="number" min="5" max="1440" step="5"
+               aria-describedby="opt-sync-interval-h">
+        <p class="sm-hint" id="opt-sync-interval-h">
+          5&ndash;1440. Only used when auto-sync is on. Chrome enforces a minimum alarm period, so a very
+          short interval is rounded up in practice.
+        </p>
+      </div>
+    </fieldset>
+  </section>
+
+  <!-- ========================================================= DOWNLOAD -->
+  <section class="sm-card" aria-labelledby="sm-h-dl">
+    <h2 class="sm-h2" id="sm-h-dl">Download</h2>
+    <p class="sm-note">
+      Suno meters <strong>downloads</strong>, not credits: free 0 / pro 20 / premier 60 per billing
+      period, resetting on the billing date, with no carryover. <strong>One song costs one download
+      whatever the format you ask for.</strong>
+    </p>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Format</legend>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-variant">Requested format</label>
+        <select class="sm-sel" id="opt-variant" aria-describedby="opt-variant-h"></select>
+        <p class="sm-hint" id="opt-variant-h">
+          Passed straight through as the download route's <code>?format=</code> parameter. The legal
+          values of that enum are undocumented, so which of these actually return audio is something
+          the extension learns from use rather than knows up front &mdash; a rung that fails simply falls
+          through to the next one in the ladder.
+        </p>
+      </div>
+    </fieldset>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Source ladder <span class="sm-legend-sub">order matters &mdash; the first rung that can deliver the clip wins</span></legend>
+
+      <p class="sm-warn" role="note">
+        <strong>Cost classes.</strong> <span class="pill pill-free">UNMETERED</span>
+        <code>progressive</code> and <code>mango-drm</code> read Suno's own media URLs and never touch the
+        download meter. <span class="pill pill-metered">METERED</span>
+        <code>studio</code>, <code>download-route</code>, <code>wav-official</code> and <code>zip</code>
+        each consume one of your monthly downloads. Keeping every metered rung <em>below</em> the unmetered
+        ones is the only thing that guarantees a batch spends zero downloads, because when a rung fails for
+        a clip the driver falls through to the next one in this order.
+      </p>
+      <p class="sm-warn sm-warn-2" role="note">
+        <strong>Not a bypass.</strong> An old exploit in which the Studio route served files without
+        counting them was closed server-side on <strong>2026-09-09</strong>. The METERED labels above are
+        the observed contract, not a workaround.
+      </p>
+
+      <h3 class="sm-h3" id="opt-ladder-h">Enabled rungs, in order</h3>
+      <ol class="sm-ladder" id="opt-ladder" aria-labelledby="opt-ladder-h"></ol>
+      <p class="sm-empty" id="opt-ladder-empty" hidden>
+        The ladder is empty. No batch can run until at least one rung is added &mdash; the worker refuses
+        to start rather than guessing.
+      </p>
+
+      <h3 class="sm-h3" id="opt-pool-h">Available rungs</h3>
+      <ul class="sm-pool" id="opt-pool" aria-labelledby="opt-pool-h"></ul>
+    </fieldset>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Mid-batch quota guard</legend>
+
+      <p class="sm-note">
+        The allowance is read once before a batch is planned and then again
+        <em>during</em> it. Without the re-check, a plan built on a stale reading
+        used to run on until every remaining clip failed one by one on the metered
+        rungs &mdash; a healthy badge and an opaque failure. These two numbers are
+        the guard that stops the batch cleanly instead.
+      </p>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-quota-reserve">Stop when downloads remaining drops to</label>
+        <input class="sm-num" id="opt-quota-reserve" type="number" min="0" max="10000" step="1"
+               aria-describedby="opt-quota-reserve-h">
+        <p class="sm-hint" id="opt-quota-reserve-h">
+          0&ndash;10000. The floor the guard stops <strong>at</strong>: once a re-read reports
+          <code>remaining &le; this</code>, the batch halts cleanly with a warning instead of
+          failing clip by clip. <strong>0 means stop exactly at zero</strong> &mdash; the batch ends
+          the moment the meter empties, having spent nothing it did not have to. Leaving headroom
+          costs you that many downloads per period but buys a hard guarantee that a batch can never
+          overrun the allowance between two re-reads.
+        </p>
+      </div>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-quota-check-every">Re-check the allowance every N metered downloads</label>
+        <input class="sm-num" id="opt-quota-check-every" type="number" min="1" max="100" step="1"
+               aria-describedby="opt-quota-check-every-h">
+        <p class="sm-hint" id="opt-quota-check-every-h">
+          1&ndash;100. How often the meter is re-read, counted in
+          <strong>successful metered</strong> downloads. Unmetered rungs never consume the
+          allowance, so they never trigger a check: a batch served entirely by
+          <code>progressive</code> / <code>mango-drm</code> spends <strong>zero</strong> extra
+          requests. A higher N is cheaper but notices exhaustion later, so a batch can overshoot
+          your reserve by up to N&minus;1 downloads before the guard fires. The default of 5 is
+          the compromise; the pre-batch preflight reads the meter regardless of this value.
+        </p>
+      </div>
+
+      <p class="sm-hint">
+        A re-read that cannot be answered is treated as <em>unknown</em>, never as zero: a failed
+        quota fetch leaves the batch running rather than stopping it on a guess. A dry run polls
+        nothing and can never be stopped by this guard.
+      </p>
+    </fieldset>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Cost and safety</legend>
+
+      <div class="sm-row sm-row-inline">
+        <input class="sm-chk" id="opt-metered-extras" type="checkbox" aria-describedby="opt-metered-extras-h">
+        <label class="sm-lbl sm-lbl-inline" for="opt-metered-extras">Allow metered extras</label>
+      </div>
+      <p class="sm-hint sm-hint-indent" id="opt-metered-extras-h">
+        Off by default. Required before the <code>wav-official</code> and <code>zip</code> rungs can be
+        added at all &mdash; both are metered, and both are opt-in rather than merely ordered. With this
+        off, the worker silently drops them from the ladder rather than spending your downloads.
+      </p>
+
+      <div class="sm-row sm-row-inline">
+        <input class="sm-chk" id="opt-overwrite" type="checkbox" aria-describedby="opt-overwrite-h">
+        <label class="sm-lbl sm-lbl-inline" for="opt-overwrite">Overwrite existing files</label>
+      </div>
+      <p class="sm-hint sm-hint-indent" id="opt-overwrite-h">
+        Off by default: a clip already recorded as downloaded for this format is skipped, which is how a
+        re-run avoids burning quota on files you already have. Turn this on only when you deliberately
+        want replacements; every re-download spends quota again.
+      </p>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-dataurl">In-line save threshold (bytes)</label>
+        <input class="sm-num" id="opt-dataurl" type="number" min="65536" max="67108864" step="65536"
+               aria-describedby="opt-dataurl-h">
+        <p class="sm-hint" id="opt-dataurl-h">
+          64&nbsp;KiB&ndash;64&nbsp;MiB. Below this a file is saved through a
+          <code>data:</code> URL; above it the worker asks the offscreen page to mint a blob URL, which is
+          far cheaper for large WAVs. The default (24&nbsp;MiB) is a good balance; lowering it wastes
+          memory on big files.
+        </p>
+      </div>
+    </fieldset>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Pacing and retries</legend>
+
+      <div class="sm-grid">
+        <div>
+          <label class="sm-lbl" for="opt-concurrency">Concurrent downloads</label>
+          <input class="sm-num" id="opt-concurrency" type="number" min="1" max="8" step="1">
+          <p class="sm-hint">1&ndash;8. Higher is faster and more likely to be rate-limited.</p>
+        </div>
+        <div>
+          <label class="sm-lbl" for="opt-rate">Requests per second</label>
+          <input class="sm-num" id="opt-rate" type="number" min="0.2" max="20" step="0.2">
+          <p class="sm-hint">0.2&ndash;20, shared by every network call the extension makes.</p>
+        </div>
+        <div>
+          <label class="sm-lbl" for="opt-retries">Retry attempts</label>
+          <input class="sm-num" id="opt-retries" type="number" min="0" max="5" step="1">
+          <p class="sm-hint">
+            0&ndash;5, per clip, <em>after</em> the first try. Retries are for transient failures only: a
+            403 entitlement wall and an explicit refusal are never retried.
+          </p>
+        </div>
+      </div>
+
+      <div class="sm-row sm-row-inline">
+        <input class="sm-chk" id="opt-jitter" type="checkbox" aria-describedby="opt-jitter-h">
+        <label class="sm-lbl sm-lbl-inline" for="opt-jitter">Randomise the request spacing (jitter)</label>
+      </div>
+      <p class="sm-hint sm-hint-indent" id="opt-jitter-h">
+        On by default. Spreads the configured rate randomly instead of firing at a perfectly regular
+        interval, which is the difference between looking like a browser tab and looking like a script.
+      </p>
+    </fieldset>
+  </section>
+
+  <!-- ========================================================== NAMING -->
+  <section class="sm-card" aria-labelledby="sm-h-name">
+    <h2 class="sm-h2" id="sm-h-name">Naming and folders</h2>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Filename template</legend>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-template">Template</label>
+        <input class="sm-text sm-text-wide" id="opt-template" type="text" maxlength="400" spellcheck="false"
+               autocomplete="off" aria-describedby="opt-template-h">
+        <p class="sm-hint" id="opt-template-h">
+          A clip title is attacker-influenced text that ends up on your filesystem, so the result is
+          sanitised: control characters and bidi overrides are stripped, <code>\ / : * ? " &lt; &gt; |</code>
+          become <code>_</code>, runs of dots collapse so <code>..</code> can never survive, leading and
+          trailing dots and spaces are trimmed, Windows device names are prefixed, and the basename is
+          capped at 180 characters.
+        </p>
+        <p class="sm-hint sm-hint-warn">
+          Use <code>/</code> to create folders. A leading <code>/</code> is rejected &mdash; the path is
+          always relative to your downloads folder. A <code>..</code> segment cannot escape it.
+        </p>
+        <p class="sm-hint sm-hint-warn">
+          <strong>The extension is appended automatically</strong> if you leave <code>{ext}</code> out, so
+          <code>{title}_{clipIdShort}</code> still produces <code>Title_a1b2c3d4.m4a</code>. Keeping
+          <code>{ext}</code> in the template makes the intent obvious; an unknown token becomes
+          <code>_</code> rather than literal braces.
+        </p>
+      </div>
+
+      <div class="sm-preview" aria-live="polite">
+        <div class="sm-preview-head">
+          <h3 class="sm-h3">Live preview</h3>
+          <span class="sm-preview-src" id="opt-preview-src">no example clip loaded</span>
+        </div>
+        <p class="sm-preview-path" id="opt-preview-path">&mdash;</p>
+        <ul class="sm-tokens" id="opt-tokens" aria-label="Template token cheatsheet"></ul>
+      </div>
+    </fieldset>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Folder depth</legend>
+      <div class="sm-grid">
+        <div>
+          <label class="sm-lbl" for="opt-folder-depth">Folders to keep</label>
+          <input class="sm-num" id="opt-folder-depth" type="number" min="0" max="4" step="1" aria-describedby="opt-folder-depth-h">
+          <p class="sm-hint" id="opt-folder-depth-h">0 puts every file straight in the downloads folder.</p>
+        </div>
+        <div>
+          <label class="sm-lbl" for="opt-max-folder-depth">Hard ceiling</label>
+          <input class="sm-num" id="opt-max-folder-depth" type="number" min="0" max="4" step="1" aria-describedby="opt-max-folder-depth-h">
+          <p class="sm-hint" id="opt-max-folder-depth-h">Caps the template itself. &ldquo;Folders to keep&rdquo; can never exceed this.</p>
+        </div>
+      </div>
+    </fieldset>
+  </section>
+
+  <!-- ============================================================ TAGS -->
+  <section class="sm-card" aria-labelledby="sm-h-tags">
+    <h2 class="sm-h2" id="sm-h-tags">Tags and sidecars</h2>
+    <p class="sm-note">
+      <strong>MP3</strong> gets an ID3v2.3 tag (<code>TIT2</code> title, <code>TPE1</code> artist,
+      <code>TALB</code> album, <code>TCON</code> genre, <code>TDRC</code> year, <code>TBPM</code> tempo,
+      <code>COMM</code> provenance comment, <code>USLT</code> lyrics, <code>APIC</code> artwork).
+      <strong>M4A</strong> gets iTunes atoms (<code>&copy;nam</code>, <code>&copy;ART</code>,
+      <code>&copy;alb</code>, <code>&copy;gen</code>, <code>&copy;lyr</code>, <code>covr</code>) written by
+      hand, because there is no MP4 tag library here. <strong>WAV</strong> gets a RIFF
+      <code>LIST</code>/<code>INFO</code> chunk <em>and</em> a RIFF chunk literally named
+      <code>id3&hairsp;</code>, so the same metadata is readable by DAWs that understand either.
+    </p>
+    <p class="sm-warn" role="note">
+      <strong>Artwork roughly doubles the file size.</strong> A 4&nbsp;MB track becomes an 8&nbsp;MB file.
+      Turn <em>Embed artwork</em> off and fetch covers yourself if size matters more than having the
+      image travel with the audio.
+    </p>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Embedded tags</legend>
+      <div class="sm-row sm-row-inline"><input class="sm-chk" id="opt-tag-embed" type="checkbox" aria-describedby="opt-tag-embed-h"><label class="sm-lbl sm-lbl-inline" for="opt-tag-embed">Embed tags in the audio file</label></div>
+      <p class="sm-hint sm-hint-indent" id="opt-tag-embed-h">Master switch. Off means every file is written untagged, whatever the individual options below say.</p>
+
+      <div class="sm-row sm-row-inline"><input class="sm-chk" id="opt-tag-lyrics" type="checkbox" aria-describedby="opt-tag-lyrics-h"><label class="sm-lbl sm-lbl-inline" for="opt-tag-lyrics">Lyrics in the tag</label></div>
+      <p class="sm-hint sm-hint-indent" id="opt-tag-lyrics-h"><code>USLT</code> on MP3, <code>&copy;lyr</code> on M4A. Raw LRC timestamps are stripped, because unsynchronised lyrics carrying timestamps is just noise.</p>
+
+      <div class="sm-row sm-row-inline"><input class="sm-chk" id="opt-tag-artwork" type="checkbox" aria-describedby="opt-tag-artwork-h"><label class="sm-lbl sm-lbl-inline" for="opt-tag-artwork">Embed artwork (cover art)</label></div>
+      <p class="sm-hint sm-hint-indent" id="opt-tag-artwork-h"><code>APIC</code> / <code>covr</code>. The full-size image is fetched per clip, and the file roughly doubles in size. A cover that cannot be fetched degrades to "no artwork", never to a failed download.</p>
+
+      <div class="sm-row sm-row-inline"><input class="sm-chk" id="opt-tag-bpm" type="checkbox" aria-describedby="opt-tag-bpm-h"><label class="sm-lbl sm-lbl-inline" for="opt-tag-bpm">Write a BPM value</label></div>
+      <p class="sm-hint sm-hint-indent" id="opt-tag-bpm-h"><code>TBPM</code> / <code>tmpo</code>. Off by default because it costs: when a clip carries no tempo the worker measures one from the decoded audio, which adds real time per file. A missing BPM is never invented.</p>
+
+      <div class="sm-row sm-row-inline"><input class="sm-chk" id="opt-tag-comment" type="checkbox" aria-describedby="opt-tag-comment-h"><label class="sm-lbl sm-lbl-inline" for="opt-tag-comment">Write a provenance comment</label></div>
+      <p class="sm-hint sm-hint-indent" id="opt-tag-comment-h"><code>COMM</code> / <code>desc</code>. Records the model version, the clip id and the prompt and style text, so a file can be traced back to what produced it.</p>
+    </fieldset>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Sidecar files written next to the audio</legend>
+      <div class="sm-row sm-row-inline"><input class="sm-chk" id="opt-tag-lrc" type="checkbox" aria-describedby="opt-tag-lrc-h"><label class="sm-lbl sm-lbl-inline" for="opt-tag-lrc">Write <code>.lrc</code></label></div>
+      <p class="sm-hint sm-hint-indent" id="opt-tag-lrc-h">Timed lyrics. Only written when the clip actually has lyrics.</p>
+
+      <div class="sm-row sm-row-inline"><input class="sm-chk" id="opt-tag-json" type="checkbox" aria-describedby="opt-tag-json-h"><label class="sm-lbl sm-lbl-inline" for="opt-tag-json">Write <code>.json</code> metadata</label></div>
+      <p class="sm-hint sm-hint-indent" id="opt-tag-json-h">A machine-readable record of the clip. It contains no session token or key material, but it does contain the prompt text.</p>
+
+      <p class="sm-hint">
+        A plain <code>.txt</code> lyric file is always written alongside when the clip has lyrics; it is not
+        optional. A sidecar is never counted as a song and never spends a download.
+      </p>
+    </fieldset>
+  </section>
+
+  <!-- ========================================================== ARTIST -->
+  <section class="sm-card" aria-labelledby="sm-h-artist">
+    <h2 class="sm-h2" id="sm-h-artist">Artist and album</h2>
+    <p class="sm-note">
+      On a Suno clip, <code>display_name</code>, <code>handle</code> and <code>user_id</code> are the
+      <strong>clip owner's own account identity</strong> &mdash; that is, you. They are not a third-party
+      artist credit and they are not a collaborator. A previous build wrote them into
+      <code>TPE1</code>/<code>&copy;ART</code>, which labelled every exported song with your own profile
+      name. So the neutral default is almost always the correct one.
+    </p>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Policy</legend>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-artist-policy">Artist tag source</label>
+        <select class="sm-sel" id="opt-artist-policy" aria-describedby="opt-artist-policy-h">
+          <option value="neutral">Neutral name (recommended)</option>
+          <option value="clip-owner">The clip owner&rsquo;s display name</option>
+        </select>
+        <p class="sm-hint" id="opt-artist-policy-h">
+          <strong>Neutral</strong> writes the text below into every artist tag. <strong>Clip owner</strong>
+          writes <code>display_name</code>, i.e. your own Suno profile name &mdash; choose it only if you
+          are deliberately stamping your profile onto exports.
+        </p>
+      </div>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-neutral-artist">Neutral artist name</label>
+        <input class="sm-text" id="opt-neutral-artist" type="text" maxlength="120" autocomplete="off" aria-describedby="opt-neutral-artist-h">
+        <p class="sm-hint" id="opt-neutral-artist-h">Up to 120 characters. Also used for sidecar credits when the policy is neutral.</p>
+      </div>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-album">Album name</label>
+        <input class="sm-text" id="opt-album" type="text" maxlength="120" autocomplete="off" aria-describedby="opt-album-h">
+        <p class="sm-hint" id="opt-album-h"><code>TALB</code> / <code>&copy;alb</code>, up to 120 characters.</p>
+      </div>
+    </fieldset>
+  </section>
+
+  <!-- =========================================================== AUDIO -->
+  <section class="sm-card" aria-labelledby="sm-h-audio">
+    <h2 class="sm-h2" id="sm-h-audio">Audio conversion</h2>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Transcode</legend>
+
+      <p class="sm-note" role="note">
+        <strong>Every conversion here runs on this machine.</strong> Any choice but Nothing is a real
+        local render: the delivered bytes are decoded to PCM and written back out in the format you
+        pick, so it costs wall-clock time and peak memory of roughly one decode plus one encode
+        <em>per track</em>. It spends <strong>no download quota</strong> &mdash; transcoding happens
+        after the fetch, so the meter only ever sees the rung that delivered the clip, and with the
+        unmetered <code>progressive</code> / <code>mango-drm</code> rungs serving it, a transcode
+        costs none of your monthly allowance. What it buys is a file in a container you picked on
+        purpose: M4A and Opus already are one, WAV is the safe interchange format, and MP3 and Ogg
+        Vorbis are there for players that take nothing else. Both encoders are vendored under
+        <code>vendor/</code> rather than pulled from a CDN, because MV3&rsquo;s
+        <code>script-src 'self'</code> CSP forbids remote script outright.
+      </p>
+
+      <div class="sm-optset" role="radiogroup" aria-labelledby="sm-h-transcode">
+        <p class="sm-h3" id="sm-h-transcode">Convert the downloaded audio to</p>
+
+        <div class="sm-opt">
+          <input class="sm-radio" type="radio" name="opt-transcode" id="opt-transcode-none" value="none" aria-describedby="opt-transcode-h">
+          <label class="sm-lbl sm-lbl-inline" for="opt-transcode-none">Nothing &mdash; save the bytes as delivered</label>
+        </div>
+        <div class="sm-opt">
+          <input class="sm-radio" type="radio" name="opt-transcode" id="opt-transcode-wav" value="wav" aria-describedby="opt-transcode-h">
+          <label class="sm-lbl sm-lbl-inline" for="opt-transcode-wav">WAV (decode, resample, write a real header)</label>
+        </div>
+        <div class="sm-opt">
+          <input class="sm-radio" type="radio" name="opt-transcode" id="opt-transcode-mp3" value="mp3" aria-describedby="opt-transcode-mp3-h">
+          <label class="sm-lbl sm-lbl-inline" for="opt-transcode-mp3">MP3 (decode, then re-encode at the bitrate below)</label>
+        </div>
+        <div class="sm-opt">
+          <input class="sm-radio" type="radio" name="opt-transcode" id="opt-transcode-ogg" value="ogg" aria-describedby="opt-transcode-ogg-h">
+          <label class="sm-lbl sm-lbl-inline" for="opt-transcode-ogg">Ogg Vorbis (decode, then re-encode at the quality below)</label>
+        </div>
+      </div>
+
+      <p class="sm-note sm-note-blocked" id="opt-transcode-h" role="note">
+        Nothing: the file is written exactly as the ladder delivered it, and nothing is decoded at
+        all. M4A and Opus never need a transcode, because the source stream already <em>is</em> one
+        &mdash; so for the default variant this is both the cheapest and the most faithful choice.
+      </p>
+      <p class="sm-note sm-note-blocked" id="opt-transcode-wav-h" role="note">
+        WAV: the bytes are decoded, resampled to the rate below and written with a real RIFF header by
+        the offscreen page. No codec loss and nothing is thrown away, but the file gets large: an
+        uncompressed 48&nbsp;kHz stereo track runs to roughly 11&nbsp;MB per minute.
+      </p>
+      <p class="sm-note sm-note-blocked" id="opt-transcode-mp3-h" hidden role="note">
+        MP3: a real encoder runs locally in the offscreen page, vendored as
+        <code>vendor/lame.all.js</code> (lamejs 1.2.1, LGPL-3.0). Nothing is uploaded and no server is
+        contacted &mdash; your audio never leaves the machine. The track is decoded to PCM and
+        re-encoded, so the result is lossy and smaller than the source; it cannot put back anything
+        the decode discarded, which is why the bitrate below is the only size knob here.
+      </p>
+      <p class="sm-note sm-note-blocked" id="opt-transcode-ogg-h" hidden role="note">
+        Ogg Vorbis: encoded locally by <code>vendor/OggVorbisEncoder.js</code>, on your own machine,
+        with no upload and no external service &mdash; the same privacy property as MP3, and the same
+        cost: one decode plus one re-encode per track, lossy. Vorbis generally reaches a given
+        perceived quality at a smaller file than MP3 does, but far fewer players and DAWs accept it,
+        so it is not the safer default. Pick it because something downstream needs Vorbis.
+      </p>
+
+      <p class="sm-warn" id="opt-transcode-error" role="alert" hidden></p>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-wav-rate">WAV output sample rate (Hz)</label>
+        <select class="sm-sel" id="opt-wav-rate" aria-describedby="opt-wav-rate-h">
+          <option value="22050">22 050</option>
+          <option value="32000">32 000</option>
+          <option value="44100">44 100</option>
+          <option value="48000">48 000</option>
+          <option value="88200">88 200</option>
+          <option value="96000">96 000</option>
+        </select>
+        <p class="sm-hint" id="opt-wav-rate-h">
+          Used <strong>only</strong> when the transcode above is set to WAV; it stays disabled for every
+          other choice. The output rate is whatever this field requests &mdash; that is the rate written
+          into the RIFF header, because the offscreen renderer actually resamples to it. MP3 and Ogg Vorbis
+          get no rate of their own: they are encoded at the offscreen page&rsquo;s decode rate of
+          48&nbsp;kHz, so a 44.1&nbsp;kHz source is resampled on the way in and there is no control
+          over it here.
+        </p>
+        <p class="sm-hint sm-hint-warn">
+          <strong>No hidden upsampling.</strong> A previous version of this page advertised a
+          &ldquo;WAV 48&nbsp;kHz&rdquo; format option while nothing resampled at all. Nothing here invents
+          detail either: asking for 48&nbsp;kHz from a 44.1&nbsp;kHz source produces a 48&nbsp;kHz file by
+          interpolation, not 48&nbsp;kHz of audio. Requesting 96 or 192&nbsp;kHz enlarges the file and the
+          header without adding information.
+        </p>
+      </div>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-mp3-bitrate">MP3 bitrate (kbps)</label>
+        <select class="sm-sel" id="opt-mp3-bitrate" aria-describedby="opt-mp3-bitrate-h"></select>
+        <p class="sm-hint" id="opt-mp3-bitrate-h">
+          Written as <code>mp3Bitrate</code> and read only while the transcode above is MP3; it stays
+          disabled for every other choice, and the value you pick is kept while it is disabled, so
+          switching MP3 &rarr; Ogg Vorbis &rarr; MP3 does not lose it. These six are the six bitrates
+          LAME accepts at full quality &mdash; ask it for anything else and it substitutes its own
+          without telling you. A three-minute track comes to roughly <strong>2.9&nbsp;MB at
+          128</strong>, <strong>4.3&nbsp;MB at 192</strong> and <strong>7.2&nbsp;MB at 320</strong>,
+          before tags and artwork. Higher is not better forever: the source was already decoded once,
+          so a higher bitrate only preserves more of whatever survived that decode.
+        </p>
+      </div>
+
+      <div class="sm-row">
+        <label class="sm-lbl" for="opt-ogg-quality">Ogg Vorbis quality</label>
+        <select class="sm-sel" id="opt-ogg-quality" aria-describedby="opt-ogg-quality-h"></select>
+        <p class="sm-hint" id="opt-ogg-quality-h">
+          Written as <code>oggQuality</code> and read only while the transcode above is Ogg Vorbis; it
+          stays disabled for every other choice, and is likewise kept across format switches. This is
+          the encoder&rsquo;s named-quality index on a 0&ndash;1 scale rather than a bitrate:
+          <strong>0.0</strong> is the smallest and fastest encode, <strong>1.0</strong> the largest
+          and slowest, and 0.0&ndash;1.0 is not a size measurement. The worker snaps anything between
+          two tenths to the nearest tenth, so every entry here is exactly what the encoder is handed
+          &mdash; which is why this is a list you pick from and not a number you can type.
+        </p>
+      </div>
+    </fieldset>
+  </section>
+
+  <!-- ======================================================== ADVANCED -->
+  <section class="sm-card" aria-labelledby="sm-h-adv">
+    <h2 class="sm-h2" id="sm-h-adv">Advanced</h2>
+
+    <fieldset class="sm-fs">
+      <legend class="sm-legend">Capture and planning</legend>
+
+      <div class="sm-row sm-row-inline">
+        <input class="sm-chk" id="opt-hls" type="checkbox" aria-describedby="opt-hls-h">
+        <label class="sm-lbl sm-lbl-inline" for="opt-hls">Allow HLS stream capture</label>
+      </div>
+      <p class="sm-blocked" id="opt-hls-h" role="note">
+        <strong>Off by default, and enabling it is a deliberate act.</strong> This option lets the page
+        collect a clip&rsquo;s stream segments, and the only way to do that on Suno&rsquo;s own player is to
+        temporarily set <code>window.MediaSource = undefined</code> so the player falls back to a plain
+        fetch. That manipulates the page, can disturb playback, and can trip abuse heuristics on
+        Suno&rsquo;s side. The content script asks for an explicit confirmation too, so both this page and
+        the page itself must agree. It is also not part of the download ladder: with it on, stream capture
+        is simply an extra path the worker will accept.
+      </p>
+
+      <div class="sm-row sm-row-inline">
+        <input class="sm-chk" id="opt-dry-run" type="checkbox" aria-describedby="opt-dry-run-h">
+        <label class="sm-lbl sm-lbl-inline" for="opt-dry-run">Dry run &mdash; plan batches without downloading</label>
+      </div>
+      <p class="sm-hint sm-hint-indent" id="opt-dry-run-h">
+        The batch is planned, quota-preflighted and recorded, and then stops. No bytes are fetched and
+        <strong>no download quota is spent</strong>. This is the safe way to find out what a filter will
+        match.
+      </p>
+
+      <div class="sm-row sm-row-inline">
+        <input class="sm-chk" id="opt-debug" type="checkbox" aria-describedby="opt-debug-h">
+        <label class="sm-lbl sm-lbl-inline" for="opt-debug">Debug logging</label>
+      </div>
+      <p class="sm-hint sm-hint-indent" id="opt-debug-h">
+        Turns on the extension&rsquo;s ring-buffered diagnostics. Useful when reporting a problem; it records
+        clip ids and request codes locally, so leave it off unless you are debugging.
+      </p>
+    </fieldset>
+  </section>
+
+  <!-- ============================================================= DATA -->
+  <section class="sm-card" aria-labelledby="sm-h-data">
+    <h2 class="sm-h2" id="sm-h-data">Backup and reset</h2>
+    <p class="sm-note">
+      An export contains your settings, the cached workspace list and the last known download balance. It
+      deliberately contains <strong>no session token and no key material</strong>, and not the diagnostics
+      log &mdash; which would carry clip ids you would not expect to leave the machine.
+    </p>
+    <div class="sm-actions">
+      <button id="opt-export" class="sm-btn" type="button" aria-label="Export settings to a JSON file">Export&hellip;</button>
+      <button id="opt-import" class="sm-btn" type="button" aria-label="Import settings from a JSON file">Import&hellip;</button>
+      <button id="opt-reset" class="sm-btn sm-danger" type="button" aria-label="Reset every setting to its default value">Reset to defaults</button>
+    </div>
+    <p class="sm-hint">
+      Reset changes settings only. Your indexed library, download history and any files already saved to
+      disk are untouched.
+    </p>
+    <input id="opt-import-file" type="file" accept="application/json,.json" hidden aria-hidden="true" tabindex="-1">
+  </section>
+
+</main>
+
+<footer class="sm-pagefoot">
+  <button id="opt-save" class="sm-btn sm-primary sm-save" type="button" aria-label="Save all settings">Save settings</button>
+  <span class="sm-savenote" id="sm-savenote" role="status" aria-live="polite"></span>
+</footer>
+
+<div id="sm-saved" class="sm-saved" role="alert" hidden></div>
+
+<script src="options.js"></script>
+</body>
+</html>

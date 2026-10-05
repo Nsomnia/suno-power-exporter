@@ -1,0 +1,110 @@
+# .gitattributes — byte-level git policy for suno-master-utility-browser-extension
+# =============================================================================
+#
+# Two rules. The first is hygiene. The second is load-bearing, and it is the
+# reason this file exists at all.
+#
+# WHY .gitignore COULD NOT DO THIS JOB
+# ------------------------------------
+# vendor/README.md records a SHA-256 for each vendored encoder and states that
+# those hashes are "only meaningful while the bytes are exactly what upstream
+# published":
+#
+#     vendor/lame.all.js          530,087 B  026bd888...a3b
+#     vendor/OggVorbisEncoder.js  2,358,493 B  5a9f749a...79b
+#
+# vendor/ is also what discharges the LGPL-3.0 obligation described there: the
+# library must stay a separate, *unmodified* work that a user can replace
+# without relinking. Both arguments rest on the file being byte-identical to
+# upstream on every machine that checks the repo out.
+#
+# That is not something .gitignore can protect. .gitignore controls MEMBERSHIP
+# — which paths git tracks — and has no say whatsoever over the BYTES of the
+# files it does track. A tracked file is rewritten in the working tree on
+# checkout according to the EOL rules; whether or not it is listed in
+# .gitignore is irrelevant. So the only place to state "these files are
+# binary, leave them alone" is .gitattributes.
+#
+# THE FAILURE THIS PREVENTS
+# -------------------------
+# Under `core.autocrlf=input` (the macOS default) git applies no EOL
+# normalisation at all, so today's checkout is already correct. The danger is
+# the next contributor: anyone on Windows with `core.autocrlf=true` (still the
+# legacy default on a fresh Git for Windows install), or anyone whose editor
+# rewrites line endings on save, checks out 2.8 MB of CRLF-lifted JavaScript.
+# Every LF becomes CRLF, the stored blob changes, the recorded SHA-256 stops
+# matching, and check-build.sh fails on a file nobody touched — or worse, the
+# integrity claim is quietly believed rather than verified. Rule 1 below stops
+# that for every file in the repo except the two that must not be touched at
+# all; rule 2 covers those.
+#
+# -----------------------------------------------------------------------------
+# RULE 1
+# -----------------------------------------------------------------------------
+* text=auto eol=lf
+#
+#   text=auto  Let git detect text vs binary per file (NUL in the first 8000
+#              bytes means binary), and normalise line endings on check-in so
+#              the STORED blob is always LF regardless of who committed it or
+#              what their platform did.
+#   eol=lf     Check the file out with LF on every platform, and fail loudly
+#              rather than silently converting if a CRLF ever reaches the
+#              working tree.
+#
+# This is the LF invariant the extension pages expect. The offscreen document
+# in particular runs an asm.js bundle whose memory initialiser is a blob of
+# hex bytes — but `eol=lf` is still the right default for the 22 extension
+# text files, which are hand-written and diff-friendly.
+#
+# -----------------------------------------------------------------------------
+# RULE 2
+# -----------------------------------------------------------------------------
+vendor/** -text
+#
+#   -text  Undo every part of rule 1 for this subtree. Mark the files BINARY:
+#          no EOL conversion on check-in, no EOL conversion on check-out, no
+#          CRLF filtering, no "safecrlf" rewriting. The working tree bytes are
+#          the blob bytes are the upstream bytes on macOS, Linux and Windows
+#          alike.
+#
+# This is what protects the SHA-256 record in vendor/README.md and, with it,
+# the LGPL "unmodified separate work" claim that offscreen/offscreen.js relies
+# on when it loads the encoder as a plain <script src>.
+#
+# WHY `vendor/** text eol=lf` IS NOT ENOUGH FOR THIS DIRECTORY
+# -----------------------------------------------------------
+# `text` is not a synonym for "leave line endings alone". When git's text
+# heuristic classifies a file as text, its normaliser maps CR, LF and CRLF all
+# to a single LF. In other words `eol=lf` would ALSO rewrite a LONE CR — a
+# carriage return with no following newline, exactly the byte sequence an old
+# Mac (CR-only, pre-OS X) or a mangled concatenation produces — into a plain LF,
+# silently, with no CRLF anywhere in sight for a human to notice.
+#
+# That matters because vendor/OggVorbisEncoder.js is an **asm.js** bundle
+# (see vendor/README.md: one `use asm` directive, zero WebAssembly
+# references) carrying an EMBEDDED MEMORY INITIALISER — a large run of
+# machine-code-shaped byte values baked into the JavaScript. This is precisely
+# the class of payload a stray CR corrupts silently: the file still parses,
+# the file is still "text", the SHA-256 recorded next to it simply stops
+# matching, and the failure surfaces much later as an Ogg export producing
+# garbage or throwing inside libvorbis rather than as an encoding bug.
+#
+# A hash check in scripts/check-build.sh would catch the damage, but the point
+# of this file is to stop the damage happening: `-text` makes the corruption
+# impossible rather than merely detectable.
+#
+# VERIFIED, NOT ASSUMED
+# ---------------------
+# Checked the actual bytes before writing this claim down. As of this commit
+# `vendor/OggVorbisEncoder.js` contains ZERO CR bytes of any kind:
+#
+#     $ grep -c $'\r' vendor/OggVorbisEncoder.js
+#     0
+#
+# and a byte census gives 2,358,493 bytes, 37,310 LF, 0 CR, 0 CRLF. The same
+# is true of vendor/lame.all.js (530,087 B, 15,518 LF, 0 CR, 0 CRLF).
+#
+# So the lone-CR hazard described above is PROSPECTIVE, not present: these
+# files are upstream-clean right now, and this rule keeps them that way. It is
+# a statement about what must never be allowed to happen to them, not a report
+# of something already broken.

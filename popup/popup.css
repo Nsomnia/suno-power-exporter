@@ -1,0 +1,402 @@
+/* ==========================================================================
+ * Suno Master Utility — popup stylesheet
+ * --------------------------------------------------------------------------
+ * Dark by default (the toolbar surface users live in), light under
+ * `prefers-color-scheme: light`. The palette is the content-script dock's
+ * (`content/content.css`): --sm-purple #8b5cf6, --sm-accent #22d3ee, --sm-ok
+ * #34d399, --sm-bad #f87171, --sm-warn #fbbf24.
+ *
+ * No rule here may rely on an inherited property the popup does not set: it is
+ * a normal extension page, so the UA defaults are all we get.
+ * ========================================================================== */
+
+:root {
+  --sm-bg: #0d101a;
+  --sm-panel: #151a28;
+  --sm-panel-2: #1b2133;
+  --sm-border: rgba(255, 255, 255, 0.14);
+  --sm-border-2: rgba(255, 255, 255, 0.26);
+  --sm-text: #eef2ff;
+  --sm-muted: #9aa4bf;
+  --sm-purple: #8b5cf6;
+  --sm-purple-2: #6366f1;
+  --sm-accent: #22d3ee;
+  --sm-ok: #34d399;
+  --sm-bad: #f87171;
+  --sm-warn: #fbbf24;
+  --sm-focus: #22d3ee;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --sm-bg: #f6f7fb;
+    --sm-panel: #ffffff;
+    --sm-panel-2: #eef0f7;
+    --sm-border: rgba(15, 20, 40, 0.16);
+    --sm-border-2: rgba(15, 20, 40, 0.34);
+    --sm-text: #16192a;
+    --sm-muted: #5b6379;
+    --sm-purple: #6d28d9;
+    --sm-purple-2: #4f46e5;
+    --sm-accent: #0e7490;
+    --sm-ok: #047857;
+    --sm-bad: #b91c1c;
+    --sm-warn: #a16207;
+    --sm-focus: #6d28d9;
+  }
+}
+
+* { box-sizing: border-box; }
+
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  width: 340px;
+  background: var(--sm-bg);
+  color: var(--sm-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+
+#sm-popup { padding: 12px; }
+
+/* --------------------------------------------------------------- header */
+.sm-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 9px;
+}
+
+.sm-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.sm-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--sm-purple);
+  box-shadow: 0 0 10px var(--sm-purple);
+  flex: none;
+}
+
+.sm-h2 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--sm-muted);
+}
+
+/* ------------------------------------------------------------- auth chip */
+.sm-chip {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin: 0 0 10px;
+  padding: 6px 9px;
+  border: 1px solid var(--sm-border);
+  border-radius: 8px;
+  background: var(--sm-panel);
+  color: var(--sm-muted);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.sm-chip.is-ok { color: var(--sm-ok); border-color: color-mix(in srgb, var(--sm-ok) 45%, transparent); }
+.sm-chip.is-bad { color: var(--sm-bad); border-color: color-mix(in srgb, var(--sm-bad) 45%, transparent); }
+.sm-chip:hover { background: var(--sm-panel-2); }
+
+/* --------------------------------------------------------------- banner */
+.sm-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 0 10px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--sm-warn);
+  background: color-mix(in srgb, var(--sm-warn) 14%, var(--sm-panel));
+  font-size: 11.5px;
+}
+.sm-banner-title { font-weight: 700; color: var(--sm-warn); }
+.sm-banner-text { color: var(--sm-text); }
+
+/* ---------------------------------------------------------------- tiles */
+.sm-tiles {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+  margin-bottom: 11px;
+}
+
+.sm-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 7px 8px;
+  border: 1px solid var(--sm-border);
+  border-radius: 8px;
+  background: var(--sm-panel);
+  min-width: 0;
+}
+
+.sm-tile-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--sm-muted);
+}
+
+.sm-tile-value {
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1.15;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sm-tile-note {
+  font-size: 10px;
+  color: var(--sm-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sm-tile-quota.is-empty { border-color: var(--sm-bad); }
+.sm-tile-quota.is-empty .sm-tile-value { color: var(--sm-bad); }
+.sm-tile-quota.is-low { border-color: var(--sm-warn); }
+.sm-tile-quota.is-low .sm-tile-value { color: var(--sm-warn); }
+
+/* -------------------------------------------------------------- progress */
+.sm-progress { margin-bottom: 10px; }
+
+.sm-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.sm-progress-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sm-progress-pct {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--sm-accent);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.sm-track {
+  height: 7px;
+  border-radius: 999px;
+  background: var(--sm-panel-2);
+  border: 1px solid var(--sm-border);
+  overflow: hidden;
+}
+
+.sm-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--sm-purple), var(--sm-purple-2));
+  transition: width 0.2s ease;
+}
+
+.sm-fill.is-done { background: var(--sm-ok); }
+
+/* Used only while a percentage cannot be computed (a sync whose page cap is not
+   yet known). A sweeping stripe says "working" without claiming a number. */
+.sm-fill.is-indeterminate {
+  width: 100% !important;
+  background-image: linear-gradient(90deg,
+    var(--sm-purple) 0 18%,
+    var(--sm-purple-2) 18% 36%,
+    var(--sm-panel-2) 36% 100%);
+  background-size: 220% 100%;
+  animation: sm-sweep 1.1s linear infinite;
+}
+
+@keyframes sm-sweep {
+  from { background-position: 0% 0; }
+  to { background-position: -220% 0; }
+}
+
+.sm-progress-detail {
+  margin: 4px 0 0;
+  font-size: 10.5px;
+  color: var(--sm-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --------------------------------------------------------------- summary */
+.sm-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 10px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--sm-border);
+  background: var(--sm-panel);
+  font-size: 11.5px;
+}
+.sm-summary.is-bad { border-color: var(--sm-bad); }
+.sm-summary-text { font-weight: 600; }
+.sm-summary-quota { color: var(--sm-muted); font-size: 10.5px; }
+
+/* --------------------------------------------------------------- actions */
+.sm-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 11px;
+}
+
+.sm-btn {
+  appearance: none;
+  border: 1px solid var(--sm-border-2);
+  background: var(--sm-panel-2);
+  color: var(--sm-text);
+  padding: 7px 9px;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 30px;
+}
+.sm-btn:hover:not(:disabled) { background: var(--sm-purple); border-color: var(--sm-purple); color: #fff; }
+.sm-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.sm-btn.sm-primary {
+  background: linear-gradient(135deg, var(--sm-purple), var(--sm-purple-2));
+  border-color: transparent;
+  color: #fff;
+}
+.sm-btn.sm-danger { border-color: color-mix(in srgb, var(--sm-bad) 55%, transparent); color: var(--sm-bad); }
+.sm-btn.sm-danger:hover:not(:disabled) { background: var(--sm-bad); border-color: var(--sm-bad); color: #fff; }
+.sm-btn.sm-ghost { background: transparent; border-color: var(--sm-border); color: var(--sm-muted); }
+.sm-btn.sm-tiny { padding: 3px 8px; min-height: 22px; font-size: 10.5px; }
+
+/* Every interactive control in the popup gets the same visible focus ring. */
+.sm-btn:focus-visible,
+.sm-chip:focus-visible,
+.sm-track:focus-visible {
+  outline: 2px solid var(--sm-focus);
+  outline-offset: 2px;
+}
+
+/* ------------------------------------------------------------------- log */
+.sm-logwrap { margin-bottom: 2px; }
+
+.sm-loghead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.sm-log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 132px;
+  overflow-y: auto;
+  border: 1px solid var(--sm-border);
+  border-radius: 8px;
+  background: var(--sm-panel);
+}
+
+.sm-log:empty::after {
+  content: "No activity yet.";
+  display: block;
+  padding: 8px;
+  font-size: 11px;
+  color: var(--sm-muted);
+}
+
+.sm-log-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 3px 8px;
+  font-size: 11px;
+  border-bottom: 1px solid var(--sm-border);
+}
+.sm-log-row:last-child { border-bottom: 0; }
+
+.sm-log-time {
+  flex: none;
+  color: var(--sm-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 10px;
+}
+
+.sm-log-msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--sm-text);
+  overflow-wrap: anywhere;
+}
+
+.sm-log-row.is-ok .sm-log-msg { color: var(--sm-ok); }
+.sm-log-row.is-bad .sm-log-msg { color: var(--sm-bad); }
+.sm-log-row.is-warn .sm-log-msg { color: var(--sm-warn); }
+.sm-log-row.is-info .sm-log-msg { color: var(--sm-muted); }
+
+/* ----------------------------------------------------------------- toast */
+.sm-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  max-width: 316px;
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--sm-border-2);
+  background: var(--sm-panel-2);
+  color: var(--sm-text);
+  font-size: 11.5px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  z-index: 40;
+}
+.sm-toast.is-ok { border-color: var(--sm-ok); }
+.sm-toast.is-bad { border-color: var(--sm-bad); color: var(--sm-bad); }
+
+@media (prefers-reduced-motion: reduce) {
+  .sm-fill { transition: none; }
+  .sm-fill.is-indeterminate { animation: none; }
+}

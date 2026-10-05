@@ -1,0 +1,92 @@
+# ---------------------------------------------------------------------------
+# Suno Master Utility — ignore rules
+# ---------------------------------------------------------------------------
+
+# macOS. Finder writes these into every directory you browse, including the
+# repo root. They encode local window geometry and are not source.
+.DS_Store
+
+# The other half of the same problem: AppleDouble sidecars (._<name>) get
+# created when this tree is copied to or checked out on a non-HFS volume. macOS
+# strips them on copy, so one that was committed comes back truncated garbage.
+._*
+
+# ---------------------------------------------------------------------------
+# scratchpad/ — NEVER COMMIT THIS.
+# ---------------------------------------------------------------------------
+# It holds unpacked copies of third-party Chrome extensions (for behavioural
+# comparison only), raw recon captures, and working notes that may quote
+# endpoint names, flag lists, or partial response bodies harvested from Suno's
+# own servers. None of it is part of this extension's build; none of it should
+# ever leave the machine. It is a research bench, not a source tree. It is also
+# ~28 MB, most of it unpacked extensions and the extension .zip files they
+# came in.
+scratchpad/
+
+# Build artefacts. There is no build step in this repo: nothing here is
+# generated, minified or bundled by us, so a zip is never an output of
+# anything. It is always a hand-made package somebody is about to share by
+# accident. (The third-party bundles in vendor/ were not produced here either —
+# they ship as source, so nothing legitimate ever needs zipping.)
+*.zip
+
+# Not currently a dependency-bearing project — there is no package.json and no
+# toolchain. Listed so that adding one cannot quietly create a committed
+# node_modules tree.
+node_modules/
+
+# ---------------------------------------------------------------------------
+# vendor/ — TRACKED ON PURPOSE. DO NOT ADD AN IGNORE RULE FOR IT.
+# ---------------------------------------------------------------------------
+# This directory holds the two encoders that MP3 and Ogg Vorbis export need,
+# and it has to be committed:
+#
+#     vendor/lame.all.js          lamejs 1.2.1                    (LGPL-3.0)
+#     vendor/OggVorbisEncoder.js  higuma/ogg-vorbis-encoder-js    (MIT + Xiph BSD)
+#
+# Three independent reasons, any one of which is decisive:
+#
+#   1. They are loaded from inside the extension package at runtime.
+#      offscreen/offscreen.js injects a <script src> for each one, resolved
+#      relative to offscreen/offscreen.html, so the bytes have to be in the
+#      extension directory. loadVendoredScript() asserts the resolved URL's
+#      protocol is chrome-extension: and refuses anything else.
+#   2. MV3 extension pages run under `script-src 'self'` — see the CSP meta
+#      tag in offscreen/offscreen.html — and the Web Store policy bans remotely
+#      hosted code outright. Fetching an encoder from a CDN is therefore not an
+#      available fallback; there is no "download it if missing" path to degrade
+#      to, and adding one would be a policy violation, not a fix.
+#   3. An untracked vendor/ fails silently and only in production. The
+#      extension still loads, the options page still offers MP3 and Ogg Vorbis,
+#      and sunoTranscode just returns ENCODER_UNAVAILABLE: the control looks
+#      live, clicks succeed, and no file appears. A fresh clone would ship that
+#      way with no error anywhere.
+#
+# That third point is the whole reason this directory is spelled out here. The
+# failure is invisible until someone tries to export audio, which is exactly
+# the kind of bug an ignore rule causes rather than prevents.
+#
+# Licence obligations point the same way — toward tracking. LGPL-3.0 §4 and the
+# MIT/Xiph-BSD terms require the licence notices to travel with the library,
+# and vendor/README.md records the pinned upstream version, commit and SHA-256
+# of both files. So these are committed as a set:
+#
+#     vendor/lame.all.js
+#     vendor/OggVorbisEncoder.js
+#     vendor/LICENSE-lamejs.txt
+#     vendor/LICENSE-OggVorbisEncoder.txt
+#     vendor/README.md
+#
+# Dropping the .txt licences, or the provenance note that says which upstream
+# bytes these are, would break the terms under which the encoders may be
+# redistributed. That is an obligation to ship files, so it is an argument for
+# tracking vendor/ — never for ignoring it.
+#
+# Do not minify, re-bundle, patch or concatenate these files. The recorded
+# hashes are only meaningful while the bytes match upstream, and vendor/
+# remaining a drop-in replacement is precisely what discharges the LGPL
+# obligation above.
+
+# Log files. Diagnostics live in chrome.storage.local and are exported through
+# the options page; nothing should ever land here.
+*.log

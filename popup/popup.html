@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>Suno Master Utility</title>
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+<main id="sm-popup">
+
+  <header class="sm-head">
+    <h1 class="sm-brand"><span class="sm-dot" aria-hidden="true"></span>Suno Master Utility</h1>
+    <button id="sm-options" class="sm-btn sm-ghost sm-tiny" type="button" aria-label="Open the settings page">Settings</button>
+  </header>
+
+  <button id="sm-auth" class="sm-chip" type="button" aria-label="Session status. Activate to open suno.com and sign in.">Checking session&hellip;</button>
+
+  <div id="sm-truncated" class="sm-banner sm-banner-warn" role="alert" hidden>
+    <span class="sm-banner-title">Library incomplete</span>
+    <span id="sm-truncated-text" class="sm-banner-text"></span>
+  </div>
+
+  <section class="sm-tiles" aria-label="Library and account status">
+    <div class="sm-tile">
+      <span class="sm-tile-label">Clips indexed</span>
+      <span class="sm-tile-value" id="sm-tile-clips">&mdash;</span>
+      <span class="sm-tile-note" id="sm-tile-clips-note">no local library yet</span>
+    </div>
+    <div class="sm-tile">
+      <span class="sm-tile-label">Library sync</span>
+      <span class="sm-tile-value" id="sm-tile-sync">&mdash;</span>
+      <span class="sm-tile-note" id="sm-tile-sync-note">&nbsp;</span>
+    </div>
+    <div class="sm-tile sm-tile-quota" id="sm-tile-quota-box">
+      <span class="sm-tile-label">Downloads left</span>
+      <span class="sm-tile-value" id="sm-tile-quota">&mdash;</span>
+      <span class="sm-tile-note" id="sm-tile-quota-note">monthly allowance</span>
+    </div>
+    <div class="sm-tile sm-tile-credits">
+      <span class="sm-tile-label">Credits</span>
+      <span class="sm-tile-value" id="sm-tile-credits">&mdash;</span>
+      <span class="sm-tile-note">separate from downloads</span>
+    </div>
+  </section>
+
+  <section class="sm-progress" aria-label="Operation progress">
+    <div class="sm-progress-head">
+      <span id="sm-progress-label" class="sm-progress-label">Idle</span>
+      <span id="sm-progress-pct" class="sm-progress-pct">&mdash;</span>
+    </div>
+    <div id="sm-progress-track" class="sm-track" role="progressbar"
+         aria-labelledby="sm-progress-label" aria-valuemin="0" aria-valuemax="100"
+         aria-valuenow="0" aria-valuetext="Idle">
+      <div id="sm-progress-fill" class="sm-fill"></div>
+    </div>
+    <p id="sm-progress-detail" class="sm-progress-detail">&nbsp;</p>
+  </section>
+
+  <div id="sm-summary" class="sm-summary" role="status" aria-live="polite" hidden>
+    <span id="sm-summary-text" class="sm-summary-text"></span>
+    <span id="sm-summary-quota" class="sm-summary-quota"></span>
+  </div>
+
+  <section class="sm-actions" aria-label="Actions">
+    <button id="sm-sync" class="sm-btn sm-primary" type="button" aria-label="Sync the Suno library into the local index">Sync library</button>
+    <button id="sm-download" class="sm-btn sm-primary" type="button" aria-label="Download the current selection">Download&hellip;</button>
+    <button id="sm-cancel" class="sm-btn sm-danger" type="button" aria-label="Cancel the running sync or download batch" disabled>Cancel</button>
+    <button id="sm-panel" class="sm-btn" type="button" aria-label="Open the full side panel">Open full panel</button>
+  </section>
+
+  <section class="sm-logwrap" aria-label="Activity log">
+    <div class="sm-loghead">
+      <h2 class="sm-h2">Activity</h2>
+      <button id="sm-log-clear" class="sm-btn sm-ghost sm-tiny" type="button" aria-label="Clear the activity log">Clear</button>
+    </div>
+    <ol id="sm-log" class="sm-log" aria-live="polite" aria-relevant="additions"></ol>
+  </section>
+
+</main>
+<script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,564 @@
+/* ==========================================================================
+ * Suno Master Utility — options stylesheet
+ * --------------------------------------------------------------------------
+ * The options page opens in a tab (`open_in_tab: true`), so it can breathe:
+ * a two-column card grid from 1000 px up, a single readable column below.
+ *
+ * The palette is the same one the dock uses (`content/content.css`): purple
+ * #8b5cf6 / #6366f1, accent #22d3ee, ok #34d399, bad #f87171, warn #fbbf24, and
+ * light/dark both defined so the page follows the system theme.
+ * ========================================================================== */
+
+:root {
+  --sm-bg: #0d101a;
+  --sm-panel: #151a28;
+  --sm-panel-2: #1b2133;
+  --sm-border: rgba(255, 255, 255, 0.13);
+  --sm-border-2: rgba(255, 255, 255, 0.28);
+  --sm-text: #eef2ff;
+  --sm-muted: #9aa4bf;
+  --sm-purple: #8b5cf6;
+  --sm-purple-2: #6366f1;
+  --sm-accent: #22d3ee;
+  --sm-ok: #34d399;
+  --sm-bad: #f87171;
+  --sm-warn: #fbbf24;
+  --sm-focus: #22d3ee;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --sm-bg: #f4f5fa;
+    --sm-panel: #ffffff;
+    --sm-panel-2: #eef0f7;
+    --sm-border: rgba(15, 20, 40, 0.15);
+    --sm-border-2: rgba(15, 20, 40, 0.36);
+    --sm-text: #16192a;
+    --sm-muted: #5b6379;
+    --sm-purple: #6d28d9;
+    --sm-purple-2: #4f46e5;
+    --sm-accent: #0e7490;
+    --sm-ok: #047857;
+    --sm-bad: #b91c1c;
+    --sm-warn: #a16207;
+    --sm-focus: #6d28d9;
+  }
+}
+
+* { box-sizing: border-box; }
+
+[hidden] { display: none !important; }
+
+html { scroll-behavior: smooth; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+}
+
+body {
+  margin: 0;
+  padding: 0 20px 96px;
+  background: var(--sm-bg);
+  color: var(--sm-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --------------------------------------------------------------- skip link */
+.skip {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  padding: 8px 14px;
+  background: var(--sm-purple);
+  color: #fff;
+  border-radius: 0 0 8px 0;
+  z-index: 10;
+}
+.skip:focus { left: 0; }
+
+/* ------------------------------------------------------------------- head */
+.sm-pagehead {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 28px 0 8px;
+}
+
+h1 {
+  margin: 0 0 6px;
+  font-size: 21px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+}
+
+.sm-ver { font-size: 12px; font-weight: 500; color: var(--sm-muted); }
+
+.sm-lede {
+  margin: 0 0 10px;
+  max-width: 76ch;
+  color: var(--sm-muted);
+  font-size: 13px;
+}
+
+.sm-status {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--sm-accent);
+  min-height: 1.2em;
+}
+.sm-status.is-bad { color: var(--sm-bad); }
+.sm-status.is-ok { color: var(--sm-ok); }
+
+/* ------------------------------------------------------------------ cards */
+#sm-main {
+  max-width: 1180px;
+  margin: 0 auto;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: 1fr;
+  padding-top: 14px;
+}
+
+@media (min-width: 1000px) {
+  #sm-main { grid-template-columns: 1fr 1fr; align-items: start; }
+  /* The naming card carries the widest content (preview + token list). */
+  #sm-main > section:nth-child(3) { grid-column: 1 / -1; }
+}
+
+.sm-card {
+  border: 1px solid var(--sm-border);
+  border-radius: 12px;
+  background: var(--sm-panel);
+  padding: 16px 18px 18px;
+}
+
+.sm-h2 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.1px;
+  color: var(--sm-purple);
+}
+
+.sm-h3 {
+  margin: 16px 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--sm-muted);
+}
+
+.sm-note {
+  margin: 0 0 12px;
+  max-width: 80ch;
+  font-size: 12.5px;
+  color: var(--sm-muted);
+}
+
+.sm-note code,
+.sm-hint code,
+.sm-blocked code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--sm-panel-2);
+  border: 1px solid var(--sm-border);
+}
+
+.sm-warn {
+  margin: 0 0 10px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--sm-warn);
+  background: color-mix(in srgb, var(--sm-warn) 12%, var(--sm-panel));
+  font-size: 12.5px;
+  max-width: 86ch;
+}
+.sm-warn-2 { border-color: var(--sm-bad); background: color-mix(in srgb, var(--sm-bad) 10%, var(--sm-panel)); }
+
+/* A control that is deliberately unavailable, with the reason stated. */
+.sm-blocked {
+  margin: 6px 0 12px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  border: 1px dashed var(--sm-border-2);
+  background: var(--sm-panel-2);
+  font-size: 12.5px;
+  color: var(--sm-muted);
+  max-width: 86ch;
+}
+.sm-blocked strong { color: var(--sm-bad); }
+
+.sm-note-blocked {
+  margin: 8px 0 4px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--sm-panel-2);
+  font-size: 12.5px;
+}
+
+/* -------------------------------------------------------------- fieldset */
+.sm-fs {
+  margin: 14px 0 0;
+  padding: 12px 14px 14px;
+  border: 1px solid var(--sm-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--sm-panel-2) 55%, transparent);
+  min-width: 0;
+}
+
+.sm-fs[disabled] { opacity: 0.55; }
+
+.sm-legend {
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--sm-accent);
+}
+
+.sm-legend-sub {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  color: var(--sm-muted);
+}
+
+/* ------------------------------------------------------------------ rows */
+.sm-row { margin-bottom: 12px; min-width: 0; }
+.sm-row:last-child { margin-bottom: 0; }
+
+.sm-row-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.sm-lbl {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.sm-row-inline .sm-lbl,
+.sm-lbl-inline { margin-bottom: 0; }
+
+.sm-lbl-disabled { color: var(--sm-muted); text-decoration: line-through; text-decoration-thickness: 1px; }
+
+.sm-hint {
+  margin: 4px 0 0;
+  max-width: 82ch;
+  font-size: 12px;
+  color: var(--sm-muted);
+}
+
+.sm-hint-indent { margin-left: 24px; }
+
+.sm-hint-warn {
+  padding-left: 9px;
+  border-left: 2px solid var(--sm-warn);
+  color: var(--sm-text);
+}
+
+.sm-empty {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px dashed var(--sm-bad);
+  font-size: 12.5px;
+}
+
+/* ---------------------------------------------------------------- inputs */
+input[type="text"],
+input[type="number"],
+select {
+  font: inherit;
+  font-size: 13px;
+  color: var(--sm-text);
+  background: var(--sm-panel);
+  border: 1px solid var(--sm-border-2);
+  border-radius: 7px;
+  padding: 6px 9px;
+  min-height: 32px;
+}
+
+input[type="text"] { width: 260px; max-width: 100%; }
+input[type="number"] { width: 110px; }
+select { width: 260px; max-width: 100%; }
+
+.sm-text-wide { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* Semantic hooks: these four classes are what a control IS, not how it looks,
+   but they still need to agree with the shared control geometry. */
+.sm-num { width: 110px; }
+.sm-sel { width: 260px; max-width: 100%; }
+.sm-chk, .sm-radio { width: 16px; height: 16px; margin: 0; accent-color: var(--sm-purple); flex: none; }
+
+input[type="checkbox"],
+input[type="radio"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--sm-purple);
+  flex: none;
+}
+
+input:disabled,
+select:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.sm-optset { margin-top: 4px; }
+.sm-opt { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+
+.sm-grid {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+/* One focus treatment for every interactive control on the page. */
+input:focus-visible,
+select:focus-visible,
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--sm-focus);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- ladder */
+.sm-ladder { list-style: none; margin: 0; padding: 0; }
+
+.sm-rung {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  margin-bottom: 5px;
+  border: 1px solid var(--sm-border);
+  border-radius: 8px;
+  background: var(--sm-panel);
+}
+
+.sm-rung-pos {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--sm-purple);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.sm-rung-body { flex: 1 1 auto; min-width: 0; }
+
+.sm-rung-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.sm-rung-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--sm-muted);
+}
+
+.sm-rung-note {
+  margin: 2px 0 0;
+  font-size: 11.5px;
+  color: var(--sm-muted);
+}
+
+.sm-rung-ops { flex: none; display: flex; gap: 3px; }
+
+.pill {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  border: 1px solid;
+}
+.pill-free { color: var(--sm-ok); border-color: var(--sm-ok); }
+.pill-metered { color: var(--sm-warn); border-color: var(--sm-warn); }
+.pill-optin { color: var(--sm-muted); border-color: var(--sm-border-2); }
+
+.sm-pool { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+
+.sm-pool-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 9px;
+  border: 1px solid var(--sm-border);
+  border-radius: 999px;
+  background: var(--sm-panel);
+  font-size: 12px;
+}
+
+.sm-pool-item.is-blocked { opacity: 0.6; }
+
+/* --------------------------------------------------------------- preview */
+.sm-preview {
+  margin-top: 14px;
+  padding: 11px 13px;
+  border: 1px solid var(--sm-border);
+  border-radius: 10px;
+  background: var(--sm-panel);
+}
+
+.sm-preview-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sm-preview-head .sm-h3 { margin: 0; }
+
+.sm-preview-src { font-size: 11.5px; color: var(--sm-muted); }
+
+.sm-preview-path {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--sm-panel-2);
+  border: 1px solid var(--sm-border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+.sm-tokens {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.sm-token {
+  display: flex;
+  gap: 7px;
+  align-items: baseline;
+  padding: 4px 7px;
+  border-radius: 7px;
+  background: var(--sm-panel-2);
+  font-size: 12px;
+}
+
+.sm-token code {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--sm-accent);
+}
+
+.sm-token-val { color: var(--sm-muted); overflow-wrap: anywhere; }
+
+/* --------------------------------------------------------------- actions */
+.sm-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+
+.sm-btn {
+  appearance: none;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--sm-border-2);
+  background: var(--sm-panel-2);
+  color: var(--sm-text);
+  cursor: pointer;
+}
+.sm-btn:hover:not(:disabled) { background: var(--sm-purple); border-color: var(--sm-purple); color: #fff; }
+.sm-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.sm-btn.sm-primary { background: linear-gradient(135deg, var(--sm-purple), var(--sm-purple-2)); border-color: transparent; color: #fff; }
+.sm-btn.sm-danger { border-color: var(--sm-bad); color: var(--sm-bad); }
+.sm-btn.sm-danger:hover:not(:disabled) { background: var(--sm-bad); border-color: var(--sm-bad); color: #fff; }
+
+/* The compact variant used inside the "available rungs" pool. */
+.sm-btn-s {
+  min-height: 26px;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+.sm-iconbtn {
+  appearance: none;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  border: 1px solid var(--sm-border-2);
+  background: var(--sm-panel-2);
+  color: var(--sm-text);
+  cursor: pointer;
+}
+.sm-iconbtn:hover:not(:disabled) { background: var(--sm-purple); border-color: var(--sm-purple); color: #fff; }
+.sm-iconbtn:disabled { opacity: 0.35; cursor: not-allowed; }
+.sm-iconbtn.is-danger:hover:not(:disabled) { background: var(--sm-bad); border-color: var(--sm-bad); }
+
+/* --------------------------------------------------------------- footer */
+.sm-pagefoot {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  background: color-mix(in srgb, var(--sm-bg) 88%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-top: 1px solid var(--sm-border);
+  z-index: 5;
+}
+
+.sm-save { min-width: 150px; }
+
+.sm-savenote { font-size: 12.5px; color: var(--sm-muted); }
+
+.sm-saved {
+  position: fixed;
+  right: 20px;
+  bottom: 64px;
+  max-width: 420px;
+  padding: 10px 13px;
+  border-radius: 9px;
+  border: 1px solid var(--sm-bad);
+  background: var(--sm-panel-2);
+  color: var(--sm-text);
+  font-size: 12.5px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, 0.4);
+  z-index: 6;
+}
+
+code { font-size: 0.94em; }

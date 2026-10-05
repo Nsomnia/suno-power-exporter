@@ -1,0 +1,417 @@
+# 🎸 Suno Master Utility
+
+**Bulk-download your entire Suno library with filters that actually work.**
+
+All your liked songs. Include or exclude the ones you downvoted. Specific
+workspaces. Search strings. A specific model generation. Duration, plays, upvotes,
+date ranges, instrumental-or-not, remixes, trashed, contests, public-only, exact
+clip-id lists — every filter the Suno API can *actually* support, and an honest
+account of the three it cannot.
+
+Version **6.0.1**. Manifest V3. Chrome 116+.
+
+---
+
+## 🚨 Read the limitations first
+
+This is not a footnote. Three things will bite you, and one of them is a missing
+binary file.
+
+| | What | Where |
+|---|---|---|
+| 🧱 | **MP3 and OGG output do not exist in this build.** MV3 forbids remotely hosted code, so the encoders cannot be fetched from a CDN — they would have to be vendored. `vendor/lame.all.js` (~1 MB, LGPL) is not in the repo. M4A and both WAV rungs are fully working; the variant list is exactly three. | [KNOWN-LIMITS §1](docs/KNOWN-LIMITS.md) |
+| 👎 | **Suno exposes no per-clip dislike field.** Detecting dislikes means paging your whole library **twice** and diffing the id sets, so a disliked pass costs roughly double a sync. | [KNOWN-LIMITS §6](docs/KNOWN-LIMITS.md) |
+| 🔤 | **The `?format=` enum is undocumented.** The client passes your string through unchanged and tallies what it has tried. Only `m4a` is guaranteed — and `wav`/`wav-48k` are honest regardless, because they are rendered locally rather than asked for. | [KNOWN-LIMITS §2](docs/KNOWN-LIMITS.md) |
+
+Plus: bulk ZIP's response shape is unknown, `duration`'s type is unverified, the
+feed page size is unknown, collaborative workspaces don't exist in prod, and the
+free-tier download allowance is genuinely unknown. **The full list — 20 items, all
+of them read out of the shipped code — is [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md).**
+
+That document is the most valuable thing in this repo. It exists so the next
+session doesn't rediscover the same walls.
+
+---
+
+## 📦 Install
+
+**Chrome 116 or newer.** (The extension needs `chrome.offscreen`, which landed in
+116; `manifest.json:82` declares it.)
+
+1. Open `chrome://extensions`
+2. Turn on **Developer mode** (top right)
+3. **Load unpacked** → select **this directory**
+4. **Sign in to [suno.com](https://suno.com) in the same browser profile**
+
+That last step is not optional. The extension **mints its Clerk JWT from the page**,
+not from a cookie. `__session` is HttpOnly and is a different, Next.js SSR value —
+sending it as a Bearer token is a bug (`lib/api.js:33-35`). So: you must be logged
+in on `suno.com`, in the same profile, in a tab that has loaded.
+
+Hit the toolbar icon. The chip at the top tells you whether a usable session was
+found.
+
+> **401 with `exp` still in the future = bad token, not bad session.**
+> (`lib/api.js:36-38`) That distinction is surfaced as `error.code` so you know
+> which one you have.
+
+---
+
+## ⚡ 60-second start
+
+1. **Sync library** — popup → *Sync library*. Pages through `/api/feed/v2` into
+   IndexedDB. Watch for the truncation banner; if it appears, your library is
+   incomplete (raise `syncMaxPages` in settings).
+2. **Pick your filters** — the dock injected into every `suno.com` page has the
+   full catalog; the side panel is faster for browsing and searching.
+3. **Hit download** — *Start (current filter)*, or tick rows and *Start (selected
+   rows)*.
+
+**Turn on dry run first** if this is your first batch. Settings → *dry run (plan
+only, no files)* plans the whole thing and reports what each item would do without
+spending a single download (`background/background.js:596`).
+
+And before you commit to a 200-song batch, run **`PROBE_DRM`** on one clip. It is
+diagnostic only — no bytes, no quota — and it tells you which rungs would work and
+whether any of them is free (`background/background.js:5501-5548`).
+
+---
+
+## 🪜 The download ladder
+
+Seven ordered rungs. The **cost class** is the whole point: how you get the bytes
+is a separate decision from whether you're allowed to download them.
+
+| # | rung | mechanism | metered? | notes |
+|--:|---|---|:--:|---|
+| 1 | `progressive` | a `media_urls` entry with **no `encoding` field** — plain GET | 🟢 **no** | a negative test: missing key == unencrypted |
+| 2 | `mango-drm` | rights → AES-GCM unwrap → chunked AES-CTR | 🟢 **no** | *"Never touches the meter."* |
+| 3 | `studio` | `GET /api/studio/clip/{id}/download` | 🔴 **yes** | **used to be free — closed server-side 2026-09-09** |
+| 4 | `download-route` | `GET /api/download/clip/{id}` | 🔴 **yes** | same refusal contract |
+| 5 | `wav-official` | `convert_wav` → signed `wav_file` (TTL 3599 s) | 🔴 **yes** | opt-in · **403 = entitlement, not auth** |
+| 6 | `zip` | `POST /api/download/clips/zip/prepare`, ≤200 clips | 🔴 **yes** | opt-in · batch-only · **response shape unknown** |
+| 7 | `hls` | page-captured segment reassembly | 🟢 **no** | opt-in · **not a rung** — page manipulation |
+
+> ### ⚠️ TWO RUNGS ARE UNMETERED. THE REST SPEND A MONTHLY ALLOWANCE.
+>
+> Rungs 1 and 2 are free. Rungs 3, 4, 5 and 6 each cost **one download**, and
+> **one song = one download regardless of format** — so downloading M4A *and* WAV
+> for the same song still costs exactly one. Budget per **song**, never per format.
+>
+> The default ladder is `['progressive', 'mango-drm', 'studio', 'download-route']`
+> — which means **it will spend quota** on any clip the two free rungs cannot
+> deliver. Turn the metered rungs off in settings to see how far a batch gets for
+> nothing.
+
+**🪤 The trap:** download routes answer **HTTP 200 with a refusal body** —
+`{"ok":false,"reason":"no_permission"}`. **Never branch on `resp.ok`.**
+
+**🪤 The decoy:** `audio_url` is *always* the literal
+`https://studio-api.prod.suno.com/api/forbidden`. The real audio is in
+`media_urls[]`. The previous build scraped `audio_url`, which is why it could never
+actually download music — it saved 111-byte 403 XML under audio filenames.
+
+### 🎚️ Formats: three, and that is a capability decision
+
+The variant list is **exactly** `m4a`, `wav-48k` and `wav`
+(`background/background.js:449`). Nothing else.
+
+| Variant | What it is | Cost |
+|---|---|---|
+| `m4a` | native — the download already *is* an m4a, so no encoder is involved at any point | 🟢 free on rungs 1–2 |
+| `wav-48k` | a local render with the rate **pinned** to 48000, so it stays distinguishable from plain `wav` | 🟢 free |
+| `wav` | a local render at `settings.wavSampleRate` — decode, resample, real RIFF header | 🟢 free |
+
+MP3, FLAC, OGG, AAC and Opus are gone from the list because they all need an
+encoder this build does not ship, and offering them was the worst kind of lie: the
+UI showed them, the setting stored fine, and every download came back
+`ENCODER_UNAVAILABLE` with the original file saved. An old stored setting degrades
+gracefully through a 13-entry alias map rather than hard-resetting, and the
+substitution is logged.
+
+`lrc`, cover art and JSON are **not variants** — they are sidecars written next to
+the audio file, and they are toggles in the settings drawer. A standalone
+cover-art *file* download is not offered at all, because it needs CDN image
+fetches this build does not implement.
+
+**BPM works end to end.** Suno sends no tempo field, so when a clip carries none
+the extension measures one from the decoded audio in the offscreen document and
+uses it for the `{bpm}` filename token, the ID3 `TBPM` frame and the `.json`
+sidecar. A missing tempo is never invented — and there is deliberately **no BPM
+range filter**, because the field is `0` on essentially every record straight from
+the feed. Tempo is a tag, not a facet.
+
+→ **[Full ladder, quota semantics and the DRM pipeline: `docs/DOWNLOAD-LADDER.md`](docs/DOWNLOAD-LADDER.md)**
+
+---
+
+## 🔍 One honest note on how this was built
+
+This is a rewrite by many hands across parallel sessions, and it still needed a
+**dedicated integration audit** before anyone could trust it end to end.
+
+That is not a criticism of the work — it is the interesting part. Every module was
+verified *against itself*: each session traced its own entry points, and the doc
+set's 474 `file:line` citations were each checked against the source. All of it
+was correct. What nobody checked was **the seams**.
+
+A rewrite split across parallel sessions has one characteristic failure mode: each
+agent reads the contract it can see and infers the rest. When two agents own
+opposite ends of the same field, each concludes the other is handling it. The BPM
+pipeline was dead this way for a full release cycle — `lib/suno.js` put `bpm` on
+the record, the worker read `clip.bpm` directly at four separate sites and never
+saw it, and the offscreen analysis read `reply.bpm` instead of
+`reply.analysis.bpm`, so the measurement returned `null` on **every clip**.
+Consistently, which is what makes a broken pipeline look like a quiet one.
+
+**Per-file verification cannot catch contract drift between modules.** One session
+reading only the contracts found all of it in a single pass — plus a
+`GET_BOOT.token` read as a string, a `SYNC_STATUS` cursor read at the wrong nesting
+depth (so "Check status" updated nothing at all), a `tagOptions.cover` toggle that
+did nothing while silently resetting the six keys that did, variants reverting
+without a trace, a quota-stopped batch reported as "Batch complete", an offscreen
+reply resolver that trusted any message ending in `:result`, and the complete
+absence of a mid-batch quota guard.
+
+→ **The full accounting: [`CHANGELOG.md`](CHANGELOG.md), 6.0.1.**
+
+---
+
+## 🎛️ The filter catalog
+
+| group | filters |
+|---|---|
+| **Reactions** | Liked · Downvoted · Unliked |
+| **Where** | Workspaces (projects) · *include unassigned* |
+| **What** | 12 model generations, incl. **Custom** and an explicit **Unknown / legacy** bucket |
+| **Search** | the full `parseQuery` grammar — see below |
+| **State** | Complete / still generating · Public / private · Trashed |
+| **Nature** | Instrumental · Remixes · Uploads · AI generated · Contests · Has hook |
+| **Numbers** | Duration · Plays · Upvotes · Date range |
+| **Exact** | Clip-id paste list · batch index |
+
+### Three things that were wrong before and are right now
+
+**❤️ Liked reads `is_liked` — your own like state. NOT `upvote_count`.**
+
+`upvote_count` is a *public count* of how many people upvoted a song. In a personal
+library essentially every clip has at least one, so the old filter matched
+**100% of your library** and looked like it was working. If you want a real
+"popular" threshold, use the **upvotes min/max** filter — it is a different filter,
+reading a different field.
+
+**👎 Downvoted has no field behind it.** There is no `is_disliked` and no
+`dislike_count` on a Suno clip. The only mechanism is paging `/api/feed/v2` twice
+with `hide_disliked` flipped and diffing the id sets — which is why a disliked pass
+costs roughly double a sync. Check `dislikedApproximate` before trusting a
+"disliked only" result.
+
+**📁 A workspace IS a project, and the default one is literally
+`{"id":"default","name":"My Workspace"}`.** Suno has **no project field on a
+clip** — membership is joined client-side from `/api/project/feed`. Anything not in
+a project lands in `default`. *Collaborative* workspaces are a **staging-only**
+flag with no known API surface, so there is no filter for them.
+
+### Search grammar
+
+```
+"quoted phrases"              title: style: lyrics: prompt: model: project:
+-title            negate      -metal      !metal
+dream OR synth                a OR b title:x   reads as  (a OR b) AND title:x
+```
+
+Operators are **case-sensitive** so ordinary words like `and` and `or` inside a
+title are not eaten. Negation is global AND-NOT. Unparseable fragments stay
+searchable rather than silently vanishing.
+
+Real examples:
+
+| query | does |
+|---|---|
+| `style: "dream pop" -metal` | dream-pop style, and not anywhere "metal" |
+| `title:"blue hour"` | phrase, title only |
+| `project:"My Workspace"` | the unassigned bucket |
+| `!instrumental` | exclude anything containing the word |
+
+### 📝 24 presets
+
+`ALL` · `LIKED_ONLY` · `DISLIKED_ONLY` · `NO_DISLIKES` · `V6` · `V6_MINI` · `V5_PLUS`
+· `CUSTOM_MODELS` · `INSTRUMENTAL` · `REMIXES` · `NO_TRASHED` · `TRASHED` ·
+`UNASSIGNED` · `PENDING` · `COMPLETE` · `PUBLIC_ONLY` · `NO_UPLOADS` · `UNLIKED` ·
+`WITH_HOOKS` · `MOST_PLAYED` · `MOST_LIKED` · `RECENT_30_DAYS` + 2 legacy aliases.
+
+**`MOST_PLAYED` and `MOST_LIKED` used to be `{}`** — byte-identical to `ALL`, i.e.
+no sorting at all. Picking "most played" returned your library in storage order.
+A top-tracks preset that doesn't sort is worse than no preset, because it looks
+like it worked.
+
+**`ALL` now means *all*, including trashed.** The old engine dropped trashed clips
+implicitly, which silently shrank mass downloads. Use `NO_TRASHED`.
+
+→ **[Every filter, every spec key, every field it reads: `docs/FILTERS.md`](docs/FILTERS.md)**
+
+---
+
+## 🏗️ Architecture at a glance
+
+33,782 lines of JS, HTML and CSS across eight libraries and one orchestrator. The
+libraries take
+their dependencies **by injection** — `fetchImpl`, a clock, a logger, an
+`indexedDB`, a crypto implementation — rather than reaching for globals, so each
+one runs unmodified in the service worker, in a content script, and under node.
+
+```
+manifest.json ─ declares permissions + CSP (script-src 'self')
+
+┌─ background/background.js ─ 6073 lines ─ the ONLY orchestrator ──────┐
+│  18 numbered sections. Owns HTTP, storage, the ladder, the batch      │
+│  driver, resumable crawls, the message router and the lifecycle.      │
+└───────────────────────────────────────────────────────────────────────┘
+        │                    │                     │
+        ▼                    ▼                     ▼
+   lib/api.js            lib/db.js            lib/drm.js
+   23 verified routes    5 IDB stores,        the Mango pipeline
+   RateLimiter 4/s       schema v3             rights → AES-GCM →
+   typed errors          downloads keyed       chunked AES-CTR →
+                         ['clipId','variant']  container verify
+
+   lib/suno.js      lib/crypto.js     lib/tagger.js    lib/lyrics.js    lib/audio.js
+   the filter       AES-GCM + CTR     ID3 / MP4       .lrc / .json     decode, resample,
+   engine + parser                   metadata        sidecars         BPM, interleave
+
+┌─ offscreen/ ──────────────────────────────────────────────────────────┐
+│  A real DOM page, because the worker has no Web Audio and no          │
+│  createObjectURL. Decodes, renders WAV, mints blob URLs.              │
+└───────────────────────────────────────────────────────────────────────┘
+
+   content/content.js   popup/   options/   side_panel.js
+   the in-page dock     toolbar  settings   browse + search
+```
+
+### The MV3 constraints, briefly
+
+These are the interesting ones — each removal forced a specific design.
+
+| constraint | solution |
+|---|---|
+| **No Web Audio in a worker** | offscreen document, lazily created and **proven alive before first use** |
+| **No `URL.createObjectURL` in a worker** | `data:` URL below 24 MB, offscreen-minted blob URL above (LRU of 8, revoked on completion) |
+| **Workers evicted at ~30 s idle** | all durable state in IndexedDB + `chrome.storage.session`; resumable cursors; a journal; a 30 s alarm armed **only** from `onInstalled`/`onStartup` |
+| **`runtime.sendMessage` can't reach content scripts** | every push fans out to `runtime.sendMessage` **and** `tabs.sendMessage` |
+| **`window` is undefined in a worker** | a four-line alias shim before `importScripts`. **Load-bearing — don't remove it** |
+| **No remote code** | no CDN encoder, **hence no MP3/OGG** |
+
+> The `sendMessage` one is worth remembering: the previous build *documented* the
+> limitation in a comment and then used only the broken path. **No event ever
+> reached the page.** Every push now fans out to both channels.
+
+→ **[File map, the full message protocol, ASCII data flows, the IndexedDB schema
+and the batch state machine: `docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**
+
+### 🛡️ The one invariant that matters most
+
+**Never mark a download done because `chrome.downloads.download()` returned an id.**
+An id means Chrome *accepted the request*, nothing more.
+
+`downloads.markDone` is reachable from exactly two call sites, and both require an
+**observed** completion: the `chrome.downloads.onChanged` listener reporting
+`state === 'complete'`, or a startup reconciliation search. The previous build
+wrote history rows for files that never landed.
+
+And: if a transfer times out, the row is left `in_progress` **on purpose** —
+reconciliation owns it from there.
+
+---
+
+## 🚫 What we deliberately did NOT build
+
+Not "not yet". Deliberately, with reasons.
+
+| not built | why |
+|---|---|
+| **`/b-side/*` staff routes** | **84 routes, 168 requests, all 404**, anonymous and authenticated. Authorization is by non-deployment. It's the best **disclosure** candidate in the recon — report it, don't use it. |
+| **Staging API** (`studio-api-staging.suno.com`) | live and **unauthenticated** — 58 flags vs prod's 47. A misconfiguration **to report**, not a resource. The client enforces a host denylist at construction time, so it cannot be configured away. |
+| **`/api/playlist/liked/`** | **does not exist.** The old build paged it and silently got nothing — which is why "liked only" never worked. |
+| **`suno.com/api/*`** | the web origin does not proxy `/api/*`; every such call 404s. |
+| **Reconstructing payloads from 422 `loc` chains** | **fabricated** — a renamed projection. Real bodies are flat. The rights call tries three shapes for exactly this reason. |
+| **The Studio-download bypass** | **closed server-side 2026-09-09.** Report it as fixed. Do not present it as an exploit. |
+| **`/api/session/` as the model catalogue** | the web branch serves a **stale** list. Use `/api/billing/info/`. |
+| **Cross-account data** | never. Not the feed, not search, not unified, not contests. Your account only. |
+| **`DELETE` on any route** | never sent. |
+| **A "collaborative workspaces" filter** | staging-only flag, no known API surface. |
+| **Zip download** | `batchOnly`, opt-in, and the response shape has never been observed. Opt-in and honest rather than offered and broken. |
+| **MP3 / OGG encoding** | needs a vendored encoder MV3 won't let us fetch. The settings controls are rendered **`disabled`** with the reason, and the variants were **removed from the list entirely** — a control that looks live and isn't is worse than no control. |
+| **A standalone cover-art file download** | it needs the `image_url` / `image_large_url` CDN fetches, which this build does not implement. Embedded artwork is `tagOptions.artwork` and that one works. |
+| **A BPM range filter** | Suno sends no tempo field, so it is `0` on essentially every record straight from the feed. The tempo is *measured* client-side and used for tags; a filter on it would match nothing. |
+
+→ **[The full verified-truth ledger, with citations for every claim above:
+`docs/RECON-NOTES.md`](docs/RECON-NOTES.md)**
+
+---
+
+## ⚖️ Ethics & scope
+
+**This is for your own account and your own music.** No exceptions.
+
+- **The rate limit is 4 req/s + jitter by default because that is production.**
+  Not because we're cautious — recon used the same number for the same reason
+  (`../suno-recon/README.md:74`). It's tunable between 0.2 and 20 req/s
+  (`background/background.js:966`); leave it alone unless you have a reason.
+- **Stay inside your own quota.** 20/month on Pro, 60/month on Premier, resets on
+  the billing date, no carryover. One song = one download, regardless of format.
+- **Suno's ToS exists to make mass export harder.** The September 2026 policy post
+  states the limits exist to make it *"harder for bad actors to mass-export music"*
+  (`../suno-recon/reports/THIRD-PARTY-2026-09-30.md:21-22`). You have your own music already; the
+  API is the fastest way to get a clean copy of *your* library, and that is all this
+  is for.
+- **Reuse your own session only.** The JWT comes from your own signed-in session.
+  There is no credential sharing here and no third-party service in the path —
+  `lib/api.js` makes every call directly to Suno's own hosts.
+- **No remote code, ever.** MV3 forbids it, and that is also why there is no
+  telemetry in here. Everything runs locally against Suno and your disk.
+- **A staging API you found unauthenticated is a bug to report, not a resource to
+  mine.** It is the single most interesting thing in the recon and the correct
+  response is one email.
+
+---
+
+## 🛠️ Contributing & verification
+
+**There are no test files in this repository, and that is a deliberate, disclosed
+choice.**
+
+Every module was developed with assertion suites run **outside** the repo — against
+captured recon payloads and live responses, with the results read back and the
+findings folded into the code comments. Nothing was committed, which means **there
+is no `npm test`, no CI, and no regression net.** If you change a lib, verify it
+against the field names in `docs/FILTERS.md` before you trust it.
+
+The code is written to be verifiable by reading: every lib header names its own
+invariants, every non-obvious decision cites the defect that caused it, and every
+one of the eight hard invariants at the top of `background/background.js:33-54`
+exists because breaking it was a real, shipped bug.
+
+Suggested first reads:
+
+1. `docs/KNOWN-LIMITS.md` — before you touch anything
+2. `background/background.js:33-54` — the eight hard invariants
+3. `lib/api.js:1-43` — the seven hard-won behaviours, in the author's own words
+4. `lib/drm.js:1-76` — the DRM pipeline and its two unresolved questions
+
+### 📜 Docs map
+
+| file | what it is |
+|---|---|
+| [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md) | 🚨 **20 hard limits.** Read first. |
+| [`docs/FILTERS.md`](docs/FILTERS.md) | every filter, its spec key, its verified field, its caveats |
+| [`docs/DOWNLOAD-LADDER.md`](docs/DOWNLOAD-LADDER.md) | the seven rungs, quota semantics, the DRM pipeline, format support |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | file map, MV3 constraints, message protocol, data flows, IDB schema |
+| [`docs/RECON-NOTES.md`](docs/RECON-NOTES.md) | the verified-truth ledger: what we built on, what we refused to |
+| [`CHANGELOG.md`](CHANGELOG.md) | 6.0.1 vs 6.0.0 vs 5.0.0 — 86 defects in the rewrite, 9 more in the audit |
+
+Upstream recon: [`../suno-recon/`](../suno-recon/) — start at
+[`reports/FINDINGS.md`](../suno-recon/reports/FINDINGS.md).
+
+---
+
+**🎹 Go make some noise.**

@@ -1,0 +1,83 @@
+{
+  "manifest_version": 3,
+  "name": "Suno Master Utility - AI Music Hub & Downloader",
+  "description": "Bulk-export Suno: Liked/Workspace/model/date/search filters, resumable batch downloads, M4A/WAV with cover art, BPM and LRC lyrics.",
+  "author": "曲元 & Antigravity",
+  "permissions": [
+    "storage",
+    "downloads",
+    "notifications",
+    "alarms",
+    "scripting",
+    "sidePanel",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://suno.com/*",
+    "https://*.suno.com/*",
+    "https://*.suno.ai/*",
+    "https://*.cloudfront.net/*"
+  ],
+  "background": {
+    "service_worker": "background/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://suno.com/*",
+        "https://*.suno.com/*"
+      ],
+      "js": [
+        "lib/db.js",
+        "lib/crypto.js",
+        "lib/drm.js",
+        "lib/tagger.js",
+        "lib/lyrics.js",
+        "lib/audio.js",
+        "lib/api.js",
+        "lib/suno.js",
+        "content/content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "Suno Master Utility"
+  },
+  "side_panel": {
+    "default_path": "side_panel.html"
+  },
+  "options_ui": {
+    "page": "options/options.html",
+    "open_in_tab": true
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "content/content.css"
+      ],
+      "matches": [
+        "https://suno.com/*",
+        "https://*.suno.com/*",
+        "https://*.suno.ai/*"
+      ]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  },
+  "version": "6.0.1",
+  "version_name": "6.0.1 - Integration-seam audit: BPM pipeline, boot token, sync cursor, tag toggles, batch outcomes, quota guard",
+  "minimum_chrome_version": "116"
+}

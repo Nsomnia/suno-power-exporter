@@ -1,0 +1,18 @@
+#!/bin/bash
+
+# Path to your URL list file
+URL_FILE="urls.lst"
+
+# Check if file exists
+if [[ ! -f "$URL_FILE" ]]; then
+    echo "File not found: $URL_FILE"
+    exit 1
+fi
+
+# Read each line and open in Brave
+while IFS= read -r line; do
+    # Skip empty lines or comments
+    if [[ -n "$line" && ! "$line" =~ ^# ]]; then
+        open -a "Brave Browser" -u "https://$line"
+    fi
+done < "$URL_FILE"

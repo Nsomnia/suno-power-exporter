@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Suno Master Utility - Offscreen</title>
+<!--
+  MV3 extension pages run under `script-src 'self'`; remote code and inline
+  <script> are both forbidden, so the only script tags below are local file
+  references. `style-src 'unsafe-inline'` is here purely so the status line
+  below can be styled by the <style> element; nothing loads from the network
+  (`default-src 'none'`), and this document never issues a fetch of its own -
+  it is handed bytes by the service worker and hands bytes back.
+
+  lib/audio.js must load BEFORE offscreen.js: the document is useless without
+  SunoAudio, and offscreen.js reads it at load time rather than lazily.
+-->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'">
+<style>
+:root { --bg: #0d0d10; --text: #e8e8ea; --muted: #8a8a94; --ok: #22c55e; --bad: #ef4444; --edge: #2a2a32; }
+body { background: var(--bg); color: var(--text); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 0; padding: 10px 12px; }
+h1 { font-size: 12px; margin: 0 0 6px; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+#os-status { white-space: pre-wrap; word-break: break-word; }
+#os-state { font-weight: 700; }
+.os-ok { color: var(--ok); }
+.os-bad { color: var(--bad); }
+#os-log { margin: 8px 0 0; padding: 6px 0 0; border-top: 1px solid var(--edge); max-height: 40vh; overflow: auto; color: var(--muted); }
+#os-log div { white-space: pre-wrap; }
+#os-log .os-bad { color: var(--bad); }
+</style>
+</head>
+<body>
+  <h1>SUNO OFFSCREEN DOCUMENT</h1>
+  <div id="os-status"><span id="os-state" class="os-bad">BOOTING</span> <span id="os-detail">loading lib/audio.js&hellip;</span></div>
+  <div id="os-log"></div>
+  <script src="../lib/tagger.js"></script>
+  <script src="../lib/audio.js"></script>
+  <script src="offscreen.js"></script>
+</body>
+</html>
