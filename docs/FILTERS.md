@@ -126,16 +126,16 @@ dislikedIds = seenIds \ baseIds
 ```
 
 **Cost: roughly double a sync** — two full crawls of your whole library. That is
-why `dislikedMode` defaults to `'exclude'` (single-pass, `background/background.js:589`) and
+why `dislikedMode` defaults to `'exclude'` (single-pass, `background/background.js:677`) and
 the expensive `'both'` mode is opt-in.
 
 ### Trust flag
 
-`cursor.dislikedApproximate` (`background/background.js:4590`, `:4644`) is set when the diff
+`cursor.dislikedApproximate` (`background/background.js:4836`) is set when the diff
 could not be computed honestly — a resumed two-pass run that never persisted its
 pass-A set, for instance. **Check it before trusting a "disliked only" result.**
 
-Full mechanics: [KNOWN-LIMITS, section 6](KNOWN-LIMITS.md).
+Full mechanics: [KNOWN-LIMITS, section 5](KNOWN-LIMITS.md).
 
 ---
 
@@ -146,7 +146,7 @@ Full mechanics: [KNOWN-LIMITS, section 6](KNOWN-LIMITS.md).
 | **UI control** | multi-select over fetched projects, plus an *include unassigned* checkbox (`content/content.js:903-915`) |
 | **Spec key** | `projects: string[]` + `includeUnassigned: boolean` |
 | **Reads** | `GET /api/project/me` (names) and `GET /api/project/feed` (membership) |
-| **Recon citation** | `lib/api.js:912-913`, `background/background.js:4251` |
+| **Recon citation** | `lib/api.js:912-913`, `background/background.js:4443` |
 
 ### A workspace IS a project
 
@@ -161,14 +161,14 @@ shown is `My Workspace` (`lib/suno.js:32`, `UNASSIGNED_LABEL`).
 
 ### 🚨 Suno has NO project field on a clip
 
-`background/background.js:4251` is the statement of record:
+`background/background.js:4443` is the statement of record:
 
 > Which workspace (project) a clip belongs to. Suno has NO project field on a
 > clip; membership is joined from the project feed, and `default` is named
 > "My Workspace". This is the only correct basis for a per-workspace filter.
 
 So membership is a **client-side join**, built once per sync from
-`/api/project/feed` (`background/background.js:4450`, shape `{items:[{type,added_at_ms,clip}]}`)
+`/api/project/feed` (`background/background.js:4642`, shape `{items:[{type,added_at_ms,clip}]}`)
 and handed to the engine as `ctx.projectIdsById` (`lib/suno.js:199-207`).
 
 Consequences:
@@ -178,7 +178,7 @@ Consequences:
   true: picking projects must never silently drop the unassigned bucket from a
   mass download."* Turn it off if you want strict project membership.
 - If `/api/project/feed` fails, the sync warns and continues
-  (`background/background.js:4457`) and **every clip reads as unassigned**.
+  (`background/background.js:4649`) and **every clip reads as unassigned**.
 - `playlist` is a **search synonym for `project`**, not the same thing
   (`lib/suno.js:85`) — playlists are a different surface entirely
   (`/api/playlist/me`, `lib/api.js:914`) and are not joined into membership.
@@ -245,7 +245,7 @@ labelled "Unknown" in the UI — read it as *unknown / legacy*. A user filtering
 library lands in it.
 
 `isCustomModel` is a separate convenience flag, prefix-matched on `model_name`
-(`lib/suno.js:973`), but there is **no clip boolean** — see KNOWN-LIMITS, section 10.
+(`lib/suno.js:973`), but there is **no clip boolean** — see KNOWN-LIMITS, section 9.
 
 ---
 
@@ -591,7 +591,7 @@ caller can chain them without double-applying `spec.limit`.
 
 `describe(spec)` (`lib/suno.js:1322-1394`) renders the one-line human summary —
 `Liked only · v6 · 2 projects · style:"dream pop" · not any:"metal"` — and it is
-what the batch plan stores as its description (`background/background.js:3557`),
+what the batch plan stores as its description (`background/background.js:3749`, carried into the plan at `:3923`),
 so you always know what a saved batch was actually going to do.
 
 ---

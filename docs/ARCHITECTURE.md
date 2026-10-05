@@ -13,7 +13,7 @@ Line counts from `wc -l` at time of writing.
 | File | Lines | Responsibility |
 |---|---:|---|
 | `manifest.json` | 82 | MV3 declaration, permissions, host permissions, CSP |
-| `background/background.js` | 6073 | **the only orchestrator** — 18 numbered sections |
+| `background/background.js` | 6257 | **the only orchestrator** — 18 numbered sections |
 | `content/content.js` | 3370 | the in-page dock: filters, results, batch drawer, row checkboxes, Clerk token relay |
 | `content/content.css` | 980 | dock styling, loaded as a web-accessible resource |
 | `lib/api.js` | 3151 | the only HTTP client; 23 verified routes, `RateLimiter`, typed errors |
@@ -24,23 +24,32 @@ Line counts from `wc -l` at time of writing.
 | `lib/lyrics.js` | 897 | LRC/txt/json sidecar construction, key-material scrubbing |
 | `lib/suno.js` | 1567 | the filter engine: normalize, matches, facets, sort, parseQuery, presets |
 | `lib/tagger.js` | 2126 | ID3 / MP4 metadata writing, container detection |
-| `offscreen/offscreen.js` | 1579 | Web Audio + `createObjectURL` + the WAV renderer |
+| `offscreen/offscreen.js` | 1607 | Web Audio + `createObjectURL` + the WAV renderer **and both vendored encoders** |
 | `offscreen/offscreen.html` | 38 | the offscreen page; `default-src 'none'` |
-| `options/options.js` | 1382 | the settings page |
-| `options/options.html` | 557 | ladder editor, pacing, naming, tags, conversion, quota guard, import/export |
+| `options/options.js` | 1609 | the settings page |
+| `options/options.html` | 605 | ladder editor, pacing, naming, tags, conversion, quota guard, import/export |
 | `options/options.css` | 563 | |
 | `popup/popup.js` | 1761 | the toolbar popup: boot, tiles, progress, activity log |
 | `popup/popup.html` | 82 | |
 | `popup/popup.css` | 401 | |
 | `side_panel.js` | 758 | the browse/search surface; 50-row paging from the local index |
 | `side_panel.html` | 372 | |
+| `vendor/lame.all.js` | 530,087 B | **third-party**: lamejs 1.2.1, **LGPL-3.0**, SHA-256 `026bd888…fea3b` |
+| `vendor/OggVorbisEncoder.js` | 2,358,493 B | **third-party**: `higuma/ogg-vorbis-encoder-js` @ `7a87242`, **MIT** wrapper + **Xiph BSD** C, SHA-256 `5a9f749a…179b` |
+| `vendor/LICENSE-lamejs.txt` | 424 B | the LAME FAQ answer shipped in the npm tarball, verbatim — see the caveat below |
+| `vendor/LICENSE-OggVorbisEncoder.txt` | 1,078 B | the upstream **MIT** licence, © 2015 Yuji Miyane, verbatim |
+| `vendor/README.md` | 10,327 B | provenance, pinned version/commit, both SHA-256s, licence positions, API notes |
+| `.gitattributes` | 109 | `* text=auto eol=lf` plus `vendor/** -text` — see § why the encoders are vendored |
+| `scripts/check-build.sh` | 588 | the pre-flight gate: **77 checks**, including SHA-256 of both encoders |
 | `run` | 18 | a bash loop that opens `urls.lst` in Brave. Handy, not part of the build. |
 | `urls.lst` | 85 | URL list for `run` |
 | `icons/icon16.png` | 400 B | |
 | `icons/icon48.png` | 3.6 KB | |
 | `icons/icon128.png` | 18 KB | |
 
-33,782 lines across the JS/HTML/CSS files in this table.
+34,187 lines across the JS/HTML/CSS files in this table, **plus 2,888,580 bytes of
+vendored third-party JavaScript** that is deliberately *not* counted there — see
+§ why the encoders are vendored.
 
 ### The boundary rule
 
@@ -97,16 +106,16 @@ A service worker has no DOM, so no `AudioContext`, no `OfflineAudioContext`, no
 `decodeAudioData`.
 
 **Solved by an offscreen document** — `chrome.offscreen.createDocument` with
-reasons `['AUDIO_PLAYBACK','BLOBS']` (`background/background.js:1694-1698`). It is a
+reasons `['AUDIO_PLAYBACK','BLOBS']` (`background/background.js:1849-1857`). It is a
 real DOM page, so it can decode, resample, render a WAV header and detect BPM.
 
 It is created lazily and **proven alive before first use**
-(`background/background.js:1686-1714`). The liveness ping matters: a document that
+(`background/background.js:1828-1870`). The liveness ping matters: a document that
 exists but whose Web Audio failed to initialise answers `sunoPing` with `audio:false`,
 and *"discovering that at the first 24 MB buffer is far worse than finding out
 now."*
 
-The protocol is `suno-offscreen/1` (`background/background.js:1664`):
+The protocol is `suno-offscreen/1` (`background/background.js:1819`):
 
 | request | returns |
 |---|---|
@@ -116,7 +125,7 @@ The protocol is `suno-offscreen/1` (`background/background.js:1664`):
 | `sunoRenderWav` | `{ok, bytes, sampleRate, bitDepth, bpm, bpmSource, warnings}` |
 | `sunoBlobUrl` | `{ok, url, mime, byteLength, live}` |
 | `sunoBlobRevoke` / `sunoBlobRevokeAll` | `{ok, revoked, live}` |
-| `sunoTranscode` | `{ok, bytes, mime, format}` **or** `{ok:false, code:'ENCODER_UNAVAILABLE'}` |
+| `sunoTranscode` | `{ok, bytes, mime, format, sampleRate, warnings}` **or** `{ok:false, code:'ENCODER_UNAVAILABLE'}` / `{ok:false, code:'ENCODE_ERROR'}` / `{ok:false, code:'UNSUPPORTED_FORMAT'}` |
 
 The reply shapes are quoted from the document's own protocol block
 (`offscreen/offscreen.js:55-70`). Note `sunoAnalyze` in particular: the tempo is at
@@ -135,11 +144,11 @@ JSON-serialised, so an `ArrayBuffer` or typed array sent through it arrives as
 
 So there is an **id-keyed registry, first channel to answer wins**, and a
 truncated broadcast is **dropped unless the registry is already settled**
-(`background/background.js:1928-1934`) — handing a truncated descriptor to a caller
+(`background/background.js:1930-1934`) — handing a truncated descriptor to a caller
 expecting WAV bytes would produce a corrupt file. A truncated broadcast is still
 decisive *evidence*, so it arms a 5-second fuse rather than the full budget
-(`OFFSCREEN_TRUNCATED_GRACE_MS`, `background/background.js:1671`, armed at
-`:1766-1777`).
+(`OFFSCREEN_TRUNCATED_GRACE_MS`, `background/background.js:1826`, armed at
+`:1922-1934`).
 
 #### 🔐 Why "the only sender is us" is not a security argument
 
@@ -147,14 +156,14 @@ Worth its own paragraph, because it is the kind of assumption that reads as
 reasoning and is not.
 
 `resolveOffscreenReply` used to match on `/:result$/` alone, and it runs **before**
-`validateSender` (`background/background.js:5590-5600`) — so it was reachable by
+`validateSender` (`background/background.js:5776-5793`) — so it was reachable by
 anything that could post a message on the runtime channel. The request id is
-`'os' + sequence + '-' + Date.now().toString(36)` (`background/background.js:1749`):
+`'os' + sequence + '-' + Date.now().toString(36)` (`background/background.js:1904`):
 a small, entirely enumerable space. Anything that could post could guess an
 in-flight id and settle its waiter with a payload of its choosing. The worst case
 is `sunoBlobUrl` — the forged `url` goes straight to `chrome.downloads.download`.
 
-`isOffscreenReply` (`background/background.js:1872-1889`) now requires **all** of:
+`isOffscreenReply` (`background/background.js:2028-2045`) now requires **all** of:
 
 - `message.from === 'offscreen'`
 - `message.protocol === OFFSCREEN_PROTOCOL`
@@ -163,12 +172,12 @@ is `sunoBlobUrl` — the forged `url` goes straight to `chrome.downloads.downloa
 - `message.id` matching `/^os\d+-[a-z0-9]+$/`
 - `sender.url` matching `OFFSCREEN_PAGE_RE`, **when present** — belt and braces,
   because making it mandatory would turn a Chrome-side reporting change into
-  "every download times out" (`:1882-1887`)
+  "every download times out" (`:2038-2043`)
 
 A rejected envelope never reaches the registry, not even to be remembered; it is
 logged as `offscreen.reply_rejected` so a protocol change on either side is visible
 in diagnostics instead of showing up as an unrelated timeout
-(`background/background.js:1908-1916`).
+(`background/background.js:2064-2072`).
 
 The general lesson: **"the only extension sender is us" is an assumption about the
 protocol, not a check.** Every inbound discriminator gets verified at the boundary,
@@ -179,7 +188,7 @@ in the same place, in one function.
 `chrome.downloads.download()` needs a URL. There is no `URL.createObjectURL` in a
 worker.
 
-**Solved with a threshold** (`materializeUrl`, `background/background.js:2450-2466`):
+**Solved with a threshold** (`materializeUrl`, `background/background.js:2626-2650`):
 
 ```
 bytes.length <= settings.dataUrlMaxBytes (default 24 MB)
@@ -192,10 +201,10 @@ Two consequences worth knowing:
 
 - The offscreen page keeps an **LRU of 8 blob URLs**. A long batch would evict a
   live URL mid-transfer, so each URL is **revoked the moment its transfer
-  completes** (`revokeBlobUrls`, `background/background.js:1963-1973`, called from
-  `onDownloadChanged` at `:2611`).
+  completes** (`revokeBlobUrls`, `background/background.js:2119-2134`, called from
+  `onDownloadChanged` at `:2795`).
 - `dataUrlMaxBytes` is user-tunable, clamped to 64 KB–64 MB
-  (`background/background.js:969`).
+  (`background/background.js:1070`).
 
 ### ⏱️ 3. Workers get evicted at ~30 s idle
 
@@ -206,22 +215,22 @@ This is the constraint that shaped the most code.
 |---|---|
 | Nothing authoritative lives in a module-scope variable | `background/background.js:59-60` |
 | All durable state in IndexedDB + `chrome.storage.session` | `STORAGE_KEYS` at `background/background.js:228-236` |
-| Settings are a **cache**, re-derived on every wake | `background/background.js:941-943` |
-| Crawl cursors written after **every page** | `background/background.js:4632`, `:4681` |
-| Batch plans persisted so an evicted worker can rebuild them | `persistPlan`, `background/background.js:3504-3512` |
-| An append-only journal per batch | `DB.journal.append` throughout; trimmed at `background/background.js:4218` |
+| Settings are a **cache**, re-derived on every wake | `background/background.js:1043-1045`, `loadSettings` at `:1280-1300` |
+| Crawl cursors written after **every page** | `background/background.js:4816`, `:4865` |
+| Batch plans persisted so an evicted worker can rebuild them | `persistPlan`, `background/background.js:3683-3696` |
+| An append-only journal per batch | `DB.journal.append` throughout; trimmed at `background/background.js:4402` |
 | A 30-second alarm is the only reliable wake | `KEEPALIVE_PERIOD_MINUTES = 0.5`, `background/background.js:259` |
-| `bootstrap()` is idempotent and re-entrant | `background/background.js:5875` |
+| `bootstrap()` is idempotent and re-entrant | `background/background.js:6059` |
 
 **Invariant B** (`background/background.js:38-39`) is the sharp edge:
 
 > Every worker startup calls `downloads.resetInProgress()`; anything left
 > `in_progress` was written by an evicted worker and is NOT done.
 
-`reconcileDownloadsOnStartup` (`background/background.js:2640-2699`) then asks
+`reconcileDownloadsOnStartup` (`background/background.js:2824-2890`) then asks
 Chrome what actually happened to every download we started, so transfers that
 completed while the worker was dead get recorded correctly instead of retried. It
-runs from `bootstrap` at `background/background.js:5890`.
+runs from `bootstrap` at `background/background.js:6074`.
 
 **Invariant F** is the subtle one (`background/background.js:48-49`):
 
@@ -230,7 +239,7 @@ runs from `bootstrap` at `background/background.js:5890`.
 
 The previous build ended up with a keepalive that fired constantly **and** one
 that still did not protect a batch — the reasoning is repeated in the body of
-`armKeepalive` (`background/background.js:5721-5735`), which is the only place an
+`armKeepalive` (`background/background.js:5905-5923`), which is the only place an
 alarm is created.
 
 ### 📡 4. `chrome.runtime.sendMessage` cannot reach content scripts
@@ -249,7 +258,7 @@ async function broadcast(message) {
 }                                                    // -> content scripts
 ```
 
-`broadcast` at `background/background.js:1595-1620`.
+`broadcast` at `background/background.js:1751-1778`.
 
 ### 🪟 5. `window` is undefined in a worker
 
@@ -297,34 +306,119 @@ was first written:
 
 `manifest.json:77-79` sets `extension_pages` CSP to `script-src 'self'`. The
 offscreen document goes further: `default-src 'none'` with `connect-src 'none'`
-(`offscreen/offscreen.html`).
+(`offscreen/offscreen.html:17`).
 
-**Consequence: no CDN encoder, hence no MP3 and no OGG.** An encoder has to be
-vendored into the extension. None is. See
-[KNOWN-LIMITS, section 1](KNOWN-LIMITS.md) — this is the #1 blocker in the project.
+**Consequence: an encoder cannot be fetched from a CDN, ever.** That is why MP3
+and Ogg Vorbis are served by **locally vendored bundles** in `vendor/` rather than
+a CDN import — and therefore why there is no "download it if missing" fallback
+path to degrade to. See § why the encoders are vendored, immediately below.
 
 `lib/api.js:41-42` records the other half of the posture: *"No page tampering: this
 file never monkey-patches `window.fetch` and never injects script. It is a plain
 IIFE so no internal name leaks to global scope."*
+
+### 📦 Why the encoders are vendored, and how `.gitattributes` protects their bytes
+
+**The files.** Two upstream bundles, shipped unmodified, with their notices:
+
+| file | what it is | size | SHA-256 | licence |
+|---|---|---:|---|---|
+| `vendor/lame.all.js` | lamejs **1.2.1** — defines the global `lamejs`, whose `Mp3Encoder` does the MP3 encode | 530,087 B | `026bd88846040f357a937cd85821a48492a362eff0812cda734f23fca55fea3b` | **LGPL-3.0** |
+| `vendor/OggVorbisEncoder.js` | `higuma/ogg-vorbis-encoder-js` @ **`7a872423f416e330e925f5266d2eb66cff63c1b6`** — defines the constructor `OggVorbisEncoder` | 2,358,493 B | `5a9f749ab0f84da2292bd68b0e906422378428aea2e298fd116e8a1696da179b` | **MIT** (JS wrapper) + **Xiph BSD** (the compiled-in libogg/libvorbis C) |
+
+Plus `vendor/LICENSE-lamejs.txt`, `vendor/LICENSE-OggVorbisEncoder.txt` and
+`vendor/README.md`, which records provenance, the pinned version and commit, both
+digests and both licence positions. **Note the Ogg licence is MIT, not
+BSD-3-Clause** — the shipped file wins over the task brief that said otherwise, and
+the split between the MIT JS wrapper and the Xiph BSD C is real rather than a
+formality (`vendor/README.md:110-131`).
+
+**Why local, mechanically.** Three reasons, any one of which is decisive:
+
+1. They are loaded from inside the extension package at runtime.
+   `offscreen/offscreen.js` injects a `<script src>` for each one, resolved
+   relative to `offscreen/offscreen.html`, and `loadVendoredScript()` asserts the
+   resolved URL's protocol is `chrome-extension:` and **refuses anything else**
+   (`offscreen/offscreen.js:781-835`). Editing that path constant to an `https`
+   URL cannot reintroduce remote code.
+2. MV3's `script-src 'self'` plus the Web Store's ban on remotely hosted code means
+   fetching an encoder is not an available fallback at all — see § 6 above.
+3. **An untracked `vendor/` fails silently and only in production.** The extension
+   still loads, the options page still offers MP3 and Ogg Vorbis, and
+   `sunoTranscode` just returns `ENCODER_UNAVAILABLE`
+   (`offscreen/offscreen.js:863-870`): the control looks live, the click succeeds,
+   and no file appears. A fresh clone would ship that way with no error anywhere.
+   `.gitignore:38-88` spells out why that directory is **tracked on purpose** and
+   carries no ignore rule.
+
+Neither file needs `wasm-unsafe-eval` or a sidecar: `lame.all.js` is a browserified
+bundle of the `src/js` tree, and `OggVorbisEncoder.js` is an **asm.js** build with
+its memory initialiser embedded (one `use asm` directive, zero `WebAssembly`
+references, no `.mem` file). `manifest.json` needs no `web_accessible_resources`
+entry for either, because a `<script>` injected by an extension page into that same
+page is same-origin.
+
+**Why `.gitattributes` exists.** Because `.gitignore` cannot do this job.
+`.gitignore` controls **membership** — which paths git tracks — and has no say
+whatsoever over the **bytes** of the files it does track. A tracked file is
+rewritten in the working tree on checkout according to the EOL rules, whether or
+not it is listed. So the only place to state *"these files are binary, leave them
+alone"* is `.gitattributes`:
+
+```
+* text=auto eol=lf
+vendor/** -text
+```
+
+Under `core.autocrlf=input` (the macOS default) git applies no EOL normalisation
+and today's checkout is already correct. The danger is the next contributor:
+anyone on Windows with `core.autocrlf=true`, or anyone whose editor rewrites line
+endings on save, would check out **2.8 MB of CRLF-lifted JavaScript**. Every LF
+becomes CRLF, the stored blob changes, the recorded SHA-256 stops matching — and
+two separate claims fail at once:
+
+- the **integrity claim** in `vendor/README.md` becomes a lie that nobody notices,
+- and so does the **LGPL-3.0 "unmodified separate work"** position that
+  `offscreen/offscreen.js` relies on. A CRLF-rewritten file is no longer the file
+  upstream published, and "drop-in replaceable by the user" stops being true.
+
+Note that `vendor/** text eol=lf` would **not** be enough: `eol=lf` also rewrites
+a *lone* CR, and `vendor/OggVorbisEncoder.js` is an asm.js bundle whose byte-exact
+content is load-bearing. `-text` is the correct rule.
+
+**What enforces it.** `scripts/check-build.sh` runs **77 checks**, up from 63. The
+new ones matter most:
+
+| check | what it does |
+|---|---|
+| SHA-256 of both encoders | verifies each bundle against the digest **parsed out of `vendor/README.md`** — never restated in the script, so the record and the bytes cannot drift apart. A missing section, a missing `\| SHA-256 \|` row or an unparseable digest is a **FAILURE**, not a silent skip. Also compares the recorded byte size. (`scripts/check-build.sh:322-415`) |
+| existence + byte audit + UTF-8 over all five `vendor/` files | the byte audit, the Chrome-strict non-character gate and the `iconv`/`python3` validity pass used to **skip** `vendor/`, which meant the largest JavaScript in the package was the only JavaScript nobody checked (`scripts/check-build.sh:147-320`) |
+| `node --check` on both bundles | **tolerated, not failed**: `OggVorbisEncoder.js` parses but V8 prints *"Invalid asm.js: Expected shift of word size"* on stderr while still exiting 0 — a compiled-mode advisory about one shift inside libvorbis, not a syntax error and not a sign the bytes changed. Failing on upstream code we are forbidden to patch would be failing on the wrong thing (`scripts/check-build.sh:433-466`) |
+
+> **`vendor/` is in `AUDIT_FILES`, deliberately *not* in `BUILD_FILES`.** None of
+> those five paths appear in `manifest.json` (the offscreen page injects the
+> `<script>` at runtime), so the manifest path check cannot police them, and
+> `BUILD_FILES` is documented as the list to keep in sync with the manifest
+> (`scripts/check-build.sh:79-101`).
 
 ### Other MV3 details the code handles
 
 - **`onMessage` must return `true` only for async handlers.** Returning it
   unconditionally leaks the channel for every synchronous reply — the documented
   cause of *"the message port closed before a response was received"*. `onRuntimeMessage`
-  (`background/background.js:5674-5700`) inspects the **result**, not a
+  (`background/background.js:5858-5880`) inspects the **result**, not a
   hand-maintained `async` flag, *"because a flag that disagrees with the handler is
   exactly how a reply gets written to a channel that has already closed"*
-  (`background/background.js:5068-5073`).
+  (`background/background.js:5860-5869`).
 - **`document.body` is null at `document_start`.** The content script obeys one
   rule: no DOM access anywhere that assumes body exists until `mount()` runs
   (`content/content.js:6-12`, `:3126-3133`). Getting this wrong is what made the
   old page UI completely dead.
 - **Sender validation on every route.** `validateSender`
-  (`background/background.js:1634`) checks **both** `sender.id === chrome.runtime.id`
+  (`background/background.js:1789-1798`) checks **both** `sender.id === chrome.runtime.id`
   **and** a `sender.url` allowlist (`background/background.js:302-307`). An unknown
   type is rejected the same way, and both replies are **synchronous**
-  (`background/background.js:5611-5625`). The old `TRIGGER_NATIVE_DOWNLOAD`
+  (`background/background.js:5801-5809`). The old `TRIGGER_NATIVE_DOWNLOAD`
   checked neither and downloaded an arbitrary caller-supplied URL.
 - **The page token relay validates origin AND source**
   (`content/content.js:2981-2987`):
@@ -348,12 +442,12 @@ IIFE so no internal name leaks to global scope."*
 
 ### Request types (extension pages → worker)
 
-**27 routes** in the `ROUTES` table (`background/background.js:5080-5549`). Every
+**27 routes** in the `ROUTES` table (`background/background.js:5264-5733`). Every
 one is `{handler}` where `handler(payload, sender)` returns a plain object
 (synchronous reply, channel NOT held open) or a promise. There is no
 hand-maintained `async` flag, because a flag that disagrees with the handler is
 precisely how a reply ends up written to a closed channel
-(`background/background.js:5068-5076`).
+(`background/background.js:5240-5262`).
 
 | Type | payload | returns |
 |---|---|---|
@@ -394,17 +488,17 @@ undocumented and therefore unfindable:
 
 | Route | what changed |
 |---|---|
-| `GET_LIMITS` | now publishes **`variantAliases`** and **`wavRungRates`** (`background/background.js:5116-5135`) alongside `variants`, so a UI can build its select from the worker's own list *and* explain a substitution instead of silently showing a different value than the user picked. Also documented as **NO SIDE EFFECT** — reads constants and cached values only. |
-| `GET_DIAGNOSTICS` | documented as the "is this install healthy?" surface and the **only** reader of `missingLibs` / `audioWarnings` (`background/background.js:5230-5243`). No side effect. |
-| `DOWNLOAD_STATUS` | accepts an **optional `{batchId}`** (`background/background.js:5341-5347`): a UI holding a stale id from an earlier poll can ask about *that* batch. Omitting it keeps the previous behaviour (active batch, else last recorded), so an existing caller that sends nothing is unaffected. |
-| `PROBE_DRM` | accepts an **optional `{ladder:[…]}`** to probe a hypothetical ordering instead of the configured one (`background/background.js:5519-5528`), and now reports **`metered`** — the first available rung that *costs* a download, so a UI can say what the honest-but-paid alternative is (`:5541-5544`). |
+| `GET_LIMITS` | now publishes **`variantAliases`** and **`wavRungRates`** (`background/background.js:5300-5323`) alongside `variants`, so a UI can build its select from the worker's own list *and* explain a substitution instead of silently showing a different value than the user picked. Also documented as **NO SIDE EFFECT** — reads constants and cached values only. |
+| `GET_DIAGNOSTICS` | documented as the "is this install healthy?" surface and the **only** reader of `missingLibs` / `audioWarnings` (`background/background.js:5414-5428`). No side effect. |
+| `DOWNLOAD_STATUS` | accepts an **optional `{batchId}`** (`background/background.js:5523-5530`): a UI holding a stale id from an earlier poll can ask about *that* batch. Omitting it keeps the previous behaviour (active batch, else last recorded), so an existing caller that sends nothing is unaffected. |
+| `PROBE_DRM` | accepts an **optional `{ladder:[…]}`** to probe a hypothetical ordering instead of the configured one (`background/background.js:5711-5719`), and now reports **`metered`** — the first available rung that *costs* a download, so a UI can say what the honest-but-paid alternative is (`:5728`). |
 
 > ⚠️ **`SYNC_STATUS` still returns `total` but not `added`** — see KNOWN-LIMITS §15.
 > And `DL_DONE` still carries no per-clip detail — see KNOWN-LIMITS §14.
 
 ### Push types (worker → everyone)
 
-8 types, frozen at `background/background.js:625-629`. **The router ignores all of
+8 types, frozen at `background/background.js:712-717`. **The router ignores all of
 them**, so a broadcast can never re-enter the router and be answered with
 "unknown message type" (invariant E, `background/background.js:46-47`).
 
@@ -421,7 +515,7 @@ them**, so a broadcast can never re-enter the router and be answered with
 
 `stoppedReason` is the one field that must never collapse: it is
 `'complete' | 'quota' | 'ladder_exhausted' | 'cancelled'`
-(`background/background.js:4155-4160`), and both UIs branch on it rather than on
+(`background/background.js:4339-4343`), and both UIs branch on it rather than on
 `failed` — a batch that halted on the monthly allowance is a warning, not a success
 and not a failure (`popup/popup.js:34-38`, `content/content.js:2232-2251`).
 
@@ -432,17 +526,17 @@ worker's `onMessage` as either a structured-clone `sendResponse` or a
 `{type:'<type>:result', id, ok, …}` broadcast.
 
 The router deliberately **falls through** for `target:'offscreen'`
-(`background/background.js:5590-5600`) — swallowing it is how a blob URL silently never
+(`background/background.js:5766-5784`) — swallowing it is how a blob URL silently never
 arrives. `:result` messages go to `resolveOffscreenReply`, which verifies the
 envelope before anything can settle a waiter, and all of them are then **dropped**
-(`background/background.js:5582-5592`): the offscreen page is not waiting on a
+(`background/background.js:5776-5784`): the offscreen page is not waiting on a
 reply to its own reply, and answering a rejected one "unknown message type" is pure
 noise on top of the rejection already logged.
 
 > There used to be a `target:'background'` branch answering `offscreenReady` /
 > `offscreenPing`. It was **removed**, because `offscreen.js` has never sent such a
 > message — a listener for messages that cannot arrive is pure liability. The
-> reasoning is recorded in place (`background/background.js:5602-5609`). The
+> reasoning is recorded in place (`background/background.js:5786-5793`). The
 > offscreen document's liveness is established by `sunoPing`, which is a real
 > request/response exchange.
 
@@ -475,7 +569,7 @@ iterateFeed()                        lib/api.js:1934
   ├──> [end]          batch { type:'summary', truncated, error }
   │
   ▼  per page:
-  ├──> commitPage()               background/background.js:4509
+  ├──> commitPage()               background/background.js:4693
   │      forced rebuild? buffer, cap 25,000 -> overflow to additive
   │      incremental?    hydrate -> clips.putMany(chunk of 500)   ONE tx per chunk
   ├──> flushIdSets()              every 5 pages (DISLIKED_FLUSH_EVERY_PAGES)
@@ -491,19 +585,19 @@ forced rebuild, complete, not overflowed?
 cursor.state = 'idle' | 'cancelled' | 'error';  broadcast SYNC_DONE / SYNC_ERROR
 ```
 
-**`clips.clear()` is never called** (`background/background.js:4356`). A forced
+**`clips.clear()` is never called** (`background/background.js:4540-4542`). A forced
 rebuild uses `bulkReplace` — one transaction, abort-safe, at
-`background/background.js:4659`. Invariant C
+`background/background.js:4841-4844`. Invariant C
 (`background/background.js:40-41`).
 
 A crawl interrupted by an eviction is **deliberately not auto-resumed**
-(`background/background.js:5901-5913`): a crawl can be hundreds of requests, and
+(`background/background.js:6099-6107`): a crawl can be hundreds of requests, and
 silently restarting one on every worker wake would hammer the API. `SYNC_START`
 with `force:false` picks up from the stored cursor.
 
 > ⚠️ **A crawl that finished pass B but never computed the diff** derives it from
 > the persisted pass-A set and sets `dislikedApproximate` when that set was never
-> flushed (`background/background.js:4644-4654`). The UI shows the flag; do not
+> flushed (`background/background.js:4828-4839`). The UI shows the flag; do not
 > treat a "disliked only" result as exact without checking it.
 
 ### Filter / query
@@ -516,7 +610,7 @@ UI                        content/content.js buildSpec()
 GET_CLIPS {spec, sort, order, offset, limit}
   │
   ▼
-queryClips()                          background/background.js §14
+queryClips()                          background/background.js:4962
   ├──> queryContext()   { projects, dislikedIds, projectIdsById }
   ├──> DB.clips.all({limit:-1})            the local index, all rows
   ▼
@@ -537,38 +631,38 @@ GET_CLIPS reply  ->  UI
 UI                        DOWNLOAD_START {spec | ids | useSelection, variant, …}
   │
   ▼
-startBatch()                            background/background.js:3670
+startBatch()                            background/background.js:3854
   │  normalizeLadder()      -- may legitimately yield []
   │  FAIL LOUDLY on []      -> {ok:false, code:'ladder_empty'}
   ▼
-resolveBatchClips()                     background/background.js:3547
+resolveBatchClips()                     background/background.js:3731
   │  explicit ids  WIN  -- the old build ignored the selection entirely
   ▼
-dedupe by clip id  <-- BEFORE ANYTHING IS SPENT   background/background.js:3687-3695
+dedupe by clip id  <-- BEFORE ANYTHING IS SPENT   background/background.js:3885-3889
   │  (one song = one download, so duplicates are free to drop)
   ▼
 skip items already isDone(id, variant) unless overwrite
   ▼
-quotaPreflight(items.length)            background/background.js:3740
+quotaPreflight(items.length)            background/background.js:3944-3947
   │  shortfall? -> message naming N needed, M remaining, reset date
   ▼
 plan { status:'planned', items[], cursor:0, stats }  -> persistPlan()
   │
   ├── dryRun?  -> plan.status = 'done', return, spend nothing
   ▼
-runBatch()  [detached, own AbortController]             background/background.js:3822
+runBatch()  [detached, own AbortController]             background/background.js:4006
   │  worker pool of `concurrency` (default 3, max 8)
-  │  MID-BATCH QUOTA GUARD armed here                    background/background.js:3866-3939
+  │  MID-BATCH QUOTA GUARD armed here                    background/background.js:4035-4123
   │
   ▼  per item:
   ├──> markInProgress(clipId, variant)
   ├──> for attempt in 1..(1 + retryAttempts):
-  │      ├──> runLadder(clip, ctx)                   background/background.js:2965
+  │      ├──> runLadder(clip, ctx)                   background/background.js:3149
   │      │      for rungId of sourceLadder:
   │      │        runLadderRung()  ->  bytes OR a signed URL
   │      │        failure? record the attempt, next rung
   │      │        all rungs failed? -> {code:'ladder_exhausted', attempts[]}
-  │      ├──> maybeTranscode()      offscreen; WAV render ONLY
+  │      ├──> maybeTranscode()      offscreen; WAV render OR mp3/ogg ENCODE
   │      ├──> applyTagsAndSidecars()  §11
   │      ├──> writeSidecars()         .lrc / .json
   │      └──> saveBytes() / saveUrl()  -> data: URL or offscreen blob URL
@@ -592,22 +686,22 @@ the file:
 
 The two sites:
 
-1. `onDownloadChanged` — `background/background.js:2582-2625`,
-   `proof:'downloads.onChanged:complete'` (`:2604`)
-2. `reconcileDownloadsOnStartup` — `background/background.js:2640-2699`
+1. `onDownloadChanged` — `background/background.js:2766-2830`,
+   `proof:'downloads.onChanged:complete'` (`:2788`)
+2. `reconcileDownloadsOnStartup` — `background/background.js:2824-2890`
 
 `chrome.downloads.download()` returning an id means **Chrome accepted the request**,
 nothing more. Marking done on that signal is how you write a history row for a
 file that never landed.
 
-The same listener has a second fix baked in (`background/background.js:2574-2585`):
+The same listener has a second fix baked in (`background/background.js:2769`):
 **`download.error` is a STRING on the delta item.** The old build tested a
 non-existent `errorDetails` field *inside* `state === 'complete'`, so the branch was
 permanently dead **and its polarity backwards** — failures were only ever supposed
 to be detected from inside the success case.
 
 If a settle times out, the row is left `in_progress` on purpose
-(`background/background.js:4040-4046`): *"transfer still in flight; will be
+(`background/background.js:4220-4226`): *"transfer still in flight; will be
 reconciled on the next worker wake."* Reconciliation owns it from there.
 
 ### Tag + save
@@ -643,18 +737,18 @@ Two details that matter:
 
 - **`tagOptions.bpm: false` really does suppress the tempo tag.** The worker gates
   `meta.bpm` with the *same* expression as the top-level `bpm`
-  (`background/background.js:3338-3348`), and that matters because
+  (`background/background.js:3522-3529`), and that matters because
   `lib/tagger.js` resolves `req.bpm !== undefined && req.bpm !== null ? req.bpm :
   meta.bpm` (`lib/tagger.js:1968`). An ungated `meta.bpm` therefore re-introduced
   the `TBPM` frame whenever the tempo toggle was off but the clip happened to carry
   a tempo — the tagger's fallback quietly undoing the user's choice. It no longer
   can.
 - **`track:false` sidecars are deliberately not in `SunoDB.downloads`**
-  (`background/background.js:2496-2498`, `:3438`): that store is the record of
+  (`background/background.js:2652-2660`, `:3620-3622`): that store is the record of
   which `(clip, variant)` pairs are finished, and a `.lrc` file is not a variant.
   Registering one would double every count and make `isDone(id, 'm4a')` ambiguous.
 - **The recorded variant must match the DELIVERED file**
-  (`background/background.js:2820`, `:3006-3016`). A WAV transcode changes the
+  (`background/background.js:3002-3003`, `:3187-3188`). A transcode changes the
   variant; if the row says `m4a` and the file is `.wav`, a later
   `isDone(id, 'm4a')` check re-downloads the same song. Both the recorded variant
   and the filename follow the bytes actually written.
@@ -702,10 +796,10 @@ Append-only, one row per meaningful step (`item-start`, `item-ok`, `item-failed`
 `phase: 'planned' | 'run-start' | 'done' | 'quota-stop' | 'cancelled' | 'error'`,
 `dislike-diff`, `truncated-fallback`, …). It is what makes "what happened at 3am"
 answerable, and it is trimmed per batch at the end
-(`background/background.js:4218`).
+(`background/background.js:4402`).
 
 `quota-stop` is a **separate** phase from `done`
-(`background/background.js:4174-4193`), precisely so a deliberate quota halt is
+(`background/background.js:4366-4385`), precisely so a deliberate quota halt is
 distinguishable from a batch that ran out of plan.
 
 ### `meta` keys
@@ -741,19 +835,19 @@ written**, not by the declaration.
 
 > **Invariant G** (`background/background.js:50-51`): *No token or key material is
 > ever logged, or written outside `chrome.storage.session`.* `SENSITIVE_KEY_RE`
-> (`background/background.js:645`) drops anything matching
+> (`background/background.js:733`) drops anything matching
 > `token|jwt|authorization|bearer|password|secret|cookie|session_key|private_key|content_key|user_key|glt|iv`
 > from the log at any level, and `EXPORT_SETTINGS` never emits the token, key
 > material, or the diagnostics ring buffer
-> (`background/background.js:5420-5446`).
+> (`background/background.js:5604-5631`).
 
 ---
 
 ## 🔢 Settings reference
 
-`DEFAULT_SETTINGS` at `background/background.js:530-622`, with the per-key
-documentation in the `Settings` typedef at `:897-941`. Every key is validated on
-read (`coerceSettings`, `background/background.js:956-1018`) because a corrupt blob
+`DEFAULT_SETTINGS` at `background/background.js:600-710`, with the per-key
+documentation in the `Settings` typedef at `:985-1041`. Every key is validated on
+read (`coerceSettings`, `background/background.js:1057-1124`) because a corrupt blob
 must not be able to produce a NaN rate or an unsanitised path template.
 
 | group | keys |
@@ -762,44 +856,85 @@ must not be able to produce a NaN rate or an unsanitised path template.
 | pacing | `rateLimit` (4), `rateLimitJitter` (true), `concurrency` (3), `retryAttempts` (2) |
 | naming | `filenameTemplate`, `folderDepth` (2), `maxFolderDepth` (4), `overwrite`, `dataUrlMaxBytes` (24 MB) |
 | tags | `tagOptions.{embed,lyrics,artwork,bpm,comment,json,lrc}` — **exactly seven**, `artistPolicy`, `neutralArtist`, `albumName` |
-| conversion | `transcode` (**`none` \| `wav` only**), `wavSampleRate` (48000) |
+| conversion | `transcode` (**`none` \| `wav` \| `mp3` \| `ogg`**), `wavSampleRate` (48000), **`mp3Bitrate`** (192), **`oggQuality`** (0.5) |
 | crawl | `syncMaxPages` (200), `dislikedMode` (`exclude`), `autoSync`, `syncIntervalMinutes` |
 | safety | `dryRun`, `allowHlsCapture`, `debug`, **`quotaReserve`**, **`quotaCheckEvery`** |
 
-### The four settings that changed in 6.0.1
+### The six settings that changed in 6.0.1
 
-**`quotaReserve` — `background/background.js:597-607`, clamped at `:999`.** The
+**`quotaReserve` — `background/background.js:685-695`, clamped at `:1105`.** The
 floor the mid-batch guard stops **at**: `remaining <= quotaReserve` ends the batch
 cleanly. Valid `[0, 10000]`, default `0`, meaning "stop the moment the meter is
 empty". Wired to a real control at `options/options.html:150-153`.
 
-**`quotaCheckEvery` — `background/background.js:608-614`, clamped at `:1000`.** Re-read
+**`quotaCheckEvery` — `background/background.js:696-702`, clamped at `:1106`.** Re-read
 the meter at most once per N **successful metered** downloads; unmetered rungs never
 count, so a purely unmetered batch polls zero times. Valid `[1, 100]`, default `5`.
 A value of 0 would poll on every item — a quota-hammering loop — and is clamped up
 to 1. Wired at `options/options.html:164-167`.
 
 **`variant` is alias-tolerant, not membership-tested** (`resolveVariant`,
-`background/background.js:517-527`, applied at `:977`). The old
+`background/background.js:528-538`, applied at `:1076-1084`). The old
 `VARIANTS.indexOf(...) >= 0` test reverted a stored `mp3-320` to the default with
 no trace at all. Now it substitutes via `VARIANT_ALIASES`, logs both values at
 debug level, and only falls back for a value it has never heard of.
 
-**`transcode` is narrowed to `['wav']`** (`background/background.js:984-993`).
-`mp3` and `ogg` used to be *accepted* here, which meant an imported settings blob
-could put the worker into a permanently-failing state while `options.js` rendered
-the radios as "None" — so the user had no way to see or undo it. `'wav'` is the
-only conversion this build can genuinely perform, and it is rendered as a real
-control.
+**`transcode` was narrowed to `none|wav` in 6.0.1 and is now widened back.**
+`background/background.js:1085-1094`. The 6.0.1 clamp was correct *at the time* —
+`mp3` and `ogg` were admitted by a build that shipped no encoder, so an imported
+settings blob could put the worker into a permanently-failing state while
+`options.js` rendered the radios as "None", leaving no way to see or undo it. The
+6.1.0 clamp is `TRANSCODE_FORMATS = ['none','wav','mp3','ogg']`
+(`:549`), reduced by `resolveTranscode` (`:567-572`).
+
+### The two settings that changed in 6.1.0
+
+Both exist only because both encoders ship. Neither accepts a range, which is the
+whole reason they are named lists rather than `[min,max]` clamps — see
+`snapToChoice` (`background/background.js:1188-1235`) for the full reasoning.
+
+**`mp3Bitrate` — default `192` kbps (`:660-666`).** Valid values are
+`MP3_BITRATES = [128, 160, 192, 224, 256, 320]` (`:584`) — the six bitrates
+`lamejs.Mp3Encoder(channels, rate, bitrate)` accepts at full quality. Anything else
+makes LAME fall back to its own internal choice, so a value let through as-is would
+be discarded with no trace and the file would come out at a bitrate the user never
+asked for.
+
+**`oggQuality` — default `0.5` (`:667-674`).** Valid values are
+`OGG_QUALITIES`, the tenths from `0.0` to `1.0` (`:595-597`) — the encoder's
+*named-quality* index, 0 = smallest/fastest, 1 = largest/slowest, matching the
+library's own granularity. A missing value becomes **0.5, not the offscreen page's
+own 0.8 default**, so what the settings say and what the encoder does cannot
+disagree.
+
+Both are **snapped, never rejected**: the nearest entry wins, and **ties snap to
+the lower option** (`200 → 192`, not `224`), so the result is a deterministic
+function of the input rather than of iteration luck. Nearest-choice snapping also
+subsumes clamping, so 10000 snaps up to the largest option and a negative snaps down
+to the smallest with no separate range check. `null`, `''` and booleans count as
+**missing** rather than as 0/1, because `Number(null) === 0` would otherwise quietly
+mean "the lowest quality" for a key that was simply never set. They are snapped a
+**second** time at the point of use (`:2357-2358`) so a caller handing over a
+hand-built `settings` object cannot push a NaN into an encoder.
+
+Both have real `<select>` controls (`options/options.html:502-529`), gated on the
+matching transcode format by `gateOnTranscode`, which touches only `.disabled` and
+`aria-disabled` and **never `.value`** (`options/options.js:653-678`) — that is what
+preserves a choice made under one format across a switch to another. The option
+lists are `MP3_BITRATE_CHOICES` / `OGG_QUALITY_CHOICES`
+(`options/options.js:152-173`), duplicated rather than imported because a content
+script and an extension page have no shared module graph; a local `snapChoice`
+mirror exists purely to paint the right option when the worker hands over a value
+the selects do not carry (`options/options.js:224-247`).
 
 **The seven `tagOptions` keys** are rebuilt from the incoming object alone on every
-read (`background/background.js:1006-1016`), which is why every UI sends the whole
+read (`background/background.js:1112-1122`), which is why every UI sends the whole
 object back rather than a one-key patch — a partial `tagOptions` would reset the
 other six to the worker defaults (`content/content.js:1183-1187`, `:2526-2528`).
 
 ### Filename templates
 
-Tokens (`buildTemplateVars`, `background/background.js:2290-2294`):
+Tokens (`buildTemplateVars`, `background/background.js:2488-2517`):
 
 ```
 {workspace} {title} {model} {artist} {year} {month} {day}
@@ -810,17 +945,17 @@ Default: `{title}_{clipIdShort}.{ext}`.
 
 - `{artist}` resolves the **artist policy**, not the clip's `display_name` —
   those fields are the *owner's account identity*, never a third-party artist
-  credit (`background/background.js:566-570`, `:2296-2298`).
+  credit (`background/background.js:2496-2500`).
 - An unknown `{token}` becomes `_`, so no literal braces reach the filesystem
-  (`background/background.js:2354`).
+  (`background/background.js:2537-2538`).
 - Folder segments are honoured up to `maxFolderDepth`, hard-capped at 4
-  (`background/background.js:2356-2365`).
+  (`background/background.js:2542-2548`).
 - **The extension is ALWAYS appended** when the rendered name lacks one
-  (`background/background.js:2379-2380`, using `extensionFor` at `:2286-2288`).
+  (`background/background.js:2563-2564`, using `extensionFor` at `:2470-2472`).
   The previous build never appended one.
-- A title that sanitises to nothing falls back to `_`
-  (`background/background.js:2370-2377`).
-- Sanitisation is **hostile by design** (`background/background.js:2243-2260`):
+- A title that sanitises to nothing falls back to the short clip id
+  (`background/background.js:2557-2561`).
+- Sanitisation is **hostile by design** (`background/background.js:2438-2468`):
   control chars, bidi overrides, line separators and BOM stripped; illegal
   characters replaced; dot-runs collapsed so `..` cannot survive; Windows device
   names prefixed; NFC normalised; 180-char basename cap.
@@ -846,7 +981,7 @@ The recon hit exactly this trap with a byte-corrupted hand-pasted token
 
 > ⚠️ **`GET_BOOT.token` and `GET_TOKEN_STATUS.token` are OBJECTS**, not strings:
 > `{hasToken, expiresAt, secondsRemaining, source, badToken}`
-> (`tokenStatus`, `background/background.js:1526-1539`). The old consumer guard was
+> (`tokenStatus`, `background/background.js:1677-1694`). The old consumer guard was
 > `TOKEN_RE.test(String(res.token))`, and `String({hasToken:true,…})` is
 > `"[object Object]"`, which can never match the token pattern — so the dock's
 > token panel silently reported nothing. The check is now a shape test

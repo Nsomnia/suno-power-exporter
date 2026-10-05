@@ -7,6 +7,246 @@ project uses [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [6.1.0] — 2026-10-05
+
+> *"The number one limitation is gone, and two bugs were hiding behind it."*
+
+### 🎉 The story worth telling
+
+6.0.1 closed with a loud, honest gap at the top of `KNOWN-LIMITS.md`: **MP3 and OGG
+output did not exist in this build.** Not "were rough", not "were untested" — the
+encoders were not in the repository, and the docs said so in four places.
+
+This release ships them. `vendor/lame.all.js` and `vendor/OggVorbisEncoder.js` are
+committed, **byte-identical to upstream**, with their licence notices, a provenance
+record, and a SHA-256 gate that keeps all three honest.
+
+But the interesting part is not the 2.8 MB. It is what was *behind* the gap:
+
+- **`lib/db.js` contained a raw `U+FFFF` non-character that Chrome refused to
+  load.** It was valid UTF-8 by every standard definition. It was the standard
+  IndexedDB prefix-range upper-bound sentinel — the one character in the file that
+  a Unicode tool cannot help but accept.
+- **The Ogg encode loop was written against lamejs's API, and
+  `OggVorbisEncoder` does not have one.** Every OGG request would have thrown a
+  `TypeError`.
+
+Both were invisible while the encoders were absent, because nothing could reach
+them. Lifting the limitation exposed them.
+
+### 🔤 The `U+FFFF` load-blocker
+
+Chrome refused to load the extension at all:
+
+> *Could not load file 'lib/db.js' for content script. It isn't UTF-8 encoded.*
+
+The cause was a **single raw `U+FFFF` non-character** at `lib/db.js:1382` — the
+upper bound of the `title_lower` prefix range built by `clips.searchTitle`:
+
+```js
+: KR.bound(lower, lower + '￿', false, false);
+```
+
+That line is now written as the `\uFFFF` escape, which is the same character
+expressed in ASCII source.
+
+**The diagnosis is the lesson, and it is why `scripts/check-build.sh` grew a gate
+rather than a note.** `iconv -f UTF-8 -t UTF-8`, Python's strict codec, `file`,
+every editor and every linter accept `U+FFFF` as valid UTF-8. Chromium does not:
+`base::IsStringUTF8` uses `base::IsValidCharacter`, which rejects the whole
+non-character range — `U+FDD0..U+FDEF` and every code point ending in
+`0xFFFE`/`0xFFFF` — where `IsValidCodepoint` allows them. A file can therefore be
+valid UTF-8 by every standard tool and still be refused by the consumer.
+
+The fix in the checker is to **test against the consumer's actual validator**, not
+against a standard one. `scripts/check-build.sh:164-285` reimplements
+`base::IsValidCharacter`, the ICU `U8_NEXT` walk, and Chromium's rejection of
+`U+FFFE`/`U+FFFF`, and reports the offending line number. This is not optional
+hygiene: it is the only check in the script that would have caught this.
+
+### 🎧 The Ogg API mismatch that would have broken OGG export
+
+The existing encode loop assumed `encoder.encode()` returns bytes and that
+`encoder.flush()` exists. The real `OggVorbisEncoder` does neither:
+
+| | `lamejs.Mp3Encoder` | `OggVorbisEncoder` |
+|---|---|---|
+| encode | `encodeBuffer(left, right)` → `Int8Array` | `encode([left, right])` → **`undefined`**; it pushes each finished page onto its own `oggBuffers` array |
+| flush | `flush()` → `Int8Array` | **`flush()` does not exist.** The methods are `encode`, `finish`, `cancel`, `process`; `finish('audio/ogg')` *is* the flush and hands over the whole stream as a `Blob` |
+
+A `if (buf && buf.length) parts.push(buf)` loop — the shape lamejs requires —
+therefore **silently discards every page** and yields zero bytes, and calling
+`flush()` was a `TypeError` on every single OGG request.
+
+Both facts are now **asserted, not assumed**
+(`offscreen/offscreen.js:923-939`): a missing `encode`/`finish` pair yields a typed
+`ENCODE_ERROR` naming the pinned SHA-256 rather than a raw `TypeError`, and a
+zero-byte result yields its own `ENCODE_ERROR`
+(`offscreen/offscreen.js:1136-1141`) instead of a silent success.
+
+### ➕ Added
+
+- **Both audio encoders, vendored and hash-verified.**
+
+  | file | what | size | SHA-256 | licence |
+  |---|---|---:|---|---|
+  | `vendor/lame.all.js` | lamejs **1.2.1**, defines the global `lamejs` | 530,087 B | `026bd88846040f357a937cd85821a48492a362eff0812cda734f23fca55fea3b` | **LGPL-3.0** |
+  | `vendor/OggVorbisEncoder.js` | `higuma/ogg-vorbis-encoder-js` @ **`7a872423f416e330e925f5266d2eb66cff63c1b6`**, defines the constructor `OggVorbisEncoder` | 2,358,493 B | `5a9f749ab0f84da2292bd68b0e906422378428aea2e298fd116e8a1696da179b` | **MIT** wrapper + **Xiph BSD** C |
+
+  `lame.all.js` was independently compared against the same file extracted from
+  the `lamejs@1.2.1` npm tarball: **byte-identical**, both hashes `026bd888…a3b`.
+  `OggVorbisEncoder.js` matches the git blob SHA the GitHub API reports for
+  `lib/OggVorbisEncoder.js` at that commit. Plus `vendor/LICENSE-lamejs.txt`,
+  `vendor/LICENSE-OggVorbisEncoder.txt` and `vendor/README.md`.
+- **The `transcode` clamp now admits all four values.**
+  `TRANSCODE_FORMATS = ['none', 'wav', 'mp3', 'ogg']`
+  (`background/background.js:549`), reduced by a dedicated `resolveTranscode`
+  (`:567-572`) and applied at `:1094`. The 6.0.1 clamp to `none|wav` was correct at
+  the time — the encoders did not exist — but it silently removed a capability the
+  moment the capability arrived, leaving the UI rendering "None" while the stored
+  blob still said `'mp3'`.
+- **Two new settings keys, with real controls.** `mp3Bitrate` (default `192`;
+  valid `128,160,192,224,256,320`) and `oggQuality` (default `0.5`; valid `0`–`1.0`
+  by tenths), both snapped by a new `snapToChoice` helper
+  (`background/background.js:1188-1235`) — **nearest wins, ties go lower** — and
+  both backed by `<select>` elements on the options page
+  (`options/options.html:502-529`) that are gated on the matching transcode format
+  and **preserve their value across format switches**, because `gateOnTranscode`
+  touches only `.disabled`/`aria-disabled` and never `.value`
+  (`options/options.js:653-678`).
+- **`.gitattributes`** — `* text=auto eol=lf`, plus `vendor/** -text`.
+- **`scripts/check-build.sh`, now 77 checks** (was 63).
+
+### 🎚️ Changed
+
+- **Transcoding is a local, unmetered operation, and that is now stated as the
+  trade-off it is.** `maybeTranscode` runs after the bytes arrive, its only I/O is
+  a runtime message to the offscreen document, and every rung it is called from is
+  already unmetered — so **a transcode consumes no monthly download allowance at
+  all**. It costs a full decode plus a re-encode (wall-clock CPU) and peak memory
+  for both the decoded PCM and the encoded output, and it buys a file that plays
+  everywhere. The reasoning is in the code at
+  `background/background.js:2297-2313` and in
+  [`docs/DOWNLOAD-LADDER.md`](docs/DOWNLOAD-LADDER.md).
+- **MP3 and Ogg are always encoded at 48 kHz**, because the worker sends no
+  `sampleRate` on the lossy rungs and the offscreen page falls back to `48000`
+  (`background/background.js:2332`, `:2359-2366`;
+  `offscreen/offscreen.js:1120-1121`). Only WAV has a user-controllable rate. The
+  options page now says so on the WAV rate control.
+- **MP3 and Ogg remain off the *variant* list, deliberately.** `variant` selects
+  the download route and becomes its `?format=` parameter, whose enum is
+  undocumented; asking for a format the server may not serve means failing and
+  falling through the ladder, potentially spending the metered rungs' quota to
+  produce the very file the free rungs already gave us. They are one key away,
+  under `transcode`. `FLAC`, `AAC` and `Opus` have no encoder and no `transcode`
+  format, so they remain genuinely undeliverable.
+- **`scripts/check-build.sh` gained SHA-256 verification of both encoders, parsed
+  out of `vendor/README.md` rather than restated** (`scripts/check-build.sh:322-415`),
+  so the recorded digests and the bytes on disk cannot drift apart. A missing
+  section, a missing `| SHA-256 |` row or an unparseable digest is a **failure**,
+  not a silent skip. It also compares the recorded byte size.
+- **`scripts/check-build.sh` extended its existence, byte-audit and UTF-8 coverage
+  to all five `vendor/` files** (`scripts/check-build.sh:147-320`). Those gates used
+  to skip `vendor/`, which meant the largest JavaScript in the package was the only
+  JavaScript nobody checked.
+- **`node --check` on the vendored bundles is tolerated, not failed.**
+  `OggVorbisEncoder.js` parses but V8 prints *"Invalid asm.js: Expected shift of
+  word size"* on stderr while still exiting 0 — a compiled-mode advisory about one
+  shift inside libvorbis, not a syntax error and not a sign the bytes changed
+  (`scripts/check-build.sh:433-466`). Failing on upstream code we are forbidden to
+  patch would be failing on the wrong thing; the file is not excused from the
+  existence, byte-audit, UTF-8 or SHA-256 gates, which is where real damage shows.
+
+### 🐛 Fixed
+
+- **`lib/db.js` contained a raw `U+FFFF` non-character**, which is valid UTF-8 by
+  every standard tool and rejected by Chromium's `base::IsStringUTF8`. Chrome
+  refused to load the extension at all — see the story above. Now written as the
+  `\uFFFF` escape at `lib/db.js:1382`.
+- **`offscreen/offscreen.js` called the Ogg encoder with lamejs's API**, which
+  would have thrown a `TypeError` on every OGG request and silently produced a
+  zero-byte file even where it did not. Fixed, with a capability assertion — see
+  the story above.
+- **`sunoTranscode` was unreachable dead code.** `coerceSettings` clamped
+  `transcode` to `none|wav`, `maybeTranscode` read the clamped value, and the two
+  branches that actually encode (`mode === 'mp3'`, `mode === 'ogg'`) could never
+  run. Shipping the encoders without lifting the clamp would have shipped a UI
+  control that saves the original and says nothing.
+
+### ⚖️ Licence obligations, recorded honestly
+
+Shipping this extension **redistributes** both encoders, and the terms bind
+whoever distributes it. This is now item 12 in
+[`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md) rather than a footnote, because two
+gaps are real:
+
+- The `LICENSE` file shipped inside the `lamejs` npm tarball — saved verbatim as
+  `vendor/LICENSE-lamejs.txt` — is **not** the licence text. It is the LAME FAQ
+  answer *"Can I use LAME in my commercial program?"*, which says the LGPL applies
+  and **names no LGPL version**. So **"LGPL-3.0" rests on `package.json` and the
+  npm registry metadata**, not on the licence shipped beside the code. Nobody has
+  audited the origin of lamejs's JS port against the upstream LAME C sources.
+- `OggVorbisEncoder.js` is **MIT, not BSD-3-Clause** — the JS wrapper is MIT and
+  the compiled-in libogg/libvorbis C is under the 3-clause BSD text, a split the
+  upstream README states and the shipped file confirms. The **Xiph BSD text is
+  referenced by URL and not reproduced locally**, so a distributor who wants it
+  physically in the package should add it.
+
+Neither blocks shipping. Both are the first two questions for a legal review.
+
+### 📕 Docs
+
+- **`docs/KNOWN-LIMITS.md` was restructured.** The MP3/OGG item is **demoted out of
+  the top slot** into a "resolved" note that names where the capability is now
+  documented, so a future session does not re-add the claim from memory. The new
+  **item 1 is the `?format=` enum** — the real remaining limit that decides what you
+  can ask Suno for at all, and the reason the variant list is three and MP3/Ogg live
+  under `transcode`. A **new item 12** records the redistribution obligations above.
+  Items 2–12 shifted up one; items 13–20 kept their numbers, so most cross-references
+  survived.
+- **`docs/DOWNLOAD-LADDER.md`**: the format matrix now covers all five audio
+  outputs, with the local-transcode cost/quota trade-off stated in full, both new
+  settings keys, the fixed 48 kHz encode rate, and the Ogg API asymmetry.
+- **`docs/ARCHITECTURE.md`**: `vendor/` added to the file map with both licences and
+  both SHA-256s, `.gitattributes` and `scripts/check-build.sh` added, a new
+  subsection on **why the encoders are vendored and how `.gitattributes` protects
+  their bytes**, and `mp3Bitrate`/`oggQuality` added to the settings table.
+- **`README.md`**: feature line and limitations section updated; the MP3/OGG row is
+  replaced by the licence-obligation row; `scripts/check-build.sh` is now
+  documented in *Contributing & verification* with the `U+FFFF` story.
+- **Every `file:line` citation in the doc set was re-verified against the current
+  source.** `background/background.js` had grown to 6,257 lines and had moved
+  substantially; the stale citations were re-quoted rather than carried forward.
+  The `lib/*.js` residue flagged by the previous pass was audited line by line —
+  almost all of it was already correct, and the two exceptions
+  (`lib/api.js:55-58` → `:53-56`, and `lib/db.js:2743`) were fixed.
+
+> **`manifest.json` ships at `"version": "6.1.0"` / `"version_name": "6.1.0 - …"`**
+> (`manifest.json:80-81`). The bump shipped **with** this entry, unlike the note an
+> earlier draft carried.
+
+### The 6.0.1 → 6.1.0 relationship, stated plainly
+
+**6.1.0 is additive and corrective; it does not revert anything 6.0.1 fixed.**
+
+- Every defect 6.0.1 fixed stays fixed. The 6.0.1 clamp on `transcode` was **not
+  reverted** — it was *widened*, from `none|wav` to all four values, and the
+  reduction still degrades an unrecognised value to `'none'` rather than letting it
+  reach `maybeTranscode` raw. The narrow clamp was a correct response to a missing
+  encoder; the wide clamp is the correct response to a shipped one.
+- The variant list is **still exactly three entries**. Shipping two encoders did
+  not add two variants, because a variant is a download route and its enum is
+  undocumented (see item 1).
+- The four distinct batch outcomes, the observed-completion invariant, the
+  mid-batch quota guard and the alias-tolerant variant resolution are untouched.
+- **One 6.0.1 statement is now superseded and is marked as such:** 6.0.1 said
+  *"the MP3/OGG limitation itself is unchanged and still true, it is still the #1
+  item."* That was true when written. It is the one claim in this changelog that
+  6.1.0 invalidates, and both `CHANGELOG.md` and `docs/KNOWN-LIMITS.md` now say so
+  explicitly so nobody re-reads the old line as current.
+
+---
+
 ## [6.0.1] — 2026-10-04
 
 > *"Found by auditing our own integration seams."*
@@ -44,15 +284,15 @@ tempo when the feed carries none read `reply.bpm` instead of
 `TBPM` frame was never written, and the `.json` sidecar had no tempo — all
 consistently, which is exactly what makes a broken pipeline look like a quiet one.
 
-The fix is one helper. `bpmFromClip` (`background/background.js:1119-1123`) is now
+The fix is one helper. `bpmFromClip` (`background/background.js:1274-1278`) is now
 the only reader, and the analysis reply is read at its real depth
-(`background/background.js:2076-2087`). Tempo is a **tag, not a facet** — there is
+(`background/background.js:2243-2250`). Tempo is a **tag, not a facet** — there is
 deliberately still no BPM range filter, because the field is `0` on essentially
 every record straight from the feed (`lib/suno.js:857-863`).
 
 **`GET_BOOT.token` was an object; every consumer stringified it.** The reply field
 is `{hasToken, expiresAt, secondsRemaining, source, badToken}`
-(`background/background.js:1526-1539`). The dock's guard was
+(`background/background.js:1677-1694`). The dock's guard was
 `TOKEN_RE.test(String(res.token))`, and `String({hasToken:true,…})` is
 `"[object Object]"` — which can never match a JWT pattern. The whole block was
 unreachable dead code, so the session-token panel silently reported nothing on
@@ -79,7 +319,7 @@ declared once and rendered from that declaration (`content/content.js:1165-1173`
 `VARIANTS.indexOf(...) >= 0` membership test, so a stored `mp3-320` was hard-reset
 to the default with no trace — indistinguishable from "your settings were lost",
 and it silently moved anyone who had deliberately chosen a different default.
-`resolveVariant` (`background/background.js:517-527`) now substitutes via a
+`resolveVariant` (`background/background.js:528-538`) now substitutes via a
 13-entry `VARIANT_ALIASES` map and logs both values at debug level, so "I asked
 for MP3 and got M4A" is answerable from diagnostics.
 
@@ -88,8 +328,8 @@ for MP3 and got M4A" is answerable from diagnostics.
 download allowance — with nothing deleted and clips still planned — produced the
 same green success toast as a clean run. `stoppedReason` now distinguishes
 `complete` / `quota` / `ladder_exhausted` / `cancelled`
-(`background/background.js:4155-4160`) and **both UIs render four distinct
-outcomes** (`popup/popup.js:1462-1591`, `content/content.js:2252-2322`).
+(`background/background.js:4339-4343`) and **both UIs render four distinct
+outcomes** (`popup/popup.js:1462-1591`, `content/content.js:2232-2318`).
 
 **The offscreen reply resolver trusted any message ending in `:result`.**
 `resolveOffscreenReply` matched on `/:result$/` alone and ran *before*
@@ -98,7 +338,7 @@ channel. Request ids are `'os' + sequence + '-' + Date.now().toString(36)` — a
 small, enumerable space — so a guessed in-flight id could settle a waiter with a
 chosen payload. The worst case is `sunoBlobUrl`: the forged URL goes straight to
 `chrome.downloads.download`. `isOffscreenReply`
-(`background/background.js:1872-1889`) now verifies `from`, the protocol string,
+(`background/background.js:2028-2045`) now verifies `from`, the protocol string,
 the type shape, the id shape, and the sender URL.
 
 > *"The only extension sender is us" reads like an argument. It is an assumption
@@ -108,7 +348,7 @@ the type shape, the id shape, and the sender URL.
 *before* a plan and `runBatch` read it *after*, so nothing checked *during*. A
 plan built on a stale reading kept going and then failed item by item on the
 metered rungs: a healthy badge, then an opaque wall. `guardQuotaAfterItem`
-(`background/background.js:3901-3939`) re-reads the meter every `quotaCheckEvery`
+(`background/background.js:4085-4123`) re-reads the meter every `quotaCheckEvery`
 (default 5) **metered** successes and halts cleanly at `quotaReserve` (default 0).
 It counts only successful metered downloads, so a purely-unmetered batch polls
 **zero** times; it polls nothing under `dryRun`; and it only stops on a **positive**
@@ -120,7 +360,7 @@ can tell a deliberate stop from a batch that ran out of plan.
 through an encoder this build does not ship — so an imported settings blob put the
 worker into a permanently-failing state while `options.js` rendered the radios as
 "None", leaving the user no way to see or undo it. Narrowed to `none | wav`
-(`background/background.js:984-993`). `options/options.js` also kept a
+(`background/background.js:1085-1094`, as it stood in 6.0.1). `options/options.js` also kept a
 hardcoded nine-variant fallback list for when `state.variants` was empty, which
 would have re-offered every removed format.
 
@@ -129,7 +369,7 @@ would have re-offered every removed format.
 ### 🎚️ Changed
 
 - **The audio variants are now exactly three: `m4a`, `wav-48k`, `wav`**
-  (`background/background.js:449`). `mp3`, `mp3-256`, `mp3-320`, `flac`, `ogg`,
+  (`background/background.js:460`). `mp3`, `mp3-256`, `mp3-320`, `flac`, `ogg`,
   `aac`, `opus` are gone from the variant list, and so are `lrc`, `cover` and
   `json` — the last three because they are **sidecars, not audio**, and are
   controlled by `tagOptions.lrc` / `.artwork` / `.json`. Advertising a format this
@@ -138,6 +378,10 @@ would have re-offered every removed format.
   original file saved. See
   [`docs/KNOWN-LIMITS.md` § 1](docs/KNOWN-LIMITS.md) — **the MP3/OGG limitation
   itself is unchanged and still true**, it is still the #1 item.
+  > ⚠️ **Superseded by 6.1.0.** That sentence was true when written and is now
+  > false: both encoders ship. `KNOWN-LIMITS.md` § 1 is now the undocumented
+  > `?format=` enum, and the MP3/OGG item is a resolved note at the top of that
+  > page. Read it as history, not as the current state.
 - **Four routes gained self-describing replies.** `GET_LIMITS` publishes
   `variantAliases` and `wavRungRates`; `GET_DIAGNOSTICS` is documented as the
   "is this install healthy?" surface; `DOWNLOAD_STATUS` accepts an optional
@@ -255,10 +499,10 @@ per-user key.
 | defect | symptom |
 |---|---|
 | **~1,356 lines in `lib/` were loaded on every page and never called** | dead weight in the critical path, and a maintenance trap: `lib/*.js` sat in the content-script list in `manifest.json:30-38` while the actual work happened in a `lib/` nobody was importing |
-| **The indexer silently truncated at 20 pages** | a user with 3,000 clips lost 2,000 with **no warning anywhere**. `syncMaxPages` now defaults to 200, is user-tunable, and truncation is surfaced in `GET_BOOT`, the popup banner, the side panel, and the sync cursor — `background/background.js:5178` calls it *"the single most important field in this reply"* |
+| **The indexer silently truncated at 20 pages** | a user with 3,000 clips lost 2,000 with **no warning anywhere**. `syncMaxPages` now defaults to 200, is user-tunable, and truncation is surfaced in `GET_BOOT`, the popup banner, the side panel, and the sync cursor — `background/background.js:5362-5365` calls it *"the single most important field in this reply"* |
 | **Filter and download-history keys used mismatched format values** | dedupe never matched, so **every batch re-downloaded everything**, and each re-download looked like new work |
 | **Download history was written before the download completed** | history rows existed for files that never landed. `chrome.downloads.download()` returning an id means *accepted*, nothing more. `markDone` is now reachable from exactly **two** call sites, both requiring an **observed** completion (invariant A, `background/background.js:33-37`) |
-| **The filename builder never appended an extension** | files written with **no extension at all**, so nothing on the user's disk would open. It also hardcoded `{format}` to `wav` regardless of what was requested. The real extension is now always appended (`background/background.js:2286-2288`, `:2379-2380`) |
+| **The filename builder never appended an extension** | files written with **no extension at all**, so nothing on the user's disk would open. It also hardcoded `{format}` to `wav` regardless of what was requested. The real extension is now always appended (`background/background.js:2563-2564`, `:2470-2472`) |
 | **The old filter engine's `includeDisliked: true` EXCLUDED dislikes** | the name says include, the code excluded. It only behaved correctly by accident of a `\|\|` chain (`skipDislikes = skipDislikes \|\| !includeDisliked`). `lib/suno.js:302-306` |
 | **30 silent `catch {}` blocks** | an undiagnosable build. Invariant H: **zero empty catch blocks**, every failure logged with enough context (`background/background.js:52-54`) |
 
@@ -268,7 +512,7 @@ Two more from the same audit that are worth naming even though they're smaller:
   polarity backwards.** `download.error` is a **string** on the delta item; the old
   build tested a non-existent `errorDetails` field *inside* `state === 'complete'`
   — so failures were only ever supposed to be detectable from inside the success
-  case (`background/background.js:2574-2585`).
+  case (`background/background.js:2769`).
 - **The page token relay validated `origin` but not `source`**, so any same-origin
   script could overwrite the extension's credential **profile-wide**. Both are
   checked now (`content/content.js:2966-2980`).
@@ -373,7 +617,7 @@ by regex at any level.
 - **The quota badge shows DOWNLOADS, not credits.** They are different resources.
   The old badge cheerfully reported plenty of headroom while the download meter was
   exhausted. Credits now live in their own field, never merged
-  (`background/background.js:4988-4991`).
+  (`background/background.js:4978-4989`).
 - **The quota is primed on install and on browser start**, so the badge is never
   blank until some UI happens to ask.
 - **`chrome.alarms.create` runs only from `onInstalled`/`onStartup`.** At module
@@ -531,22 +775,31 @@ description to what actually ships** — `manifest.json:4` is now:
 Note what is absent: **no MP3**, because the encoder is not vendored. The store
 listing and the build now agree.
 
+> ⚠️ **Superseded by 6.1.0, twice over.** The encoder *is* vendored now, and MP3
+> *is* shipped — but it is reached through **Settings → Convert → MP3**, not through
+> the store description, which `manifest.json:4` still reads "M4A/WAV with cover
+> art, BPM and LRC lyrics" and which nobody has re-cut. So the "no MP3" note is
+> wrong about the build and right about the listing.
+
 **86 audited defects** across the data layer, the download ladder, the filter
 engine and the UI. The full accounting is above — this entry exists so the diff is
 readable, not because 5.0.0 had anything worth keeping.
 
 ---
 
-## Doc set shipped with 6.0.1
+## Doc set shipped with 6.1.0
+
+Re-verified against the current source; see the 6.1.0 entry for what moved.
 
 | file | what it is |
 |---|---|
-| `docs/KNOWN-LIMITS.md` | 20 hard limits, most valuable file in the repo |
+| `docs/KNOWN-LIMITS.md` | 20 hard limits plus the resolved MP3/OGG note, most valuable file in the repo |
 | `docs/FILTERS.md` | every filter, its spec key, its verified field, its caveats |
 | `docs/DOWNLOAD-LADDER.md` | seven rungs, quota semantics, DRM pipeline, format matrix |
 | `docs/ARCHITECTURE.md` | file map, MV3 constraints, message protocol, data flows, IDB schema |
 | `docs/RECON-NOTES.md` | the verified-truth ledger — built on, and deliberately refused |
 
+[6.1.0]: #610--2026-10-05
 [6.0.1]: #601--2026-10-04
 [6.0.0]: #600---2026-10-04
 [5.0.0]: #500---the-previous-release

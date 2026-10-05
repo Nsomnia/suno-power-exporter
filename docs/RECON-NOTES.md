@@ -96,7 +96,7 @@ Every field the filter engine reads is recon-verified. The full mapping lives in
 | real audio is `media_urls[].url`, a CloudFront object with `content_type: "m4a-opus"` | `lib/drm.js:15-16` |
 | liking is per-clip `is_liked` | `lib/suno.js:897-899` |
 | `major_model_version` is **frequently the empty string** | `lib/suno.js:44-48`, `:893` |
-| **no project field on a clip** — membership is joined from `/api/project/feed` | `background/background.js:4251` |
+| **no project field on a clip** — membership is joined from `/api/project/feed` | `background/background.js:4443` |
 | the `action_config.actions` entitlement enum | `lib/suno.js:71-77` |
 | model keys: v6=`chirp-hawk`, v6-wild=`chirp-hawk-wild`, v6-mini=`chirp-goose`, remaster=`chirp-halibut` | `../suno-recon/reports/LIVE-2026-09-30.md:74-75`, `../suno-recon/reports/THIRD-PARTY-2026-09-30.md:140-141` |
 
@@ -258,7 +258,7 @@ counter** on 2026-09-04 (`../suno-recon/reports/THIRD-PARTY-2026-09-30.md:126-12
 it by 2026-09-09; counting is now server-authoritative
 (`../suno-recon/reports/THIRD-PARTY-2026-09-30.md:126-128`; `../suno-recon/reports/FINDINGS.md:357-361`).
 
-**Why not built on:** it is a **closed bug**. `background/background.js:322-325` says so in the
+**Why not built on:** it is a **closed bug**. `background/background.js:324-327` says so in the
 ladder definition:
 
 > The old exploit — "the Studio route does not count toward quota" — was closed
@@ -323,18 +323,28 @@ answer and the code cannot guess.
 ### The `format` enum is undocumented
 
 The download routes take `?format=`. **No source enumerates the accepted members.**
-`background/background.js:444-447` is the honest position:
+`background/background.js:456-459` is the honest position:
 
 > The value is passed straight through as the download route's `?format=`
 > parameter, whose enum members are undocumented — `lib/api.js` tallies every value
 > tried so the real members can be learned from telemetry.
 
-`VARIANTS` (`background/background.js:448`) lists **three**: `m4a`, `wav-48k`, `wav`.
+`VARIANTS` (`background/background.js:460`) lists **three**: `m4a`, `wav-48k`, `wav`.
 Seven values that used to be there — `mp3`, `mp3-256`, `mp3-320`, `flac`, `ogg`,
-`aac`, `opus` — were **removed** in 6.0.1, not because the server rejects them but
-because this build has no encoder to produce them locally and offering them was a
-control that looked live and was not (`background/background.js:421-447`).
-`lrc` / `cover` / `json` left the list for a different reason: they are sidecars,
+`aac`, `opus` — were **removed** in 6.0.1 and have stayed off the list since. Two
+different reasons, and conflating them is the usual misreading
+(`background/background.js:421-459`):
+
+- **`mp3` and `ogg` stay off because `variant` is the ROUTE's `?format=`, not a
+  local conversion.** Both encoders are vendored and both work — as
+  `settings.transcode`. Advertising `mp3` as a variant would mean *asking* for a
+  format the server may not serve, failing, and falling through the ladder,
+  potentially spending the metered rungs' quota to produce the very file the free
+  rungs already gave us.
+- **`flac`, `aac` and `opus` stay off because there is genuinely no encoder.** No
+  vendored bundle and no `transcode` format, so no code path can produce one.
+
+`lrc` / `cover` / `json` left the list for a third reason: they are sidecars,
 not containers.
 
 `lib/api.js:1020` keeps `_formatTally` for exactly this. **Only `m4a` is
@@ -409,12 +419,12 @@ without a second network round trip.
 ### The feed page size
 
 `lib/api.js:911` annotates it `// page size UNKNOWN` and nothing in the recon
-resolves it. Consequences in KNOWN-LIMITS, section 5.
+resolves it. Consequences in KNOWN-LIMITS, section 4.
 
 ### The free-tier download figure
 
 Policy says 7 lifetime (`../suno-recon/reports/FINDINGS.md:340`); the extension writes "free 0"
-(`background/background.js:320`); the code encodes **`null`, verified: false**
+(`background/background.js:321`); the code encodes **`null`, verified: false**
 (`lib/api.js:960`). **None of these is verified** because the recon account was
 Premier. The code is right to refuse to substitute a number.
 
@@ -458,17 +468,17 @@ production** (`../suno-recon/README.md:74`).
 
 | rule | where |
 |---|---|
-| Zero empty catch blocks; every failure logged with diagnosable context | `background/background.js:51-53` |
-| No token or key material logged, ever | `background/background.js:644`, `lib/api.js:166-172` |
-| No token or key material outside `chrome.storage.session` | `background/background.js:49-50` |
-| Sender validation on **every** route: `id` **and** `url` | `background/background.js:1633` |
-| Offscreen replies verified against the full sender envelope before they can settle a waiter | `background/background.js:1871-1888` |
+| Zero empty catch blocks; every failure logged with diagnosable context | `background/background.js:52-54` |
+| No token or key material logged, ever | `background/background.js:733`, `lib/api.js:166-172` |
+| No token or key material outside `chrome.storage.session` | `background/background.js:50-51` |
+| Sender validation on **every** route: `id` **and** `url` | `background/background.js:1789-1798` |
+| Offscreen replies verified against the full sender envelope before they can settle a waiter | `background/background.js:2028-2045` |
 | Page relay validates origin **and** source | `content/content.js:2966-2980` |
 | Host denylist enforced at construction, not at request time | `lib/api.js:1054-1073` |
 | Route table validated at construction; unknown routes refused | `lib/api.js:1034-1046` |
 | Unwrapped content keys in an in-memory LRU **only** — never storage, never disk | `lib/drm.js:53-61` |
-| `EXPORT_SETTINGS` omits token, key material and diagnostics | `background/background.js:5412-5438` |
-| Hostile filename sanitisation (a title is attacker-influenced text) | `background/background.js:2242-2269` |
+| `EXPORT_SETTINGS` omits token, key material and diagnostics | `background/background.js:5604-5631` |
+| Hostile filename sanitisation (a title is attacker-influenced text) | `background/background.js:2205-2260` |
 | No `innerHTML` anywhere in the content script — every node via `textContent` | `content/content.js:24-27` |
 | No remote code; MV3 CSP `script-src 'self'` | `manifest.json:77-79` |
 

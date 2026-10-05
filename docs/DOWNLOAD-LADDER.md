@@ -20,7 +20,7 @@ know what a rung is, read that array.
 | ⚪ opt-in | `wav-official`, `zip`, `hls` | only run when `allowMeteredExtras` / `allowHlsCapture` is on |
 
 The default ladder is the four that always work without permission
-(`background/background.js:536`):
+(`background/background.js:606`):
 
 ```js
 downloadSource: ['progressive', 'mango-drm', 'studio', 'download-route']
@@ -29,7 +29,7 @@ downloadSource: ['progressive', 'mango-drm', 'studio', 'download-route']
 **The default therefore does spend quota** — on any clip where the two free rungs
 cannot deliver. If you are batching 200 songs, check whether they can first: run
 `PROBE_DRM` (see below), or turn the metered rungs off in settings and see how far
-the batch gets. `background/background.js:3033` types `ladder_exhausted` when a
+the batch gets. `background/background.js:3212-3223` types `ladder_exhausted` when a
 clip runs out of rungs.
 
 ---
@@ -44,8 +44,8 @@ clip runs out of rungs.
 | **Endpoint** | the CloudFront object itself, `.../1/clip/{id}.m4a` (`lib/api.js:63`) |
 | **Metered** | **No.** `background/background.js:332-339` |
 | **Produces** | the raw M4A bytes, then optional local WAV render + tags + sidecars |
-| **Fails when** | every `media_urls` entry carries an `encoding` field — i.e. every entry is encrypted. The reason string is explicit: *"every media_urls entry carries an `encoding` field, so there is no unencrypted asset"* (`background/background.js:2740-2743`). |
-| **Skipped when** | `SunoDRM.pickMediaUrl(clip, {preferUnencrypted:true})` returns nothing with `encrypted === false` (`background/background.js:2779-2781`) |
+| **Fails when** | every `media_urls` entry carries an `encoding` field — i.e. every entry is encrypted. The reason string is explicit: *"every media_urls entry carries an `encoding` field, so there is no unencrypted asset"* (`background/background.js:2923-2927`). |
+| **Skipped when** | `SunoDRM.pickMediaUrl(clip, {preferUnencrypted:true})` returns nothing, or returns something whose `encrypted !== false` (`background/background.js:2954-2965`) |
 
 The detection rule is a **negative** one, which is worth internalising: an asset
 is treated as unencrypted precisely when the `encoding` key is *missing*
@@ -60,7 +60,7 @@ is treated as unencrypted precisely when the `encoding` key is *missing*
 | **Metered** | **No.** `background/background.js:340-347` — *"Never touches the meter."* |
 | **Produces** | decrypted M4A bytes, same downstream path as rung 1 |
 | **Fails when** | the clip exposes no usable `media_urls` entry; the rights call fails all three body shapes; or the unwrap fails on both user-key seeds |
-| **Skipped when** | no usable `media_urls` entry (`background/background.js:2772-2778`) |
+| **Skipped when** | no usable `media_urls` entry (`background/background.js:2956-2966`) |
 
 This is the rung that makes "download 300 songs on a free account" possible at
 all. The full pipeline is below.
@@ -72,8 +72,8 @@ all. The full pipeline is below.
 | **Mechanism** | GET the clip's official Studio download |
 | **Endpoint** | `GET /api/studio/clip/{id}/download` (`lib/api.js:922`) |
 | **Metered** | **Yes — counts as ONE download** (`background/background.js:348-355`) |
-| **Produces** | a signed URL handed straight to `chrome.downloads` (`saveUrl`, `background/background.js:2525`) |
-| **Fails when** | the server answers **HTTP 200 with a refusal body** — see the trap below. Or returns a job id, which is not implemented (`background/background.js:2875-2877`). |
+| **Produces** | a signed URL handed straight to `chrome.downloads` (`saveUrl`, `background/background.js:3063-3073`) |
+| **Fails when** | the server answers **HTTP 200 with a refusal body** — see the trap below. Or returns a job id, which is not implemented (`background/background.js:3058-3062`). |
 | **Skipped when** | nothing in the ladder list reaches it, or rung 1/2 already succeeded |
 
 > **This rung used to be free. That is a closed bug, not a feature.**
@@ -94,7 +94,7 @@ all. The full pipeline is below.
 | **Fails when** | same 200-with-refusal trap; or a job id |
 | **Skipped when** | rung 3 already succeeded, or rungs 1/2 succeeded |
 
-Both metered URL rungs share one code path (`background/background.js:2840-2896`)
+Both metered URL rungs share one code path (`background/background.js:3030-3129`)
 and both route through `parseDownloadResponse`.
 
 ### 5. `wav-official` — 🔴 metered, opt-in
@@ -104,9 +104,9 @@ and both route through `parseDownloadResponse`.
 | **Mechanism** | Ask Suno to convert to WAV, then fetch the signed S3 URL |
 | **Endpoint** | `POST /api/gen/{id}/convert_wav/` → `GET /api/gen/{id}/wav_file/` (`lib/api.js:937-938`) |
 | **Metered** | **Yes** (`background/background.js:364-371`) |
-| **Gated on** | `allowMeteredExtras === true` — otherwise `normalizeLadder` drops it (`background/background.js:1042`) |
+| **Gated on** | `allowMeteredExtras === true` — otherwise `normalizeLadder` drops it (`background/background.js:1148`) |
 | **Produces** | a genuine WAV, at the source bit depth, from Suno's own pipeline |
-| **Fails when** | **403 means ENTITLEMENT, not auth** (`lib/api.js:937`, `background/background.js:367`) — your plan has no WAV, which is a wall, not a bug |
+| **Fails when** | **403 means ENTITLEMENT, not auth** (`lib/api.js:937`, `background/background.js:370`) — your plan has no WAV, which is a wall, not a bug |
 | **Signed URL TTL** | **3599 seconds**, observed (`lib/api.js:969`) |
 
 This is the *only* rung that produces a server-side WAV. The local WAV render
@@ -122,11 +122,11 @@ This is the *only* rung that produces a server-side WAV. The local WAV render
 | **Gated on** | `allowMeteredExtras === true` **and** `batchOnly: true` |
 | **Body** | **flat**, `clip_ids` array, **≤200 per chunk** |
 | **Produces** | ⚠️ **unknown.** The response shape has never been confirmed. |
-| **Fails when** | it returns a job id — `background/background.js:2875-2877` refuses: *"job polling is not implemented"*. Or the plan is not entitled: the validator emits `Bulk download is not available` (`../suno-recon/reports/FINDINGS.md:469`). |
+| **Fails when** | it returns a job id — `background/background.js:3058-3062` refuses: *"job polling is not implemented"*. Or the plan is not entitled: the validator emits `Bulk download is not available` (`../suno-recon/reports/FINDINGS.md:469`). |
 
 `batchOnly` means `normalizeLadder` removes it from every single-clip path
-(`background/background.js:1043`), so it can only ever be reached deliberately.
-**Treat this rung as experimental.** See KNOWN-LIMITS, section 3 ("Bulk ZIP").
+(`background/background.js:1149`), so it can only ever be reached deliberately.
+**Treat this rung as experimental.** See KNOWN-LIMITS, section 2 ("Bulk ZIP").
 
 ### 7. `hls` — 🟢 unmetered, opt-in, **and not really a rung**
 
@@ -136,7 +136,7 @@ This is the *only* rung that produces a server-side WAV. The local WAV render
 > HLS_CAPTURE, which is page manipulation and is therefore opt-in and explicit.*
 
 Calling it from the single-clip ladder **throws**
-(`background/background.js:2947-2951`):
+(`background/background.js:3131-3135`):
 *"HLS is not a ladder rung: it needs a segment list captured from the page, which
 only the HLS_CAPTURE hand-off can provide."*
 
@@ -144,9 +144,9 @@ only the HLS_CAPTURE hand-off can provide."*
 |---|---|
 | **Endpoint** | the page's own media segments, reassembled from an init segment + media segments |
 | **Metered** | **No** |
-| **Gated on** | `allowHlsCapture === true` **in the worker** (`background/background.js:3143-3152`) *and* an explicit confirm in the content script (`content/content.js:2815-2824`) — both sides must agree |
-| **Produces** | a fragmented MP4, then tagged and saved like everything else (`captureHls`, `background/background.js:3141`) |
-| **Fails when** | `allowHlsCapture` is false → `hls_disabled` with the full explanation; too many segments (> `HLS_MAX_SEGMENTS` = 4000, `background/background.js:3063`, checked at `:3160-3162`); any segment fetch failure |
+| **Gated on** | `allowHlsCapture === true` **in the worker** (`background/background.js:3339-3346`) *and* an explicit confirm in the content script (`content/content.js:2815-2824`) — both sides must agree |
+| **Produces** | a fragmented MP4, then tagged and saved like everything else (`captureHls`, `background/background.js:3325`) |
+| **Fails when** | `allowHlsCapture` is false → `hls_disabled` with the full explanation; too many segments (> `HLS_MAX_SEGMENTS` = 4000, `background/background.js:3247`, checked at `:3344-3346`); any segment fetch failure |
 
 > ⚠️ **HLS manipulates Suno's page.** The content script temporarily sets
 > `window.MediaSource = undefined` **in the page's MAIN world** so Suno's own
@@ -171,13 +171,13 @@ only the HLS_CAPTURE hand-off can provide."*
 `lib/api.js:25-28` leads its own header with this, and
 `SunoAPI.parseDownloadResponse` (`lib/api.js:1769-1890`) exists solely to handle
 it. The refusal contract is checked **before** any artifact probing
-(`lib/api.js:1818`). `background/background.js:2856-2863` calls that parser for
+(`lib/api.js:1818`). `background/background.js:3040-3047` calls that parser for
 both metered rungs instead of inspecting the response status.
 
 Related, from the same header — **403 means entitlement, not auth**
 (`lib/api.js:39`). `SunoApiError.isEntitlementError` is `status === 403`
 (`lib/api.js:697-699`), and the batch driver treats `entitlement` as
-**never retryable** (`background/background.js:862`).
+**never retryable** (`background/background.js:909`).
 
 ---
 
@@ -306,34 +306,60 @@ question**, recorded at runtime in `stats().rights.bodyShape`.
 
 ## 🎚️ Format support matrix
 
-**Exactly three audio variants ship.** `VARIANTS` is
-`Object.freeze(['m4a', 'wav-48k', 'wav'])` (`background/background.js:449`), and
-that list is a **capability decision, not an omission** — the reasoning is
-`background/background.js:421-448`. `GET_LIMITS` publishes it, so a UI should
-build its select from *that* rather than from a hardcoded list.
+**The variant list is still exactly three** — `m4a`, `wav-48k`, `wav`
+(`VARIANTS`, `background/background.js:460`) — because a `variant` selects the
+**download route** and the `?format=` enum behind it is undocumented. That list is a
+**capability decision, not an omission**; the reasoning is
+`background/background.js:421-459`. `GET_LIMITS` publishes it, so a UI should build
+its select from *that* rather than from a hardcoded list.
+
+**Separately, the `transcode` setting now performs four conversions**, MP3 and Ogg
+Vorbis included. These are two different mechanisms and conflating them is the
+single most common misreading of this extension:
+
+| | `variant` (3 values) | `transcode` (4 values) |
+|---|---|---|
+| **what it picks** | the download **route** — passed through as the route's `?format=`, and keyed on by `isDone(id, variant)` and the filename extension | a **post-fetch local step** on bytes already in hand |
+| **when it runs** | before the request | after the bytes arrive |
+| **can it fail server-side** | **yes** — the enum is undocumented | no network call at all |
+| **cost** | one download if a metered rung serves it | **zero downloads**, CPU and RAM instead |
+
+**Why the encoders are local files rather than a CDN fetch.** MV3 sets
+`extension_pages` to `script-src 'self'` (`manifest.json:77-79`) and the offscreen
+page goes further with `default-src 'none'; script-src 'self'`, so
+`<script src="https://cdn…">` cannot load and the Web Store policy bans remotely
+hosted code outright. There is therefore **no "download it if missing" fallback**
+— the encoders must be *inside* the extension directory, and `vendor/` must be
+committed. `loadVendoredScript()` even asserts the resolved URL's protocol is
+`chrome-extension:` and refuses anything else (`offscreen/offscreen.js:781-835`),
+so editing that path constant to an https URL cannot reintroduce remote code. See
+[`ARCHITECTURE.md` § why the encoders are vendored](ARCHITECTURE.md) and
+`vendor/README.md` for the full provenance and licence record.
 
 ### Works today
 
-| Variant | Mechanism | Cost |
+| Format | Mechanism | Cost |
 |---|---|---|
 | **`m4a`** | native. The `media_urls` stream already *is* `audio/x-m4a` | 🟢 on rungs 1–2 |
-| **`wav`** | local render at `settings.wavSampleRate`: offscreen `sunoRenderWav` — decode → resample → real RIFF header (`background/background.js:2167-2181`) | 🟢 free — a local render of free bytes |
-| **`wav-48k`** | the same render with the rate **pinned** to 48000 (`wavRateForVariant`, `background/background.js:2119-2123`) so the rung stays distinguishable when `wavSampleRate` moves | 🟢 free |
+| **`wav`** | local render at `settings.wavSampleRate`: offscreen `sunoRenderWav` — decode → resample → real RIFF header (`background/background.js:2335-2350`) | 🟢 free — a local render of free bytes |
+| **`wav-48k`** | the same render with the rate **pinned** to 48000 (`WAV_48K_RATE`, `background/background.js:481`, applied by `wavRateForVariant` at `:2275-2279`) so the rung stays distinguishable when `wavSampleRate` moves | 🟢 free |
+| **`mp3`** | offscreen `sunoTranscode` → `encodeMp3` (`offscreen/offscreen.js:901-917`) → `lamejs.Mp3Encoder` from `vendor/lame.all.js` at `settings.mp3Bitrate` | 🟢 **unmetered** — CPU + RAM |
+| **`ogg`** | offscreen `sunoTranscode` → `encodeOgg` (`offscreen/offscreen.js:919-953`) → `OggVorbisEncoder` from `vendor/OggVorbisEncoder.js` at `settings.oggQuality` | 🟢 **unmetered** — CPU + RAM |
 | **`.lrc`** | timed lyrics, only written when the clip actually has lyrics | 🟢 |
 | **embedded cover art** | `APIC` / `covr`, full-size image fetched per clip | 🟢 |
 | **`.json`** sidecar | machine-readable clip record. Contains prompt text; **no** token or key material | 🟢 |
 
 The last three are **sidecars, not variants**. They are controlled by
 `tagOptions.lrc`, `tagOptions.artwork` and `tagOptions.json`
-(`background/background.js:556-564`) and are toggled in the page drawer at
+(`background/background.js:626-634`) and are toggled in the page drawer at
 `content/content.js:1165-1173`. A *standalone cover-art FILE* is a different
 feature entirely and is not offered, because it needs the `image_url` /
 `image_large_url` CDN fetches, which this build does not implement
 (`content/content.js:93-96`).
 
-`GET_LIMITS` also publishes `variantAliases` and `wavRungRates`, so a UI can
-explain a substitution instead of silently showing a different value than the
-user picked (`background/background.js:5116-5135`).
+`GET_LIMITS` also publishes `variantAliases` and `wavRungRates`
+(`background/background.js:5305-5315`), so a UI can explain a substitution instead
+of silently showing a different value than the user picked.
 
 > **Do not rename the M4A blob MIME.** It MUST be `audio/x-m4a`, never
 > `audio/mp4` (`lib/drm.js:137-145`): an MP4-family blob declared as `audio/mp4`
@@ -344,31 +370,107 @@ user picked (`background/background.js:5116-5135`).
 
 | Format | Why, exactly |
 |---|---|
-| **MP3** | MV3 CSP is `script-src 'self'` (`manifest.json:77-79`) — remote code is forbidden, so an encoder cannot be fetched from a CDN. It would have to be vendored at `vendor/lame.all.js` (~1 MB, LGPL). Not present. The offscreen returns a typed `ENCODER_UNAVAILABLE`, which `background/background.js:1840-1847` marks as never-retryable. The settings radio is rendered `disabled` with the reason (`options/options.html:425-427`). |
-| **OGG Vorbis** | identical reason; `vendor/OggVorbisEncoder.js` is not present (`offscreen/offscreen.js:176`, `options/options.html:429-430`). |
+| **FLAC** | no vendored encoder and no `transcode` format, so there is no code path that can produce one. `background/background.js:453-454` says so in the `VARIANTS` comment. |
+| **AAC** | identical. |
+| **Opus** | identical — and note the trap: the *source* stream is `m4a-opus` (`lib/drm.js:15-16`), so a standalone Opus file is not reachable from here at all. |
+| **MP3/OGG *as variants*** | deliberately, and not for want of an encoder. `variant` is passed through as the route's `?format=`, whose enum is undocumented, so offering `mp3` there means *asking* for a format the server may refuse, failing, and falling through the ladder — potentially spending the metered rungs' quota to produce the very file the free rungs already gave us. They are one key away, under `transcode`. |
 
-The pipeline code already knows how to call both encoders
-(`offscreen/offscreen.js:888-889`). Only the binary is missing.
+### 🎸 What a local transcode actually costs you
 
-### `transcode` is now `none` or `wav`, full stop
+This is the honest trade, and it is stated the same way in the code
+(`background/background.js:2297-2313`):
 
-`coerceSettings` narrows the setting to exactly those two
-(`background/background.js:984-993`). `mp3` and `ogg` used to be *accepted* here,
-which meant an imported settings blob could put the worker into a
-permanently-failing state — every download attempted a `sunoTranscode`, got
-`ENCODER_UNAVAILABLE`, logged, and saved the original instead — while `options.js`
-rendered the choice as "None", so the user had no way to see or undo it.
+- **Downloads: zero.** `maybeTranscode` runs *after* `SunoDRM.decryptClipBuffer`
+  has already returned the audio bytes, and its only I/O is `callOffscreen` — a
+  runtime message to the offscreen document, **not an HTTP call**. It touches no
+  rung and cannot spend the monthly allowance. Since every rung it is called from
+  is already unmetered (`progressive` / `mango-drm`), transcoding an M4A source
+  **saves no quota**; nothing is gained there.
+- **Wall-clock CPU: one full decode plus one full re-encode.** Roughly 1–2× the
+  track's duration for MP3, and rather more for Ogg at high quality. That is the
+  real cost, and it is paid on the offscreen page's single thread.
+- **Peak memory: the decoded PCM *and* the encoded output, both at once**, both
+  held in the offscreen document rather than the worker.
+- **What it buys:** a file that plays everywhere. M4A/AAC is awkward on some players
+  and hardware; MP3 is near-universal, and Ogg Vorbis is the smaller of the two at
+  comparable quality. **CPU and RAM for compatibility — that is the entire trade.**
+- **It is strictly best-effort.** Every failure path returns `null`, so the
+  original bytes are saved unchanged rather than the download being lost
+  (`background/background.js:2312-2313`). A damaged install reports a typed
+  `ENCODER_UNAVAILABLE` rather than a silent M4A (`:2377-2387`).
 
-**`wav` never reaches `sunoTranscode` at all.** The `mode === 'wav'` branch is
-served by `sunoRenderWav` (`background/background.js:2134-2145`, `:2167-2182`),
-which is the only conversion this build can actually perform; `sunoTranscode` is
-the mp3 / ogg *encoder*. That branch and its `ENCODER_UNAVAILABLE` handling stay
-(`background/background.js:2184-2196`, `:2197-2207`) so a value that *does*
-arrive from a corrupted cache is answered honestly instead of silently ignored.
-`coerceSettings` admits only `none|wav`, so **no settings value can select it any
-more** — it is unreachable by design, and it is kept precisely so
-`ENCODER_UNAVAILABLE` is surfaced to the UI rather than swallowed by a silently
-skipped branch.
+> **MP3 and Ogg are always encoded at 48 kHz**, and there is no control for it. The
+> worker sends no `sampleRate` on the lossy rungs
+> (`background/background.js:2332`, `:2359-2366`), so the offscreen page decodes at
+> its own fallback of 48000 and that becomes the encoder rate
+> (`offscreen/offscreen.js:1120-1121`). **Only WAV has a user-controllable rate**
+> (`wavSampleRate`). A 44.1 kHz source is resampled on the way in; nothing here
+> invents detail.
+
+### The two encoder settings
+
+Both are real `<select>` controls on the options page
+(`options/options.html:502-529`), gated on the matching transcode format and
+**preserving their value across format switches** — `gateOnTranscode` touches only
+`.disabled` and `aria-disabled`, never `.value`
+(`options/options.js:653-678`), so MP3 → Ogg → MP3 comes back to the bitrate you
+picked.
+
+| key | valid values | default | validated by |
+|---|---|---:|---|
+| `mp3Bitrate` | `128, 160, 192, 224, 256, 320` (kbps) | **192** | `snapToChoice(settings.mp3Bitrate, MP3_BITRATES, …)` |
+| `oggQuality` | `0`–`1.0` in tenths | **0.5** | `snapToChoice(settings.oggQuality, OGG_QUALITIES, …)` |
+
+Both are **snapped, never rejected** (`background/background.js:1188-1235`): the
+nearest entry wins and **ties go to the lower option**, so `200` becomes `192`, not
+`224`, and the result is a deterministic function of the input rather than of
+iteration luck. That matters because neither encoder accepts a range — LAME
+silently substitutes its own bitrate, and the offscreen page substitutes `0.8` for
+an out-of-range Ogg quality (`offscreen/offscreen.js:1126-1132`), so a value let
+through as-is would be discarded with no trace. `null`, `''` and booleans count as
+**missing**, not as 0/1, because `Number(null) === 0`.
+
+They are snapped a **second** time at the point of use
+(`background/background.js:2357-2358`), so a caller handing over a hand-built
+`settings` object cannot push a NaN into `lamejs.Mp3Encoder`.
+
+### `transcode` accepts all four values
+
+`TRANSCODE_FORMATS = ['none', 'wav', 'mp3', 'ogg']`
+(`background/background.js:549`), reduced by `resolveTranscode` (`:567-572`) and
+applied at `:1094`. A dedicated resolver rather than a bare `indexOf`, for the same
+reason `resolveVariant` exists: an unrecognised value must still degrade to
+`'none'` ("save the original"), and the occurrence is logged.
+
+The clamp used to be hardcoded to `none|wav`, which made MP3 and OGG
+**permanently unreachable even though both encoders were already vendored** —
+`maybeTranscode` read the clamped value, so `sunoTranscode` was dead code and every
+`mp3`/`ogg` blob silently saved the original. That is exactly the kind of silent
+capability removal that leaves the UI showing "None" while the stored blob still
+says `'mp3'`, and it is the reason the settings are gated on the format that reads
+them.
+
+> **The two libraries do not share an API, and the Ogg one fails silently if you
+> assume they do.** `lamejs.Mp3Encoder` matches the usual expectation —
+> `encodeBuffer()` returns an `Int8Array` and `flush()` returns one.
+> `OggVorbisEncoder` is the other way round: **`encode()` returns `undefined`** and
+> pushes onto the encoder's own `oggBuffers`, and **there is no `flush()`** — the
+> methods are `encode`, `finish`, `cancel`, `process`, and `finish('audio/ogg')` is
+> the flush. A `if (buf && buf.length) parts.push(buf)` loop therefore discards
+> **every page**, and calling `flush()` was a `TypeError` on every single OGG
+> request. Both facts are now **asserted**, not assumed
+> (`offscreen/offscreen.js:923-939`), so a wrong or partial build yields a typed
+> `ENCODE_ERROR` naming the pinned SHA-256 instead of a raw `TypeError`.
+
+### Untested
+
+| | |
+|---|---|
+| **`?format=` passthrough** | the enum is undocumented — no recon source enumerates the accepted members. `lib/api.js` tallies every value tried so they can be learned from telemetry (`lib/api.js:1020`). `m4a` is the only guaranteed container; `wav`/`wav-48k` are honest because they are rendered locally, not asked for. See KNOWN-LIMITS, section 1. |
+| **ZIP** | response shape unknown; job polling not implemented. See KNOWN-LIMITS, section 2 ("Bulk ZIP"). |
+| **HLS** | gated behind `allowHlsCapture` + a page confirm; the reassembly path exists (`background/background.js:3325`) but is not the default path for anything. |
+
+---
 
 ### BPM: measured, never invented — and never filterable
 
@@ -378,19 +480,19 @@ The tempo field is a **working feature** end to end:
   of `clip.bpm` / `metadata.bpm` / `metadata.tempo_bpm` that coerces to a
   non-zero number.
 - All four read sites in the worker go through one helper, `bpmFromClip`
-  (`background/background.js:1119-1123`), so the `{bpm}` filename token
-  (`:2312`), the ID3 `TBPM` frame (`:3319`), the `.json` sidecar field (`:3409`)
-  and the HLS path (`:2808`) cannot drift apart again. That single helper is the
+  (`background/background.js:1274-1278`), so the `{bpm}` filename token
+  (`:2513`), the ID3 `TBPM` frame (`:3527`), the `.json` sidecar field (`:3593`)
+  and the HLS path (`:2992`) cannot drift apart again. That single helper is the
   fix: the pipeline was dead because four sites each rolled their own coercion.
 - Suno sends **no tempo field** in a feed payload, so when `tagOptions.bpm` is on
   and the clip carries none, the worker measures one itself through the offscreen
-  document: `detectBpmViaOffscreen` (`background/background.js:2063-2104`) calls
+  document: `detectBpmViaOffscreen` (`background/background.js:2219-2260`) calls
   `sunoAnalyze`, which replies `{ok, analysis:{peakDb, rmsDb, durationSec,
   sampleRate, channels, bpm, bpmConfidence}}`
-  (`offscreen/offscreen.js:61-63`, `:966-983`). The tempo lives at
+  (`offscreen/offscreen.js:61-63`, `:989-1006`). The tempo lives at
   `reply.analysis.bpm` — **not** `reply.bpm`, and reading the shallow path made
   the function return `null` on every single clip
-  (`background/background.js:2076-2087`).
+  (`background/background.js:2243-2250`).
 
 **There is deliberately no BPM range filter.** `normalizeSpec()` has no bpm
 predicate and no numeric range, and the comment at `lib/suno.js:857-863` says
@@ -398,14 +500,6 @@ why: no recon-verified clip payload carries a tempo field, so `bpm` is 0 on
 essentially every record straight from the feed. *"Do not add a BPM range filter
 here: it would match nothing, and the field being usually-0 is the absence of
 data, not a bug to filter around."* The tempo is a **tag**, not a facet.
-
-### Untested
-
-| | |
-|---|---|
-| **`?format=` passthrough** | the enum is undocumented — no recon source enumerates the accepted members. `lib/api.js` tallies every value tried so they can be learned from telemetry (`lib/api.js:1020`). `m4a` is the only guaranteed container; `wav`/`wav-48k` are honest because they are rendered locally, not asked for. |
-| **ZIP** | response shape unknown; job polling not implemented. See KNOWN-LIMITS, section 3 ("Bulk ZIP"). |
-| **HLS** | gated behind `allowHlsCapture` + a page confirm; the reassembly path exists (`background/background.js:3141`) but is not the default path for anything. |
 
 ---
 
@@ -420,8 +514,9 @@ data, not a bug to filter around."* The tempo is a **tag**, not a facet.
 
 Encoded at `lib/api.js:959-966`. The recon account was Premier, so the free-tier
 figure was never observed — the report gives a *policy* figure of 7 lifetime
-(`../suno-recon/reports/FINDINGS.md:340`) and `background/background.js:321`
-writes "free 0". **Neither is verified**, and the code is right to refuse to invent
+(`../suno-recon/reports/FINDINGS.md:340`) and the code writes "free 0"
+(`background/background.js:321`, restated in the `quotaPreflight` header at
+`:3803`). **Neither is verified**, and the code is right to refuse to invent
 one: a `null` limit becomes `unlimited: true` rather than a substituted number
 (`lib/api.js:2604`). Read your own badge.
 
@@ -441,8 +536,8 @@ This is the arithmetic that matters:
 ```
 
 So the batch dedupes by **clip id before anything is spent**
-(`background/background.js:3695-3703`), and `duplicatesDropped` is reported in the
-plan stats (`background/background.js:3703`, `:3745`). Getting this wrong is the
+(`background/background.js:3887`), and `duplicatesDropped` is reported in the
+plan stats (`background/background.js:3929`, `:3953`). Getting this wrong is the
 single most expensive mistake available in this extension.
 
 Suno's stated purpose for the limits: to make it "harder for bad actors to
@@ -452,22 +547,22 @@ own quota — see the README's *Ethics & scope* section.
 ### Credits are a DIFFERENT resource
 
 `getQuota` returns downloads and credits in **separate objects** and never merges
-them (`background/background.js:5026-5032`). The old badge showed credits, so a
+them (`background/background.js:5207-5222`). The old badge showed credits, so a
 user at zero downloads saw a healthy badge. The toolbar badge now paints
 **downloads remaining** in violet (`paintQuotaBadge`,
-`background/background.js:5046-5058`).
+`background/background.js:5230-5243`).
 
 ### Preflight, the mid-batch guard, and four outcomes
 
 There are **two** checks now, and the second one is the interesting one.
 
-**1. The preflight** — `quotaPreflight` (`background/background.js:3634-3660`)
+**1. The preflight** — `quotaPreflight` (`background/background.js:3800-3851`)
 runs once before the plan and compares `planned` against
 `quota.effectiveRemaining`. On a shortfall it returns the exact sentence: *"This
 batch needs N downloads but only M remain before the quota resets on `<date>`."*
 When Suno reports no limit at all it proceeds and says so
-(`background/background.js:3647-3650`). The shortfall is logged at **`warn`**
-(`batch.quota_shortfall`, `background/background.js:3762`), which is the severity
+(`background/background.js:3841-3844`). The shortfall is logged at **`warn`**
+(`batch.quota_shortfall`, `background/background.js:3946`), which is the severity
 its amber paint implies — an allowance running out is a warning, not an error.
 
 A before-check cannot be the whole answer: a plan of 60 clips checked against 60
@@ -475,18 +570,18 @@ remaining is still wrong the moment one clip fails, another succeeds off an
 unmetered rung, or a sibling tab spends the meter.
 
 **2. The mid-batch guard** — `guardQuotaAfterItem`
-(`background/background.js:3901-3939`), armed at `:3866-3880`. Two rules make it
+(`background/background.js:4085-4123`), armed at `:4050-4064`. Two rules make it
 cheap enough to always have on:
 
 | rule | why |
 |---|---|
-| it counts only **successful metered** downloads (`metered !== true` returns early, `:3904-3906`) | `progressive` and `mango-drm` never consume the allowance, so a purely-unmetered batch polls **zero** times and never pays for a re-meter it cannot use |
-| a **failed poll is not an exhausted meter** (`:3915-3920`) | `unlimited`, a missing limit and a thrown fetch all leave the batch running. Only a **positive** reading at or below the reserve stops it |
-| a dry run polls nothing (`:3866-3869`) and can never be stopped by this | planning must not cost a meter read |
-| one in-flight fetch is shared across the pool (`:3879-3892`) | N workers finishing together trigger **one** `readQuotaCached`, not N |
+| it counts only **successful metered** downloads (an unmetered or unknown rung returns early, `:4088-4090`) | `progressive` and `mango-drm` never consume the allowance, so a purely-unmetered batch polls **zero** times and never pays for a re-meter it cannot use |
+| a **failed poll is not an exhausted meter** (`:4101-4104`) | `unlimited`, a missing limit and a thrown fetch all leave the batch running. Only a **positive** reading at or below the reserve stops it |
+| a dry run polls nothing (`:4050-4053`) and can never be stopped by this | planning must not cost a meter read |
+| one in-flight fetch is shared across the pool (`:4066-4076`) | N workers finishing together trigger **one** `readQuotaCached`, not N |
 
-Two settings keys control it (`background/background.js:597-614`, clamped at
-`:999-1000`, wired to real controls at `options/options.html:150-167`):
+Two settings keys control it (`background/background.js:685-702`, clamped at
+`:1105-1106`, wired to real controls at `options/options.html:150-167`):
 
 | key | range | default | meaning |
 |---|---:|---:|---|
@@ -495,11 +590,12 @@ Two settings keys control it (`background/background.js:597-614`, clamped at
 
 **When it stops**, `runBatch` records `quotaStop =
 {reason, remaining, reserve, meteredDownloads, remainingItems, resetsOn, at}`
-(`background/background.js:3922-3930`), halts claiming new items while in-flight
+(`background/background.js:4106-4114`), halts claiming new items while in-flight
 workers finish the item they already own (`:4131-4133`), writes a **separate
 `quota-stop` journal phase** so a later run can tell a deliberate halt from a
-batch that ran out of plan (`:4187-4201`), raises a notification saying how much
-fitted and when the meter returns (`:4241-4248`), and emits `DL_DONE` with:
+batch that ran out of plan (`:4366-4385`), raises a notification saying how much
+fitted and when the meter returns (`:4425-4436`), and emits `DL_DONE`
+(`:4404-4416`) with:
 
 ```
 stoppedReason : 'complete' | 'quota' | 'ladder_exhausted' | 'cancelled'
@@ -508,7 +604,7 @@ remainingItems: how much of the plan is still unattempted
 quotaStop     : the reading above, or null
 ```
 
-The ternary is at `background/background.js:4155-4160`, and it is the one field
+The ternary is at `background/background.js:4339-4343`, and it is the one field
 that must never collapse the four cases into each other — a quota halt, an
 exhausted ladder and a user cancel have three different recoveries.
 
@@ -540,7 +636,7 @@ only route that carries `plan.stoppedReason` / `plan.quotaStop`
 
 > ⚠️ **One honest gap:** there is **no `DOWNLOAD_RESUME` route.**
 > `DOWNLOAD_RETRY_FAILED` re-plans only the clips recorded `failed`
-> (`background/background.js:4324-4340`), so after a quota halt the
+> (`background/background.js:4504-4521`), so after a quota halt the
 > never-attempted clips need a fresh `DOWNLOAD_START`. The page UI works around
 > this by re-sending the last payload. See KNOWN-LIMITS, section 13.
 
@@ -548,7 +644,7 @@ only route that carries `plan.stoppedReason` / `plan.quotaStop`
 
 ## 🔎 Probe before you spend
 
-`PROBE_DRM` (`background/background.js:5501-5548`) is **diagnostic only**: it
+`PROBE_DRM` (`background/background.js:5660-5733`) is **diagnostic only**: it
 downloads nothing and spends nothing. Give it a clip id and it returns:
 
 - `audioUrlIsDecoy` — almost always `true`, and worth seeing once
@@ -557,15 +653,15 @@ downloads nothing and spends nothing. Give it a clip id and it returns:
 - `recommended` — the first available rung
 - `free` — the first available **unmetered** rung ← *this is the one you want*
 - `metered` — the first available rung that **costs** a download, so you can say
-  what the honest-but-paid alternative is (`background/background.js:5541-5544`)
+  what the honest-but-paid alternative is (`background/background.js:5728`)
 
 It also accepts an **optional `{ladder:[...]}`** to probe a hypothetical ordering
-instead of the configured one (`background/background.js:5519-5528`) — a UI asking
+instead of the configured one (`background/background.js:5713-5719`) — a UI asking
 "would studio work if I enabled it?" cannot get a real answer from a ladder that
 has studio filtered out, and enabling it just to ask would be a side effect this
 route promises not to have. `clipId` is the only required field.
 
-`evaluateLadder` (`background/background.js:2720-2756`) produces those reasons,
+`evaluateLadder` (`background/background.js:2896-2940`) produces those reasons,
 and they are written to be read by a human, not parsed. If the clip is not in the
 local library it says so and tells you to run a sync first.
 
@@ -573,24 +669,24 @@ local library it says so and tells you to run a sync first.
 
 ## ⚙️ Ladder settings
 
-Ordered preference, first **available** rung wins (`background/background.js:535`).
+Ordered preference, first **available** rung wins (`background/background.js:606`).
 
-`normalizeLadder` (`background/background.js:1028-1058`) folds legacy aliases
-(`LADDER_ALIASES`, `background/background.js:408-419`) so a stale settings blob
+`normalizeLadder` (`background/background.js:1126-1164`) folds legacy aliases
+(`LADDER_ALIASES`, `background/background.js:395-419`) so a stale settings blob
 cannot silently disable everything. Three subtleties:
 
 - `hls` is deliberately **not** mapped to a working fallback.
-- Every `batchOnly` rung is dropped **unconditionally** (`:1043`), not gated on
+- Every `batchOnly` rung is dropped **unconditionally** (`:1149`), not gated on
   the opt-in flag — so a stored `['hls']` normalises to empty, and `hls` is
   documented as *"not a rung"* rather than as "unsupported".
 - An **empty** input means "not configured" → the default ladder. A **non-empty**
   input that filters down to nothing returns `[]` and `startBatch` fails loudly
-  with `ladder_empty` (`background/background.js:3682-3687`) rather than silently
+  with `ladder_empty` (`background/background.js:3864-3870`) rather than silently
   re-enabling rungs the user turned off.
 
 **Both rung editors filter that pool to match.** The options page's
 `editableRungs()` drops `hls` and every `batchOnly` rung
-(`options/options.js:498-502`), and the in-page dock's "available rungs" list
+(`options/options.js:700-704`), and the in-page dock's "available rungs" list
 applies the same two exclusions (`content/content.js:1308-1323`). The two are
 **duplicated rather than imported**, because a content script and an extension page
 are separate contexts with no shared module graph. The point of the exclusion is

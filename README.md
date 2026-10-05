@@ -8,25 +8,31 @@ date ranges, instrumental-or-not, remixes, trashed, contests, public-only, exact
 clip-id lists — every filter the Suno API can *actually* support, and an honest
 account of the three it cannot.
 
-Version **6.0.1**. Manifest V3. Chrome 116+.
+Version **6.1.0** (see [`CHANGELOG.md`](CHANGELOG.md)). Manifest V3.
+Chrome 116+.
 
 ---
 
 ## 🚨 Read the limitations first
 
-This is not a footnote. Three things will bite you, and one of them is a missing
-binary file.
+This is not a footnote. Three things will bite you.
 
 | | What | Where |
 |---|---|---|
-| 🧱 | **MP3 and OGG output do not exist in this build.** MV3 forbids remotely hosted code, so the encoders cannot be fetched from a CDN — they would have to be vendored. `vendor/lame.all.js` (~1 MB, LGPL) is not in the repo. M4A and both WAV rungs are fully working; the variant list is exactly three. | [KNOWN-LIMITS §1](docs/KNOWN-LIMITS.md) |
-| 👎 | **Suno exposes no per-clip dislike field.** Detecting dislikes means paging your whole library **twice** and diffing the id sets, so a disliked pass costs roughly double a sync. | [KNOWN-LIMITS §6](docs/KNOWN-LIMITS.md) |
-| 🔤 | **The `?format=` enum is undocumented.** The client passes your string through unchanged and tallies what it has tried. Only `m4a` is guaranteed — and `wav`/`wav-48k` are honest regardless, because they are rendered locally rather than asked for. | [KNOWN-LIMITS §2](docs/KNOWN-LIMITS.md) |
+| 🔤 | **The `?format=` enum is undocumented.** The client passes your string through unchanged and tallies what it has tried. Only `m4a` is guaranteed — and `wav`/`wav-48k` are honest regardless, because they are rendered locally rather than asked for. That is *also* why MP3 and Ogg Vorbis live under **Convert** rather than under the format dropdown. | [KNOWN-LIMITS §1](docs/KNOWN-LIMITS.md) |
+| 👎 | **Suno exposes no per-clip dislike field.** Detecting dislikes means paging your whole library **twice** and diffing the id sets, so a disliked pass costs roughly double a sync. | [KNOWN-LIMITS §5](docs/KNOWN-LIMITS.md) |
+| ⚖️ | **The MP3 encoder is LGPL-3.0, and shipping this extension redistributes it.** Both encoders are vendored byte-identically with their notices, but a distributor inherits a real obligation — and the Xiph BSD text for the Ogg build is referenced by URL rather than reproduced on disk. | [KNOWN-LIMITS §12](docs/KNOWN-LIMITS.md) |
 
 Plus: bulk ZIP's response shape is unknown, `duration`'s type is unverified, the
 feed page size is unknown, collaborative workspaces don't exist in prod, and the
 free-tier download allowance is genuinely unknown. **The full list — 20 items, all
 of them read out of the shipped code — is [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md).**
+
+> 🎉 **MP3 and Ogg Vorbis used to be the #1 limitation on that page and are now a
+> shipped feature.** Both encoders are vendored in `vendor/` at the exact upstream
+> bytes, `transcode` accepts all four values, and there are two real settings
+> behind it (`mp3Bitrate`, `oggQuality`). It costs **CPU and RAM, never a download
+> from your monthly allowance**. → [the format matrix](docs/DOWNLOAD-LADDER.md)
 
 That document is the most valuable thing in this repo. It exists so the next
 session doesn't rediscover the same walls.
@@ -69,11 +75,11 @@ found.
 
 **Turn on dry run first** if this is your first batch. Settings → *dry run (plan
 only, no files)* plans the whole thing and reports what each item would do without
-spending a single download (`background/background.js:596`).
+spending a single download (`background/background.js:684`).
 
 And before you commit to a 200-song batch, run **`PROBE_DRM`** on one clip. It is
 diagnostic only — no bytes, no quota — and it tells you which rungs would work and
-whether any of them is free (`background/background.js:5501-5548`).
+whether any of them is free (`background/background.js:5660-5733`).
 
 ---
 
@@ -111,10 +117,11 @@ is a separate decision from whether you're allowed to download them.
 `media_urls[]`. The previous build scraped `audio_url`, which is why it could never
 actually download music — it saved 111-byte 403 XML under audio filenames.
 
-### 🎚️ Formats: three, and that is a capability decision
+### 🎚️ Formats: three variants, four conversions — two different things
 
-The variant list is **exactly** `m4a`, `wav-48k` and `wav`
-(`background/background.js:449`). Nothing else.
+The **variant** list is exactly `m4a`, `wav-48k` and `wav`
+(`background/background.js:460`), and that is a capability decision: a variant
+selects the *download route*, and the `?format=` enum behind it is undocumented.
 
 | Variant | What it is | Cost |
 |---|---|---|
@@ -122,12 +129,24 @@ The variant list is **exactly** `m4a`, `wav-48k` and `wav`
 | `wav-48k` | a local render with the rate **pinned** to 48000, so it stays distinguishable from plain `wav` | 🟢 free |
 | `wav` | a local render at `settings.wavSampleRate` — decode, resample, real RIFF header | 🟢 free |
 
-MP3, FLAC, OGG, AAC and Opus are gone from the list because they all need an
-encoder this build does not ship, and offering them was the worst kind of lie: the
-UI showed them, the setting stored fine, and every download came back
-`ENCODER_UNAVAILABLE` with the original file saved. An old stored setting degrades
-gracefully through a 13-entry alias map rather than hard-resetting, and the
-substitution is logged.
+Separately, the **Convert** setting performs four conversions — `none`, `wav`,
+**`mp3`**, **`ogg`** (`background/background.js:549`) — using the two encoders
+vendored in `vendor/`:
+
+| Convert | What happens | Cost |
+|---|---|---|
+| `mp3` | `lamejs` 1.2.1 re-encodes the decoded PCM at `mp3Bitrate` (default **192** kbps) | 🟢 **zero downloads** — CPU + RAM |
+| `ogg` | `OggVorbisEncoder` re-encodes it at `oggQuality` (default **0.5** on a 0–1 named-quality scale) | 🟢 **zero downloads** — CPU + RAM |
+
+Both run locally, entirely on your machine: nothing is uploaded and no server is
+contacted. The transcode happens **after** the bytes arrive, and every rung it can
+be called from is already unmetered, so **it never spends a single download** — it
+costs a full decode plus a re-encode (wall-clock CPU) and peak memory for both the
+decoded PCM and the encoded output. What it buys is a file that plays everywhere.
+**FLAC, AAC and Opus still have no encoder**, so they are genuinely undeliverable.
+
+An old stored setting degrades gracefully through a 13-entry alias map rather than
+hard-resetting, and the substitution is logged.
 
 `lrc`, cover art and JSON are **not variants** — they are sidecars written next to
 the audio file, and they are toggles in the settings drawer. A standalone
@@ -151,9 +170,10 @@ This is a rewrite by many hands across parallel sessions, and it still needed a
 **dedicated integration audit** before anyone could trust it end to end.
 
 That is not a criticism of the work — it is the interesting part. Every module was
-verified *against itself*: each session traced its own entry points, and the doc
-set's 474 `file:line` citations were each checked against the source. All of it
-was correct. What nobody checked was **the seams**.
+verified *against itself*: each session traced its own entry points, and every
+`file:line` citation in the doc set was each checked against the source — 474 of
+them at the time of that pass. All of it was correct. What nobody checked was **the
+seams**.
 
 A rewrite split across parallel sessions has one characteristic failure mode: each
 agent reads the contract it can see and infers the rest. When two agents own
@@ -254,7 +274,8 @@ implicitly, which silently shrank mass downloads. Use `NO_TRASHED`.
 
 ## 🏗️ Architecture at a glance
 
-33,782 lines of JS, HTML and CSS across eight libraries and one orchestrator. The
+34,187 lines of JS, HTML and CSS across eight libraries and one orchestrator, plus
+2.8 MB of vendored third-party JavaScript. The
 libraries take
 their dependencies **by injection** — `fetchImpl`, a clock, a logger, an
 `indexedDB`, a crypto implementation — rather than reaching for globals, so each
@@ -263,7 +284,7 @@ one runs unmodified in the service worker, in a content script, and under node.
 ```
 manifest.json ─ declares permissions + CSP (script-src 'self')
 
-┌─ background/background.js ─ 6073 lines ─ the ONLY orchestrator ──────┐
+┌─ background/background.js ─ 6257 lines ─ the ONLY orchestrator ──────┐
 │  18 numbered sections. Owns HTTP, storage, the ladder, the batch      │
 │  driver, resumable crawls, the message router and the lifecycle.      │
 └───────────────────────────────────────────────────────────────────────┘
@@ -281,7 +302,15 @@ manifest.json ─ declares permissions + CSP (script-src 'self')
 
 ┌─ offscreen/ ──────────────────────────────────────────────────────────┐
 │  A real DOM page, because the worker has no Web Audio and no          │
-│  createObjectURL. Decodes, renders WAV, mints blob URLs.              │
+│  createObjectURL. Decodes, renders WAV, mints blob URLs, and          │
+│  loads the two vendored encoders from vendor/ at runtime.            │
+└───────────────────────────────────────────────────────────────────────┘
+
+┌─ vendor/ ─────────────────────────────────────────────────────────────┐
+│  2.8 MB of UNMODIFIED third-party audio encoders — lamejs 1.2.1       │
+│  (LGPL-3.0) and higuma/ogg-vorbis-encoder-js (MIT + Xiph BSD) — with │
+│  both licence notices and a SHA-256 recorded in vendor/README.md.    │
+│  Committed on purpose: an untracked vendor/ fails silently.           │
 └───────────────────────────────────────────────────────────────────────┘
 
    content/content.js   popup/   options/   side_panel.js
@@ -299,7 +328,7 @@ These are the interesting ones — each removal forced a specific design.
 | **Workers evicted at ~30 s idle** | all durable state in IndexedDB + `chrome.storage.session`; resumable cursors; a journal; a 30 s alarm armed **only** from `onInstalled`/`onStartup` |
 | **`runtime.sendMessage` can't reach content scripts** | every push fans out to `runtime.sendMessage` **and** `tabs.sendMessage` |
 | **`window` is undefined in a worker** | a four-line alias shim before `importScripts`. **Load-bearing — don't remove it** |
-| **No remote code** | no CDN encoder, **hence no MP3/OGG** |
+| **No remote code** | the two audio encoders are **vendored under `vendor/`** and hash-verified, because `script-src 'self'` makes a CDN fetch impossible — so there is no "grab it if missing" fallback to degrade to |
 
 > The `sendMessage` one is worth remembering: the previous build *documented* the
 > limitation in a comment and then used only the broken path. **No event ever
@@ -340,7 +369,8 @@ Not "not yet". Deliberately, with reasons.
 | **`DELETE` on any route** | never sent. |
 | **A "collaborative workspaces" filter** | staging-only flag, no known API surface. |
 | **Zip download** | `batchOnly`, opt-in, and the response shape has never been observed. Opt-in and honest rather than offered and broken. |
-| **MP3 / OGG encoding** | needs a vendored encoder MV3 won't let us fetch. The settings controls are rendered **`disabled`** with the reason, and the variants were **removed from the list entirely** — a control that looks live and isn't is worse than no control. |
+| **MP3 / OGG as *variants*** | they are reachable, but as `settings.transcode` rather than through the format dropdown. A variant becomes the route's `?format=` parameter, and that enum is undocumented — asking for a format the server may not serve means failing and falling through the ladder, potentially spending the metered rungs' quota to produce the very file the free rungs already gave you. The old build offered them as variants anyway and every download came back `ENCODER_UNAVAILABLE`. |
+| **FLAC / AAC / Opus** | no vendored encoder and no `transcode` format for them, so there is no code path that can produce one. Note the trap: the *source* stream is already `m4a-opus`, so a standalone Opus file is not reachable from here at all. |
 | **A standalone cover-art file download** | it needs the `image_url` / `image_large_url` CDN fetches, which this build does not implement. Embedded artwork is `tagOptions.artwork` and that one works. |
 | **A BPM range filter** | Suno sends no tempo field, so it is `0` on essentially every record straight from the feed. The tempo is *measured* client-side and used for tags; a filter on it would match nothing. |
 
@@ -356,7 +386,7 @@ Not "not yet". Deliberately, with reasons.
 - **The rate limit is 4 req/s + jitter by default because that is production.**
   Not because we're cautious — recon used the same number for the same reason
   (`../suno-recon/README.md:74`). It's tunable between 0.2 and 20 req/s
-  (`background/background.js:966`); leave it alone unless you have a reason.
+  (`background/background.js:1067`); leave it alone unless you have a reason.
 - **Stay inside your own quota.** 20/month on Pro, 60/month on Premier, resets on
   the billing date, no carryover. One song = one download, regardless of format.
 - **Suno's ToS exists to make mass export harder.** The September 2026 policy post
@@ -386,6 +416,25 @@ findings folded into the code comments. Nothing was committed, which means **the
 is no `npm test`, no CI, and no regression net.** If you change a lib, verify it
 against the field names in `docs/FILTERS.md` before you trust it.
 
+There *is* one thing you should run, though, before you load the extension:
+
+```sh
+sh scripts/check-build.sh      # 77 checks, exit 0 = the extension should load
+```
+
+It exists because **Chrome aborts loading an unpacked extension on the first bad
+file and reports several completely different root causes with the same message.**
+The one that is worth knowing about: a single raw `U+FFFF` non-character in
+`lib/db.js` — the standard IndexedDB prefix-range upper-bound sentinel — produced
+*"Could not load file 'lib/db.js' for content script. It isn't UTF-8 encoded."*
+It really was valid UTF-8. `iconv`, Python's strict codec and every standard tool
+accept it; Chromium's stricter `base::IsStringUTF8` does not, because it rejects
+every code point ending in `0xFFFE`/`0xFFFF`. So the checker now replicates
+Chromium's exact predicate instead of asking a standard tool, and the sentinel is
+written as the `\uFFFF` escape (`lib/db.js:1382`). The same pass now covers all five
+`vendor/` files, and the script SHA-256-verifies both encoders against the digests
+recorded in `vendor/README.md`.
+
 The code is written to be verifiable by reading: every lib header names its own
 invariants, every non-obvious decision cites the defect that caused it, and every
 one of the eight hard invariants at the top of `background/background.js:33-54`
@@ -397,17 +446,18 @@ Suggested first reads:
 2. `background/background.js:33-54` — the eight hard invariants
 3. `lib/api.js:1-43` — the seven hard-won behaviours, in the author's own words
 4. `lib/drm.js:1-76` — the DRM pipeline and its two unresolved questions
+5. `vendor/README.md` — the encoders' provenance, licences and the API traps
 
 ### 📜 Docs map
 
 | file | what it is |
 |---|---|
-| [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md) | 🚨 **20 hard limits.** Read first. |
+| [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md) | 🚨 **20 hard limits** (plus the MP3/OGG item, now resolved). Read first. |
 | [`docs/FILTERS.md`](docs/FILTERS.md) | every filter, its spec key, its verified field, its caveats |
 | [`docs/DOWNLOAD-LADDER.md`](docs/DOWNLOAD-LADDER.md) | the seven rungs, quota semantics, the DRM pipeline, format support |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | file map, MV3 constraints, message protocol, data flows, IDB schema |
 | [`docs/RECON-NOTES.md`](docs/RECON-NOTES.md) | the verified-truth ledger: what we built on, what we refused to |
-| [`CHANGELOG.md`](CHANGELOG.md) | 6.0.1 vs 6.0.0 vs 5.0.0 — 86 defects in the rewrite, 9 more in the audit |
+| [`CHANGELOG.md`](CHANGELOG.md) | 6.1.0 vs 6.0.1 vs 6.0.0 vs 5.0.0 — 86 defects in the rewrite, 9 more in the audit |
 
 Upstream recon: [`../suno-recon/`](../suno-recon/) — start at
 [`reports/FINDINGS.md`](../suno-recon/reports/FINDINGS.md).

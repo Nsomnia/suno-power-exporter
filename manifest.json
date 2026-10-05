@@ -77,7 +77,7 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
   },
-  "version": "6.0.1",
-  "version_name": "6.0.1 - Integration-seam audit: BPM pipeline, boot token, sync cursor, tag toggles, batch outcomes, quota guard",
+  "version": "6.1.0",
+  "version_name": "6.1.0 - MP3/OGG ship via vendored encoders; clamp lifted, mp3Bitrate/oggQuality added, U+FFFF load-blocker fixed",
   "minimum_chrome_version": "116"
 }
