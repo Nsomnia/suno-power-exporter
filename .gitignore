@@ -90,3 +90,6 @@ node_modules/
 # Log files. Diagnostics live in chrome.storage.local and are exported through
 # the options page; nothing should ever land here.
 *.log
+
+
+verify-api.js
