@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Suno Power Exporter</title>
+  <link rel="stylesheet" href="controls.css" />
+</head>
+<body>
+  <header class="sp-header">
+    <h1>Suno Power Exporter</h1>
+    <div class="sp-status" id="status" role="status" aria-live="polite">Connecting…</div>
+  </header>
+
+  <nav class="sp-tabs" id="tabs" role="tablist" aria-label="Exporter sections">
+    <button id="tab-btn-library" class="sp-tab-btn active" data-tab="library" role="tab" aria-selected="true" aria-controls="tab-library">Library</button>
+    <button id="tab-btn-directory" class="sp-tab-btn" data-tab="directory" role="tab" aria-selected="false" aria-controls="tab-directory">Directory</button>
+    <button id="tab-btn-settings" class="sp-tab-btn" data-tab="settings" role="tab" aria-selected="false" aria-controls="tab-settings">Settings</button>
+    <button id="tab-btn-activity" class="sp-tab-btn" data-tab="activity" role="tab" aria-selected="false" aria-controls="tab-activity">Activity</button>
+  </nav>
+
+  <main class="sp-main">
+    <!-- Library -->
+    <section id="tab-library" class="sp-tab-panel active" role="tabpanel" aria-labelledby="tab-btn-library">
+      <div class="sp-hero">
+        <div class="sp-hero-copy">
+          <div class="sp-eyebrow">LIBRARY SYNC</div>
+          <h2>Your Suno library, in one place.</h2>
+          <p>Sync every workspace, inspect coverage, and export only what you choose.</p>
+        </div>
+        <div class="sp-hero-actions">
+          <button class="sp-btn sp-btn-primary" id="btn-fetch">Sync library</button>
+          <button class="sp-btn sp-btn-ghost" id="btn-test-conn">Test connection</button>
+          <button class="sp-btn sp-btn-ghost" id="btn-debug">Debug: off</button>
+        </div>
+        <div class="sp-coverage" id="coverage-summary" aria-live="polite">No sync yet</div>
+        <div class="sp-progress" id="sync-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+          <div class="sp-progress-track"><span id="sync-progress-bar"></span></div>
+          <div class="sp-progress-label" id="sync-progress-label">Preparing sync…</div>
+        </div>
+      </div>
+
+      <div class="sp-filters sp-card">
+        <label class="sp-search"><span class="sp-sr-only">Search tracks</span><input type="search" id="f-search" placeholder="Search title, artist, model…" /></label>
+        <label><input type="checkbox" id="f-liked" /> Liked only</label>
+        <label><input type="checkbox" id="f-uploads" checked /> Include uploads</label>
+        <label title="Leave unchecked for a complete library sync"><input type="checkbox" id="f-ignore-disliked" /> Skip disliked (off = complete)</label>
+        <label>Workspace
+          <select id="f-workspace"><option value="">All workspaces</option></select>
+        </label>
+        <button class="sp-btn sp-btn-ghost" id="btn-clear">Clear list</button>
+      </div>
+
+      <div class="sp-toolbar">
+        <div class="sp-toolbar-count"><strong id="lib-count">0 tracks</strong><span id="lib-selection">0 selected</span></div>
+        <div class="sp-toolbar-actions">
+          <button class="sp-btn sp-btn-green" id="btn-dl-m4a">Export M4A</button>
+          <button class="sp-btn sp-btn-green" id="btn-dl-mp3">Export MP3</button>
+          <button class="sp-btn sp-btn-green" id="btn-dl-wav">Export WAV</button>
+          <button class="sp-btn sp-btn-ghost" id="btn-stop" disabled>Stop</button>
+        </div>
+      </div>
+
+      <div class="sp-table-wrap sp-card">
+        <div class="sp-table-head">
+          <span id="page-label">No tracks</span>
+          <div class="sp-pager"><button class="sp-btn sp-btn-ghost" id="btn-select-page">Select page</button><button class="sp-btn sp-btn-ghost" id="btn-select-all">Select all matches</button><button class="sp-btn sp-btn-ghost" id="btn-clear-selection">Clear selection</button><button class="sp-btn sp-btn-ghost" id="btn-prev-page">Previous</button><button class="sp-btn sp-btn-ghost" id="btn-next-page">Next</button></div>
+        </div>
+        <table class="sp-table">
+          <caption class="sp-sr-only">Synced tracks</caption>
+          <thead>
+            <tr><th scope="col"><span class="sp-sr-only">Select</span></th><th scope="col">Track</th><th scope="col">ID</th><th scope="col">Artist</th><th scope="col">Model</th><th scope="col">Status</th></tr>
+          </thead>
+          <tbody id="lib-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Directory -->
+    <section id="tab-directory" class="sp-tab-panel" role="tabpanel" aria-labelledby="tab-btn-directory">
+      <div class="sp-section">
+        <h2>Download Directory</h2>
+        <p class="sp-hint">
+          Choose a folder for organized exports, or use browser downloads when you do not want to grant folder access.
+          Exports are written under <strong>sppe_downloads/</strong> and scanned to avoid duplicates.
+        </p>
+        <div class="sp-row">
+          <label>Output
+            <select id="s-download-mode"><option value="directory">Chosen folder</option><option value="downloads">Browser Downloads</option></select>
+          </label>
+          <button class="sp-btn sp-btn-primary" id="btn-choose-dir">Choose Folder</button>
+          <button class="sp-btn sp-btn-ghost" id="btn-reconnect-dir">Reconnect</button>
+          <button class="sp-btn sp-btn-ghost" id="btn-clear-dir">Clear Saved</button>
+        </div>
+        <div class="sp-row" id="dir-status">No directory selected.</div>
+        <div class="sp-row"><button class="sp-btn sp-btn-ghost" id="btn-scan-dir">Scan Now</button></div>
+      </div>
+    </section>
+
+    <!-- Settings -->
+    <section id="tab-settings" class="sp-tab-panel" role="tabpanel" aria-labelledby="tab-btn-settings">
+      <div class="sp-section">
+        <h2>Download Format</h2>
+        <label><input type="radio" name="audioFormat" value="m4a" checked /> M4A (source audio)</label>
+        <label><input type="radio" name="audioFormat" value="mp3" /> MP3 (when available)</label>
+        <label><input type="radio" name="audioFormat" value="wav" /> WAV (transcoded)</label>
+      </div>
+
+      <div class="sp-section">
+        <h2>Library Filters (applied on fetch)</h2>
+        <p class="sp-hint">Use the Library filter bar to include or skip disliked tracks and uploads for the next sync.</p>
+      </div>
+
+      <div class="sp-section">
+        <h2>Tagging & Metadata</h2>
+        <label><input type="checkbox" id="s-artwork" checked /> Embed cover artwork</label>
+        <label><input type="checkbox" id="s-lyrics" checked /> Embed lyrics</label>
+        <label><input type="checkbox" id="s-detectbpm" /> Detect BPM (WAV/MP3)</label>
+        <label><input type="checkbox" id="s-sidecar" /> Write .meta.json sidecar</label>
+      </div>
+
+      <div class="sp-section">
+        <h2>Naming & Output</h2>
+        <label>Filename template
+          <input type="text" id="s-template" class="sp-input" value="{title} - {artist} [{id}]" />
+        </label>
+        <label><input type="checkbox" id="s-shortid" /> Use short ID (first 8 chars)</label>
+        <label>Concurrency
+          <input type="number" id="s-concurrency" min="1" max="4" value="2" />
+        </label>
+        <label>Feed request pacing (ms)
+          <input type="number" id="s-ratelimit" min="0" value="900" />
+        </label>
+        <label><input type="checkbox" id="s-inlinebtns" checked /> Inject download buttons on suno.com</label>
+      </div>
+
+      <button class="sp-btn sp-btn-primary" id="btn-save-settings">Save Settings</button>
+      <span id="settings-saved" class="sp-saved">Saved</span>
+    </section>
+
+    <!-- Activity -->
+    <section id="tab-activity" class="sp-tab-panel" role="tabpanel" aria-labelledby="tab-btn-activity">
+      <div class="sp-section">
+        <h2>Activity Log</h2>
+        <button class="sp-btn sp-btn-ghost" id="btn-clear-log">Clear Log</button>
+        <pre id="activity-log" class="sp-log" role="log" aria-live="polite" aria-label="Extension activity"></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer class="sp-footer">
+    <span id="footer-meta"></span>
+  </footer>
+
+  <script type="module" src="controls.js"></script>
+</body>
+</html>

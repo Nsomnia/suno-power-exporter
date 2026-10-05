@@ -1,0 +1,9 @@
+{
+  "name": "suno-power-exporter",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "for f in background.js content/content.js controls/controls.js lib/*.js; do node --check \"$f\" || exit 1; done"
+  }
+}
