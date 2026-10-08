@@ -179,6 +179,7 @@ importScripts(
    * runs before the monolith's own declarations are evaluated, so a part must
    * not CALL into the monolith at load time, only at call time.
    * scripts/check-build.sh enforces the load-order and reference rules. */
+  './parts/02-diagnostics.js',
   './parts/03-errors.js',
   './parts/06-messaging.js',
   './parts/15-quota.js'
@@ -248,6 +249,9 @@ const FILTER_AVAILABLE = !!(SunoFilter && typeof SunoFilter.apply === 'function'
  * export note at the bottom of `background/parts/15-quota.js` for why a
  * top-level `const` with one of these names throws in a classic worker. */
 const MISSING_PARTS = [];
+if (!globalThis.SMUDiagnostics || typeof globalThis.SMUDiagnostics.log !== 'function') {
+  MISSING_PARTS.push('background/parts/02-diagnostics.js (log)');
+}
 if (!globalThis.SMUErrors || typeof globalThis.SMUErrors.describeError !== 'function') {
   MISSING_PARTS.push('background/parts/03-errors.js (describeError)');
 }
@@ -914,134 +918,13 @@ const PUSH_TYPES = Object.freeze(new Set([
 /* ==========================================================================
  * 2. DIAGNOSTICS
  *
- * One `log()`, gated behind `settings.debug`, writing to a ring buffer in
- * `chrome.storage.local`. There is no `console.log` in this file: the console is
- * invisible in a packaged extension and lost the moment the worker dies.
+ * MOVED to `background/parts/02-diagnostics.js`, loaded by `importScripts` at
+ * the top of this file. Its three mutable bindings (`diagBuffer`,
+ * `diagFlushTimer`, `diagFlushPending`) are section-local, verified by reference
+ * count before the move. Note the mutual call-time dependency with
+ * `03-errors.js` — this section calls `redactText` and is called by `log` —
+ * for which the importScripts order is genuinely irrelevant.
  * ======================================================================== */
-
-/** @type {Array<{t:number,level:string,event:string,data:object}>} cache only. */
-let diagBuffer = [];
-let diagFlushTimer = null;
-let diagFlushPending = false;
-
-/** Anything matching this never reaches the log, at any level. */
-const SENSITIVE_KEY_RE = /(token|jwt|authorization|bearer|password|secret|cookie|session_key|private_key|content_key|user_key|glt|iv)/i;
-
-/**
- * Make a value safe to log: drop sensitive keys, cap depth and string length,
- * and turn anything unserialisable into a marker rather than throwing.
- * @param {unknown} value
- * @param {number} [depth]
- * @returns {unknown}
- */
-function sanitizeLogData(value, depth = 0) {
-  if (value === null || value === undefined) return value;
-  if (typeof value === 'string') return value.length > 400 ? value.slice(0, 400) + '…' : value;
-  if (typeof value === 'number' || typeof value === 'boolean') return value;
-  if (typeof value === 'bigint') return String(value);
-  if (typeof value === 'function') return '[function]';
-  if (value instanceof Error) return { name: value.name, message: redactText(value.message) };
-  if (ArrayBuffer.isView(value)) return `[${value.constructor.name}(${value.byteLength})]`;
-  if (value instanceof ArrayBuffer) return `[ArrayBuffer(${value.byteLength})]`;
-  if (depth >= 4) return '[depth]';
-  if (Array.isArray(value)) return value.slice(0, 40).map((entry) => sanitizeLogData(entry, depth + 1));
-  if (typeof value === 'object') {
-    const out = {};
-    let kept = 0;
-    for (const key of Object.keys(value)) {
-      if (SENSITIVE_KEY_RE.test(key)) {
-        out[key] = '[redacted]';
-        continue;
-      }
-      if (kept >= 40) break;
-      out[key] = sanitizeLogData(value[key], depth + 1);
-      kept += 1;
-    }
-    return out;
-  }
-  return String(value);
-}
-
-/**
- * THE single logging entry point.
- *
- * Persists to `chrome.storage.local` when `settings.debug` is on, and ALWAYS for
- * `error` level — an error you cannot see is the defect that just shipped.
- *
- * @param {'debug'|'info'|'warn'|'error'} level
- * @param {string} event stable, greppable event name
- * @param {object} [data] structured context (redacted automatically)
- * @returns {void}
- */
-function log(level, event, data) {
-  try {
-    diagBuffer.push({ t: Date.now(), level, event, data: sanitizeLogData(data || {}) });
-    if (diagBuffer.length > DIAG_BUFFER_CAP) {
-      diagBuffer.splice(0, diagBuffer.length - DIAG_BUFFER_CAP);
-    }
-    scheduleDiagFlush();
-  } catch (logErr) {
-    // A logger that throws is worse than no logger, but it must not take the
-    // worker down. Record the fact in the console-free path we still have:
-    // the last entry is silently dropped and the flush still runs.
-    void logErr;
-    scheduleDiagFlush();
-  }
-}
-
-/**
- * Arm the write-behind flush. Coalesced so a hot loop cannot produce one
- * storage write per log line.
- * @returns {void}
- */
-function scheduleDiagFlush() {
-  if (diagFlushTimer !== null || diagFlushPending) return;
-  diagFlushPending = true;
-  diagFlushTimer = setTimeout(() => {
-    diagFlushTimer = null;
-    diagFlushPending = false;
-    void flushDiagnostics();
-  }, DIAG_FLUSH_MS);
-}
-
-/**
- * Write the in-memory ring buffer through to `chrome.storage.local`, trimming
- * the stored buffer to the cap.
- * @returns {Promise<void>}
- */
-async function flushDiagnostics() {
-  const settings = settingsCache;
-  const hasError = diagBuffer.some((entry) => entry.level === 'error');
-  if (!hasError && !(settings && settings.debug)) return;
-  const batch = diagBuffer.slice();
-  try {
-    const stored = await chrome.storage.local.get(STORAGE_KEYS.DIAGNOSTICS);
-    const existing = Array.isArray(stored[STORAGE_KEYS.DIAGNOSTICS])
-      ? stored[STORAGE_KEYS.DIAGNOSTICS]
-      : [];
-    const merged = existing.concat(batch).slice(-DIAG_BUFFER_CAP);
-    await chrome.storage.local.set({ [STORAGE_KEYS.DIAGNOSTICS]: merged });
-  } catch (flushErr) {
-    // Storage can be unavailable during extension update. Nothing to do but
-    // keep the in-memory buffer and try again on the next flush.
-    void flushErr;
-  }
-}
-
-/**
- * Read the persisted ring buffer back, newest last.
- * @returns {Promise<Array<object>>}
- */
-async function readDiagnostics() {
-  try {
-    const stored = await chrome.storage.local.get(STORAGE_KEYS.DIAGNOSTICS);
-    const entries = stored[STORAGE_KEYS.DIAGNOSTICS];
-    return Array.isArray(entries) ? entries.slice(-DIAG_BUFFER_CAP) : [];
-  } catch (readErr) {
-    void readErr;
-    return [];
-  }
-}
 
 /* ==========================================================================
  * 3. ERRORS, REDACTION, CLASSIFICATION
