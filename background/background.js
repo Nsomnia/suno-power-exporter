@@ -180,6 +180,7 @@ importScripts(
    * not CALL into the monolith at load time, only at call time.
    * scripts/check-build.sh enforces the load-order and reference rules. */
   './parts/03-errors.js',
+  './parts/06-messaging.js',
   './parts/15-quota.js'
 );
 
@@ -249,6 +250,9 @@ const FILTER_AVAILABLE = !!(SunoFilter && typeof SunoFilter.apply === 'function'
 const MISSING_PARTS = [];
 if (!globalThis.SMUErrors || typeof globalThis.SMUErrors.describeError !== 'function') {
   MISSING_PARTS.push('background/parts/03-errors.js (describeError)');
+}
+if (!globalThis.SMUMessaging || typeof globalThis.SMUMessaging.broadcast !== 'function') {
+  MISSING_PARTS.push('background/parts/06-messaging.js (broadcast)');
 }
 if (!globalThis.SMUQuota || typeof globalThis.SMUQuota.quotaView !== 'function') {
   MISSING_PARTS.push('background/parts/15-quota.js (quotaView)');
@@ -2991,65 +2995,13 @@ function clearTokenMintInFlight() {
 /* ==========================================================================
  * 6. MESSAGING
  *
- * `chrome.runtime.sendMessage` from a service worker reaches extension pages
- * (popup / options / side panel) but NOT content scripts. The previous build
- * acknowledged that in a comment and then only used the broken path, so no event
- * ever reached the page. Every push goes to both.
+ * MOVED to `background/parts/06-messaging.js`, loaded by `importScripts` at
+ * the top of this file. Extracted third, and chosen for that position:
+ * `broadcast` has 19 call sites across the worker, so it exercises the part
+ * mechanism at full fan-out instead of in one quiet corner. It carries no
+ * completeness verdict — pushes are progress, and the verdict belongs to
+ * `syncContractView` in section 13.
  * ======================================================================== */
-
-/**
- * Deliver a push to extension pages AND to content scripts in Suno tabs.
- * @param {object} message
- * @returns {Promise<void>} resolves when both fan-outs have been attempted
- */
-async function broadcast(message) {
-  if (!message || typeof message.type !== 'string') return;
-  try {
-    // No inner `.catch()`: the outer catch below logs. An empty rejection
-    // handler here is exactly the kind of swallow this file forbids.
-    await chrome.runtime.sendMessage(message);
-  } catch (runtimeErr) {
-    log('debug', 'broadcast.runtime_failed', { type: message.type, error: describeError(runtimeErr) });
-  }
-  try {
-    const tabs = await findSunoTabs();
-    for (const tab of tabs) {
-      if (typeof tab.id !== 'number') continue;
-      try {
-        await chrome.tabs.sendMessage(tab.id, message);
-      } catch (tabErr) {
-        // A tab with no listener (or a navigating frame) is normal. One
-        // message per tab per push, so this is cheap and must not be retried.
-        log('debug', 'broadcast.tab_failed', { type: message.type, tabId: tab.id });
-        void tabErr;
-      }
-    }
-  } catch (tabsErr) {
-    log('debug', 'broadcast.tab_query_failed', { type: message.type, error: describeError(tabsErr) });
-  }
-}
-
-/**
- * Is this message from a source we are willing to take instructions from?
- *
- * Both halves matter: `sender.id` alone admits any extension page, and
- * `sender.url` alone is absent for some senders. The previous build checked
- * NEITHER on `TRIGGER_NATIVE_DOWNLOAD`, which downloaded an arbitrary
- * caller-supplied URL.
- *
- * @param {chrome.runtime.MessageSender} sender
- * @returns {{ok:boolean, reason?:string}}
- */
-function validateSender(sender) {
-  if (!sender) return { ok: false, reason: 'no sender' };
-  if (sender.id !== chrome.runtime.id) return { ok: false, reason: 'sender is not this extension' };
-  const url = typeof sender.url === 'string' ? sender.url : '';
-  if (!url) return { ok: false, reason: 'sender has no url' };
-  for (const pattern of TRUSTED_PAGE_PATTERNS) {
-    if (pattern.test(url)) return { ok: true };
-  }
-  return { ok: false, reason: 'sender url is not allowlisted: ' + url.slice(0, 120) };
-}
 
 /* ==========================================================================
  * 7. OFFSCREEN DOCUMENT
