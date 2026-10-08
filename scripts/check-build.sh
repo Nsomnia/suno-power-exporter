@@ -572,35 +572,42 @@ def top_level_names(path):
     return names
 
 
-worker = "background/background.js"
-parts = sorted(glob.glob("background/parts/*.js"))
-if not parts:
+# Each host file and the directory its parts are split into. The popup splits
+# the same way as the worker, only the loader differs (an HTML <script> tag list
+# rather than importScripts), so the hazard and the guard are identical.
+HOSTS = [("background/background.js", "background/parts/*.js"),
+         ("popup/popup.js", "popup/parts/*.js")]
+bad = False
+seen = {}
+found_any = False
+
+for worker, pattern in HOSTS:
+    parts = sorted(glob.glob(pattern))
+    if not parts:
+        continue
+    found_any = True
+    worker_names = top_level_names(worker)
+    print("    ok   %-44s %d top-level names" % (worker, len(worker_names)))
+    for p in parts:
+        names = top_level_names(p)
+        print("    ok   %-44s %d top-level names" % (p, len(names)))
+        for name, line in sorted(names.items()):
+            if name in worker_names:
+                bad = True
+                print("  FAIL %s:%d declares %r, which %s:%d also declares"
+                      % (p, line, name, worker, worker_names[name]))
+                print("        a part redeclaring a host function SILENTLY REPLACES it")
+                continue
+            if name in seen:
+                other, oline = seen[name]
+                bad = True
+                print("  FAIL %s:%d and %s:%d both declare %r" % (p, line, other, oline, name))
+            else:
+                seen[name] = (p, line)
+
+if not found_any:
     print("    ok   no parts to compare yet")
     sys.exit(0)
-
-worker_names = top_level_names(worker)
-bad = False
-print("    ok   %-44s %d top-level names" % (worker, len(worker_names)))
-
-seen = {}
-for p in parts:
-    names = top_level_names(p)
-    print("    ok   %-44s %d top-level names" % (p, len(names)))
-    for name, line in sorted(names.items()):
-        # part vs monolith
-        if name in worker_names:
-            bad = True
-            print("  FAIL %s:%d declares %r, which %s:%d also declares"
-                  % (p, line, name, worker, worker_names[name]))
-            print("        a part redeclaring a monolith function SILENTLY REPLACES it")
-            continue
-        # part vs part
-        if name in seen:
-            other, oline = seen[name]
-            bad = True
-            print("  FAIL %s:%d and %s:%d both declare %r" % (p, line, other, oline, name))
-        else:
-            seen[name] = (p, line)
 
 if bad:
     sys.exit(1)
