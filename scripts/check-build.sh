@@ -519,6 +519,99 @@ PY
 		printf '%s\n' "$stopreason_out" | grep -E '^\s+ok' || true
 	fi
 
+# --- 4c. extracted parts must not collide with the monolith ----------------
+# THE SILENT HAZARD OF THE PART MECHANISM, reproduced by execution:
+#
+#   the worker declares  function log() {}
+#   a part declares      function log() {}   ->  globalThis.log is now the PART
+#
+# No error. No warning. `node --check` passes, because it validates each file in
+# isolation and cannot see that two files claim the same global name. Every
+# monolith call site silently starts calling the part version instead, and the
+# only symptom is that logging (or anything else a part shadows) behaves wrong
+# in a way nothing points at.
+#
+# `const` behaves differently and worse-looking but better-caught: two parts
+# declaring the same `const` throws SyntaxError at load, so it is loud. It is the
+# `function` case that is invisible, and it is the only one worth guarding.
+#
+# Top-level declarations are matched at column 0. That is exact for this tree:
+# every part and the worker declare their top-level functions flush left, and
+# anything indented belongs to a function or block body and cannot collide.
+printf '\n-- extracted parts: no global name collisions\n'
+parts_out=$(python3 - <<'PY' 2>&1
+import glob, os, re, sys
+
+CH, Q1, Q2 = chr(92), chr(39), chr(34)
+# Declarations that claim a name in the shared global scope.
+DECL = re.compile(
+    r"^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)"      # function foo(
+    r"|^(?:const|let|var)\s+([A-Za-z_$][\w$]*)"          # const foo =
+    r"|^class\s+([A-Za-z_$][\w$]*)"                      # class Foo
+)
+
+
+def top_level_names(path):
+    try:
+        lines = open(path, encoding="utf-8").read().split("\n")
+    except OSError as exc:
+        print("  cannot read %s: %s" % (path, exc))
+        sys.exit(1)
+    names = {}
+    for i, line in enumerate(lines, 1):
+        if not line or line[0].isspace():
+            continue  # indented: inside a function or block, cannot collide
+        m = DECL.match(line)
+        if not m:
+            continue
+        name = next(g for g in m.groups() if g)
+        names.setdefault(name, i)
+    return names
+
+
+worker = "background/background.js"
+parts = sorted(glob.glob("background/parts/*.js"))
+if not parts:
+    print("    ok   no parts to compare yet")
+    sys.exit(0)
+
+worker_names = top_level_names(worker)
+bad = False
+print("    ok   %-44s %d top-level names" % (worker, len(worker_names)))
+
+seen = {}
+for p in parts:
+    names = top_level_names(p)
+    print("    ok   %-44s %d top-level names" % (p, len(names)))
+    for name, line in sorted(names.items()):
+        # part vs monolith
+        if name in worker_names:
+            bad = True
+            print("  FAIL %s:%d declares %r, which %s:%d also declares"
+                  % (p, line, name, worker, worker_names[name]))
+            print("        a part redeclaring a monolith function SILENTLY REPLACES it")
+            continue
+        # part vs part
+        if name in seen:
+            other, oline = seen[name]
+            bad = True
+            print("  FAIL %s:%d and %s:%d both declare %r" % (p, line, other, oline, name))
+        else:
+            seen[name] = (p, line)
+
+if bad:
+    sys.exit(1)
+print("    ok   no part shadows a monolith or sibling name")
+PY
+)
+	if [ $? -eq 0 ]; then
+		pass "extracted parts declare no colliding global names"
+	else
+		printf '%s\n' "$parts_out" | grep -vE '^\s+ok' || true
+		printf '%s\n' "$parts_out" | grep -E '^\s+ok' || true
+		fail "an extracted part shadows a global name; this fails SILENTLY at runtime"
+	fi
+
 # --- 5. JavaScript syntax -------------------------------------------------
 printf '\n-- JavaScript syntax (node --check)\n'
 for f in $BUILD_FILES; do
