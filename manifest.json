@@ -28,13 +28,6 @@
         "https://*.suno.com/*"
       ],
       "js": [
-        "lib/db.js",
-        "lib/crypto.js",
-        "lib/drm.js",
-        "lib/tagger.js",
-        "lib/lyrics.js",
-        "lib/audio.js",
-        "lib/api.js",
         "lib/suno.js",
         "content/content.js"
       ],
