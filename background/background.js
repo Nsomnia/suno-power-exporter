@@ -179,6 +179,7 @@ importScripts(
    * runs before the monolith's own declarations are evaluated, so a part must
    * not CALL into the monolith at load time, only at call time.
    * scripts/check-build.sh enforces the load-order and reference rules. */
+  './parts/03-errors.js',
   './parts/15-quota.js'
 );
 
@@ -246,6 +247,9 @@ const FILTER_AVAILABLE = !!(SunoFilter && typeof SunoFilter.apply === 'function'
  * export note at the bottom of `background/parts/15-quota.js` for why a
  * top-level `const` with one of these names throws in a classic worker. */
 const MISSING_PARTS = [];
+if (!globalThis.SMUErrors || typeof globalThis.SMUErrors.describeError !== 'function') {
+  MISSING_PARTS.push('background/parts/03-errors.js (describeError)');
+}
 if (!globalThis.SMUQuota || typeof globalThis.SMUQuota.quotaView !== 'function') {
   MISSING_PARTS.push('background/parts/15-quota.js (quotaView)');
 }
@@ -1037,132 +1041,14 @@ async function readDiagnostics() {
 
 /* ==========================================================================
  * 3. ERRORS, REDACTION, CLASSIFICATION
+ *
+ * MOVED to `background/parts/03-errors.js`, loaded by `importScripts` at the
+ * top of this file. Extracted second because it has no mutable module-scope
+ * state and every identifier it needs from the monolith is read at CALL time,
+ * so the move cannot change when anything resolves. Its five exports are read
+ * by 16 of the remaining sections, which is precisely why they stay hoisted
+ * globals on this side rather than becoming properties to be destructured.
  * ======================================================================== */
-
-/**
- * Redact bearer material and key material from arbitrary text before it can
- * reach a log, a notification, or a message payload.
- * @param {unknown} value
- * @returns {string}
- */
-function redactText(value) {
-  if (value === null || value === undefined) return '';
-  let text = typeof value === 'string' ? value : String(value);
-  text = text.replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [redacted]');
-  text = text.replace(/\beyJ[A-Za-z0-9._-]{8,}/g, '[redacted-jwt]');
-  text = text.replace(/("(?:authorization|token|jwt|password|secret|content_key|user_key|glt)"\s*:\s*)"[^"]*"/gi, '$1"[redacted]"');
-  return text.length > 600 ? text.slice(0, 600) + '…' : text;
-}
-
-/**
- * A failure shaped for a message reply: never carries a stack, never carries a
- * token, always carries a machine code the UI can branch on.
- */
-class OpError extends Error {
-  /**
-   * @param {string} code stable machine code
-   * @param {string} message human text (redacted)
-   * @param {object} [info] extra fields merged onto the reply
-   */
-  constructor(code, message, info) {
-    super(redactText(message));
-    this.name = 'OpError';
-    this.code = code;
-    this.info = info && typeof info === 'object' ? info : {};
-  }
-
-  /** @returns {{ok:false, error:string, code:string}} */
-  toReply() {
-    return { ok: false, error: this.message, code: this.code, ...this.info };
-  }
-}
-
-/**
- * Normalise anything thrown into `{code, message, retryable, status}`.
- * @param {unknown} err
- * @returns {{code:string, message:string, retryable:boolean, status:number}}
- */
-function describeError(err) {
-  if (err instanceof OpError) {
-    return { code: err.code, message: err.message, retryable: false, status: 0 };
-  }
-  if (err && typeof err === 'object') {
-    const status = Number.isFinite(err.status) ? err.status : 0;
-    let code = typeof err.code === 'string' && err.code ? err.code : 'unknown_error';
-    if (SunoApiError && typeof SunoApiError.isAuthError === 'function' && SunoApiError.isAuthError(err)) {
-      code = err.code === 'bad_token' ? 'bad_token' : 'unauthorized';
-    } else if (SunoApiError && SunoApiError.isQuotaError && SunoApiError.isQuotaError(err)) {
-      code = 'quota';
-    } else if (SunoApiError && SunoApiError.isEntitlementError && SunoApiError.isEntitlementError(err)) {
-      code = 'entitlement';
-    } else if (SunoApiError && SunoApiError.isNotFound && SunoApiError.isNotFound(err)) {
-      code = 'not_found';
-    }
-    return {
-      code,
-      message: redactText(err.message || String(err)),
-      retryable: err.retryable === true || isTransientStatus(status),
-      status,
-    };
-  }
-  return { code: 'unknown_error', message: redactText(String(err)), retryable: false, status: 0 };
-}
-
-/**
- * Is this HTTP status worth retrying? 429 and 5xx and network faults are
- * transient. 401/403/404 and an explicit refusal body never are.
- * @param {number} status
- * @returns {boolean}
- */
-function isTransientStatus(status) {
-  if (!Number.isFinite(status) || status <= 0) return true; // network-level
-  if (status === 429) return true;
-  return status >= 500 && status <= 599;
-}
-
-/**
- * Should this failure be retried by the batch driver? Deliberately narrow: a
- * 403 is an entitlement wall, a 404 will never appear, and a `{ok:false}`
- * refusal is a decision, not a glitch.
- * @param {unknown} err
- * @returns {boolean}
- */
-function isRetryableFailure(err) {
-  if (!err) return false;
-  if (err.aborted === true) return false;
-  if (err.name === 'AbortError') return false;
-  if (SunoApiError && typeof SunoApiError.isAbortError === 'function' && SunoApiError.isAbortError(err)) {
-    return false;
-  }
-  if (err.code === 'entitlement' || err.code === 'not_found' || err.code === 'bad_token') return false;
-  if (err.code === 'unauthorized' || err.code === 'missing_token') return false;
-  if (err.code === 'refused') return false;
-  // An explicit `reason` is the server refusing on purpose, never a glitch.
-  if (typeof err.reason === 'string' && err.reason) return false;
-  // An EXPLICIT `retryable: false` is authoritative in both directions. Without
-  // this, a ladder failure carrying `retryable:false` and no HTTP status fell
-  // through to `isTransientStatus(0)`, which means "network fault" — and the
-  // item would be retried forever.
-  if (err.retryable === true) return true;
-  if (err.retryable === false) return false;
-  return isTransientStatus(Number(err.status) || 0);
-}
-
-/**
- * Was this failure a cancellation rather than a fault? Aborts are control flow.
- * @param {unknown} err
- * @returns {boolean}
- */
-function isAbortLike(err) {
-  if (!err) return false;
-  if (err.aborted === true) return true;
-  if (err.name === 'AbortError') return true;
-  if (err.code === 'aborted' || err.code === 'cancelled') return true;
-  if (SunoApiError && typeof SunoApiError.isAbortError === 'function' && SunoApiError.isAbortError(err)) {
-    return true;
-  }
-  return false;
-}
 
 /* ==========================================================================
  * 4. SETTINGS

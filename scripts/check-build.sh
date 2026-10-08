@@ -59,6 +59,7 @@ lib/audio.js
 lib/api.js
 lib/suno.js
 background/background.js
+background/parts/03-errors.js
 background/parts/15-quota.js
 content/content.js
 popup/popup.js
