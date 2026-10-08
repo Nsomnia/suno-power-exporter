@@ -57,7 +57,15 @@
  * MV3 CONSTRAINTS THIS FILE IS WRITTEN AGAINST
  * ---------------------------------------------------------------------------
  * - The worker can be evicted at any await. Nothing authoritative may live in a
- *   module-scope variable; caches are caches and are re-derived on wake.
+ *   module-scope variable; caches are caches and are re-derived on wake. THE RUN
+ *   BOOKKEEPING IS THE EXCEPTION THAT PROVES IT, and it exists because the rule
+ *   was not enough on its own: §13c keeps "a crawl is in flight, started at T, and
+ *   a Stop was requested" in `chrome.storage.session`, which survives the
+ *   eviction. `syncController` and `syncCancelRequested` stay module-scope
+ *   because they are the things that DIE — they describe the crawl this worker is
+ *   running, and after an eviction there is no such crawl to describe. The honest
+ *   version of the rule is the one the code now follows: a module-scope binding may
+ *   be a cache or a handle, never the only copy of a fact a surface needs.
  * - `URL.createObjectURL` does not exist here. `chrome.downloads` needs a URL,
  *   so bytes become either a `data:` URL or an offscreen-minted blob URL.
  * - `chrome.alarms` has a 30 s floor in release builds and wakes the worker, so
@@ -254,6 +262,16 @@ const STORAGE_KEYS = Object.freeze({
   SESSION_SELECTION: 'suno.selection.session',
   SESSION_ACTIVE_DOWNLOADS: 'suno.activeDownloads.session',
   SESSION_TABS: 'suno.registeredTabs.session',
+  /* THE RUN-BOOKKEEPING RECORD. See §13c for the full argument; the short version
+   * is that `DB.syncState` holds the CRAWL and this holds the RUN, and the two
+   * have different lifetimes and different reasons to exist.
+   *
+   * No clip content, no cursor, no oracle numbers, no token material: six scalars
+   * saying whether a crawl is in flight, and when it started. `storage.session` is
+   * the right home for exactly that, because it SURVIVES service-worker eviction
+   * (which is the bug) and is CLEARED when the browser closes (which is correct —
+   * a browser that is not running is not running a crawl). */
+  SESSION_SYNC_RUN: 'suno.syncRun.session',
 });
 
 const META_KEYS = Object.freeze({
@@ -1702,6 +1720,60 @@ async function readSessionToken() {
     log('warn', 'auth.session_read_failed', { error: describeError(sessionErr) });
   }
   return null;
+}
+
+/**
+ * Refill `authCache` from session storage, if what is there is still usable.
+ *
+ * WHY `authCache` IS A CACHE AND NOT A SECOND SOURCE OF TRUTH — and why this is
+ * needed at all, given `getAuthToken` already falls back to `readSessionToken`:
+ *
+ * The gap is not the token, it is what the FALLBACK COSTS. `getAuthToken` on a
+ * cold worker has to await a `chrome.storage.session` read before it can use a
+ * token that is already on disk, and `SunoAPIClient` — whose own `cachedToken`
+ * died with the worker too — reaches it through a `tokenProvider` that, on a
+ * miss, runs the whole four-layer MAIN-world sweep: a `chrome.scripting`
+ * injection per Suno tab and up to `CLERK_WAIT_DEFAULT_MS` (12 s) of waiting for
+ * a page global that may not exist. A crawl that resumes at the start of a page
+ * pays that on its first request, and pays it again on the next one if the mint
+ * fails for want of a tab. Warming the cache at wake collapses all of it to one
+ * storage read, and `SunoAPIClient` is handed the same entry through
+ * `getAuthToken`, so the two caches warm together.
+ *
+ * NOTHING NEW IS PERSISTED. The token was already in `chrome.storage.session`
+ * (invariant G: no token is ever written outside it) — this reads a record that
+ * exists rather than creating one, and it expires with the browser, which is the
+ * right lifetime for a bearer token.
+ *
+ * A token that is present but no longer fresh is deliberately NOT warmed: the
+ * cache exists to skip a mint, and caching a token inside the refresh skew would
+ * make `isFreshToken` decide the opposite way on the next call. It is left for
+ * `getAuthToken` to mint over, exactly as if this had never run.
+ *
+ * @returns {Promise<{warmed:boolean, expiresAt:number|null}>}
+ */
+async function warmAuthCacheOnWake() {
+  const stored = await readSessionToken();
+  if (!stored) {
+    log('debug', 'auth.cache_warm_empty', {});
+    return { warmed: false, expiresAt: null };
+  }
+  if (!isFreshToken(stored, false)) {
+    /* Logged WITHOUT the token: `expiresAt` is the JWT's own `exp` claim, which
+     * is a timestamp, and the presence of the record is already the fact worth
+     * having. */
+    log('info', 'auth.cache_warm_stale', {
+      expiresAt: Number.isFinite(stored.exp) ? stored.exp : null,
+      obtainedAt: Number.isFinite(stored.obtainedAt) ? stored.obtainedAt : null,
+    });
+    return { warmed: false, expiresAt: Number.isFinite(stored.exp) ? stored.exp : null };
+  }
+  authCache = stored;
+  log('info', 'auth.cache_warmed', {
+    expiresAt: stored.exp,
+    obtainedAt: stored.obtainedAt,
+  });
+  return { warmed: true, expiresAt: stored.exp };
 }
 
 /**
@@ -5850,6 +5922,18 @@ function clearWatchdog() {
 let syncCancelRequested = false;
 
 /**
+ * When the run record was last heartbeated, so the per-page heartbeat in
+ * `afterPage` can be throttled.
+ *
+ * This is the ONLY module-scope binding the eviction fix adds to the sync
+ * section, and it is a throttle, not a fact: losing it on eviction costs at most
+ * one redundant write. Every decision about whether a run is in flight is made
+ * from the record in `chrome.storage.session` (§13c), which is durable.
+ * @type {number}
+ */
+let lastSyncRunBeat = 0;
+
+/**
  * Start the crawl. `runSync` is fire-and-forget; this returns immediately.
  *
  * INVARIANTS THE CRAWL KEEPS (each one is a bug this build fixed):
@@ -5910,6 +5994,25 @@ async function startSync(options) {
       }
     }, SYNC_WALL_CLOCK_MS);
 
+    /* THE RUN RECORD, WRITTEN BEFORE THE CRAWL IS ANNOUNCED. §13c. The order is
+     * the point: `syncController` is created on the line above and dies with the
+     * worker, so if this record is not on disk before the first `await` in
+     * `runSync`, there is a window in which a wake can see a cursor claiming a
+     * run that no record corroborates and no controller owns — which is exactly
+     * the disagreement this record exists to prevent. */
+    await writeSyncRun({
+      running: true,
+      startedAt: Date.now(),
+      cancelRequested: false,
+      cancelRequestedAt: null,
+      phase: 'starting',
+      heartbeatAt: Date.now(),
+    });
+    /* The per-page heartbeat throttle is reset with the record, so a run that
+     * starts seconds after the last one cannot inherit a beat new enough to
+     * suppress its own first heartbeats. */
+    lastSyncRunBeat = Date.now();
+
     reply = {
       ok: true,
       force: options.force === true,
@@ -5953,6 +6056,7 @@ async function startSync(options) {
       syncController = null;
       syncCancelRequested = false;
       clearWatchdog();
+      void clearSyncRun();
       void broadcast({
         type: 'SYNC_ERROR',
         ...syncContractView(null, {
@@ -5981,6 +6085,7 @@ async function startSync(options) {
     syncController = null;
     syncCancelRequested = false;
     clearWatchdog();
+    void clearSyncRun();
     void broadcast({
       type: 'SYNC_ERROR',
       ...syncContractView(null, {
@@ -6746,6 +6851,17 @@ function cursorForWire(cursor) {
  *   'expected_total'         the run came up short of the count it compared
  *                            against — a project row count, or the project list.
  *   'aborted'                the user cancelled. Not a fault.
+ *   'watchdog_timeout'       the crawl ran past `SYNC_WALL_CLOCK_MS` and the
+ *                            watchdog aborted it. A stall, not a user decision.
+ *   'interrupted'            THE WORKER WENT AWAY MID-CRAWL, and the row was
+ *                            reconciled on read (`reconcileStaleCursor`) or at
+ *                            wake (§13c). It is a worker-level reason, not a
+ *                            statement from the feed, and it is why the crawl
+ *                            cannot be proven indexed. Where the Stop had already
+ *                            been requested the row's `error` names that, because
+ *                            "your Stop was lost with the worker" and "the crawl
+ *                            broke" are different sentences with different
+ *                            remedies.
  * Anything else is a bug in the producer: render it as an unknown failure and
  * show `error`, never as a success.
  *
@@ -6956,6 +7072,18 @@ async function runSync(opts) {
     state: 'running',
     force,
     startedAt,
+    /* EXPLICITLY RESET, for the same reason `nextPage` and `pass` are nulled
+     * above: `DB.syncState.set` MERGES, so a key this object omits survives from
+     * a previous run's row. `cancelSync` writes `cancelRequested:true` onto that
+     * row and the run's own verdict now clears it, but a row written by a build
+     * that predates the clearing would otherwise hand this run a cancel nobody
+     * asked for — and `SYNC_STATUS.cancelling` would then report "Stopping" for
+     * a crawl that was never stopped. `interrupted*` are the §13c reconciliation's
+     * markers and belong to the run that was evicted, not to this one. */
+    cancelRequested: false,
+    cancelRequestedAt: null,
+    interrupted: false,
+    interruptedAfterCancel: false,
   };
 
   /* Normalised BEFORE the merge so the row that wins the `Object.assign` below
@@ -7377,6 +7505,21 @@ async function runSync(opts) {
     // orphaned by an eviction", without needing a timer that would itself not
     // survive eviction.
     cursor.heartbeatAt = Date.now();
+    /* …and the run record gets the same heartbeat (§13c). THROTTLED, and the
+     * throttle is load-bearing rather than tidy: this runs once per feed page,
+     * which is ~80 writes on the library this bug was reported from, and the
+     * record's only job is to be newer than `SYNC_RUN_HEARTBEAT_FLOOR_MS` when
+     * the worker dies. Five seconds is an order of magnitude below the floor it
+     * is checked against, so a throttled write can never make a live crawl look
+     * evicted. NOT awaited: `afterPage` is on the crawl's hot path and a storage
+     * round-trip per page is exactly the kind of cost that pushes a crawl past
+     * the eviction window in the first place. `writeSyncRun` logs its own
+     * failures, so nothing is lost by letting it settle late — and the cursor
+     * write on the next line is the durable record regardless. */
+    if (Date.now() - lastSyncRunBeat > SYNC_RUN_HEARTBEAT_FLOOR_MS) {
+      lastSyncRunBeat = Date.now();
+      void writeSyncRun({ heartbeatAt: lastSyncRunBeat });
+    }
     const workspaceIndex = workspaces.findIndex((row) => row.projectId === page.projectId);
     if (workspaceIndex >= 0) {
       workspaces[workspaceIndex] = outcome;
@@ -7850,6 +7993,18 @@ async function runSync(opts) {
     cursor.stopReason = stopReason;
     cursor.lastError = completed ? null : (error || firstError || 'the library is incomplete');
     cursor.state = signal.aborted ? 'cancelled' : (completed ? 'idle' : 'incomplete');
+    /* The stop intent is CLEARED at the verdict, here and at the two failure
+     * verdicts below. `cancelSync` writes `cancelRequested:true` onto this row
+     * and nothing else ever cleared it, and `DB.syncState.set` MERGES — so a row
+     * that had once been cancelled carried the flag into every later run, and
+     * `SYNC_STATUS.cancelling` (which reads it) reported "Stopping" for a crawl
+     * the user had never asked to stop. The same three lines also reset the
+     * eviction bookkeeping, so a healed row cannot be mistaken for a fresh one
+     * by the reconciliation in §13c. */
+    cursor.cancelRequested = false;
+    cursor.cancelRequestedAt = null;
+    cursor.interrupted = false;
+    cursor.interruptedAfterCancel = false;
     /* `missing` IS `expectedTotal - examined`, always, from the same `examined`
      * the oracle compares. It is written even when `oracleApplied` is false — the
      * arithmetic is still the best estimate available, and `oracleApplied` is what
@@ -7955,6 +8110,12 @@ async function runSync(opts) {
       cursor.stopReason = syncWatchdogFired ? 'watchdog_timeout' : 'aborted';
       cursor.state = 'cancelled';
       cursor.lastError = syncWatchdogFired ? 'cancelled by the watchdog' : 'cancelled by the user';
+      // The stop has now TAKEN EFFECT, so the intent is spent — see the note on
+      // the same three lines at the normal verdict.
+      cursor.cancelRequested = false;
+      cursor.cancelRequestedAt = null;
+      cursor.interrupted = false;
+      cursor.interruptedAfterCancel = false;
       cursor.missing = missingNow;
       cursor.examined = examined;
       cursor.totalSeen = uniqueSeenTotal();
@@ -7990,6 +8151,12 @@ async function runSync(opts) {
     cursor.truncated = true;
     cursor.stopReason = 'page_failed';
     cursor.state = 'error';
+    // As at the normal verdict: the run is over, so the stop intent and the
+    // eviction bookkeeping are cleared with it.
+    cursor.cancelRequested = false;
+    cursor.cancelRequestedAt = null;
+    cursor.interrupted = false;
+    cursor.interruptedAfterCancel = false;
     cursor.missing = missingNow;
     cursor.examined = examined;
     cursor.totalSeen = uniqueSeenTotal();
@@ -8026,6 +8193,14 @@ async function runSync(opts) {
     // run is still real, and a press in that window must still be answered with
     // `abortAvailable:true` rather than as a no-op.
     syncCancelRequested = false;
+    /* The run record goes LAST, and only here. Every terminal path above has
+     * already written the verdict to the cursor and broadcast it, so by the time
+     * this runs there is a durable row saying the run is over — and clearing the
+     * record is what stops the NEXT wake from reconciling a run that finished
+     * normally. It is awaited rather than `void`ed for the same reason the
+     * cursor write above is: a wake that beat this line would find a live record
+     * with no controller and declare a completed run evicted. */
+    await clearSyncRun();
   }
 }
 
@@ -8189,6 +8364,13 @@ async function reportSyncPhase(phase, detail, ctx) {
       log('warn', 'sync.phase_persist_failed', { phase, message: describeError(phaseErr).message });
     }
   }
+  /* The run record is heartbeated here as well as on the cursor row (§13c). The
+   * two are not interchangeable: the cursor write is inside `if (cur)`, so a
+   * phase reported without a cursor would leave the run record ageing with
+   * nothing to show for it, and `syncEvictionVerdict` would call the crawl
+   * evicted while it was demonstrably between phases. Cheap, and it makes the
+   * phase the thing that keeps a run alive — which is exactly what it is. */
+  await writeSyncRun({ phase, heartbeatAt: Date.now() });
    log('info', 'sync.phase', {
      phase,
      pagesDone: Number.isFinite(info.pagesDone) ? info.pagesDone : 0,
@@ -8248,12 +8430,25 @@ async function cancelSync() {
       ? await reconcileStaleCursor(stored, live)
       : Object.assign({}, stored, { state: 'cancelled', completed: false, truncated: true, stopReason: 'aborted' });
     if (!live.stale) {
+      /* `cancelRequested` is cleared here for the same reason the run verdicts
+       * clear it (§13c): this press ENDS the run, so leaving the flag set would
+       * make every later `SYNC_STATUS` report a cancellation still in progress.
+       * `reconcileStaleCursor` is not given the same treatment in its own body —
+       * it may heal a row whose cancel intent the user still expects to be
+       * honoured, and the wake-time reconciliation in §13c is what clears it
+       * there. */
+      healed.cancelRequested = false;
+      healed.cancelRequestedAt = null;
       try {
         await DB.syncState.set('feed', healed);
       } catch (markErr) {
         log('warn', 'sync.cancel_mark_failed', { message: describeError(markErr).message });
       }
     }
+    /* The run record is dropped on this path too. The press cleared the claim
+     * that made the record mean anything, and leaving it behind is what makes the
+     * NEXT wake reconcile a run that has been over since this press. */
+    await clearSyncRun();
     log('info', 'sync.cancel_orphaned', { stale: live.stale, ageMs: live.ageMs });
     void broadcast({
       type: 'SYNC_CANCELLED',
@@ -8279,6 +8474,11 @@ async function cancelSync() {
 
   if (!syncController) {
     log('info', 'sync.cancel_noop', { storedState: stored && stored.state });
+    /* A press with nothing to stop must not leave a run record behind either:
+     * §13c's reconciliation reads "a record claiming a crawl with no controller"
+     * as an eviction, and a record left by a no-op press would be reconciled as
+     * one on the next wake — announcing a run that never existed. */
+    await clearSyncRun();
     void broadcast({
       type: 'SYNC_CANCELLED',
       state: 'cancelled',
@@ -8314,15 +8514,560 @@ async function cancelSync() {
   // `running` until the crawl actually unwinds, because claiming `cancelled`
   // before it stops would be the same over-confident report as the two bugs
   // this reply exists to fix.
+  const cancelRequestedAt = Date.now();
   try {
     await DB.syncState.set('feed', Object.assign({}, (await DB.syncState.get('feed', null)), {
       cancelRequested: true,
-      cancelRequestedAt: Date.now(),
+      cancelRequestedAt,
     }));
   } catch (markErr) {
     log('warn', 'sync.cancel_mark_failed', { message: markErr && markErr.message ? String(markErr.message) : 'unknown' });
   }
+  /* …and the SAME intent goes into the run record (§13c), which is what
+   * `syncEvictionVerdict` reads to word a cancellation that was lost with the
+   * worker. It is written after the cursor so the cursor stays the primary
+   * record and a failure here degrades to the cursor-only path rather than to a
+   * run that claims a stop the crawl never saw. */
+  await writeSyncRun({ cancelRequested: true, cancelRequestedAt, heartbeatAt: Date.now() });
   return { ok: true, running: true, cancelRequested: true, abortAvailable: true, orphanedCursorCleared: false, stale: false };
+}
+
+/* -------------------------------------------------------------------------
+ * 13c. THE RUN RECORD — what an EVICTED worker left behind
+ *
+ * THE BUG THIS EXISTS FOR, in the shape the user saw it: a long library crawl
+ * is the single most eviction-prone thing this extension does, because a
+ * `chrome.alarms` keepalive at the 30 s floor wakes the worker repeatedly and
+ * Chrome is then free to take it away at any `await`. When it does, EVERY
+ * module-scope binding is gone: `syncController`, `syncCancelRequested`,
+ * `syncWatchdogFired`. What was left in the world was the durable crawl cursor,
+ * which says `running`, and nothing that could contradict it. The consequence
+ * was a crawl that no surface could ever call finished:
+ *
+ *   - `SYNC_DONE` / `SYNC_ERROR` / `SYNC_CANCELLED` are emitted FROM MEMORY, so
+ *     a worker that dies before it reaches one of them says NOTHING. The popup
+ *     kept rendering an indeterminate "Stopping" slider with a live button,
+ *     because the last thing it was told was `SYNC_CANCEL_REQUESTED`.
+ *   - The stored `cancelRequested` is never cleared once a run ends, so a
+ *     single cancel in a browser session made every later `SYNC_STATUS` claim
+ *     `cancelling:true` — permanently, for every subsequent run.
+ *
+ * WHY THIS IS `chrome.storage.session` AND NOT `DB.syncState`, since a crawl
+ * cursor is already persisted per page and reusing it would have been the
+ * smaller change:
+ *
+ *   - They answer DIFFERENT questions. The cursor is "how far did the walk get,
+ *     and does it satisfy the oracle" — a completeness claim that has to be
+ *     written inside a transaction, merged field by field, and is read by every
+ *     surface as the verdict. This is "is a crawl in flight right now" — a
+ *     liveness fact with a different writer and a different lifetime.
+ *   - Their LIFETIMES differ in the direction that matters. The cursor is
+ *     disk-resident and outlives a browser restart, so after the browser quits
+ *     mid-crawl it still says `running` and the reconciliation below has to
+ *     cope with that (it does: the cursor alone is enough to detect the orphan).
+ *     A run record belongs to the RUNNING browser: it survives worker eviction
+ *     and is cleared on browser close, which is exactly the lifetime of a crawl.
+ *   - Writing run state into the cursor row would have made `resumable`
+ *     (`runSync`, `stored.state === 'running'`) depend on a field that
+ *     reconciliation MUTATES. That predicate is the thing that decides whether
+ *     a resume skips workspaces, so it is the last place in this file to invite
+ *     a second writer.
+ *
+ * So: two stores, two questions, one writer each. This is not a third
+ * mechanism — `DB.syncState` remains the crawl and `chrome.storage.session`
+ * remains the session-scoped state the file already uses for the active-download
+ * mirror (`STORAGE_KEYS.SESSION_ACTIVE_DOWNLOADS`, `persistActiveDownloads`).
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Which worker instance is writing. Regenerated on every wake, which is the
+ * point: a run record carrying a DIFFERENT epoch was written by a worker that
+ * no longer exists, and that is an eviction by definition.
+ *
+ * This is the one piece of sync state that IS module-scope, and it is
+ * deliberately the useless half — a process identity, not a run. Two workers
+ * cannot share one (they cannot coexist), and it carries nothing a reader needs
+ * to render anything.
+ * @type {string}
+ */
+const SYNC_RUN_EPOCH = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+
+/**
+ * Coerce whatever is in session storage into a run record, or null.
+ *
+ * Nothing here trusts the stored shape: the record is written on a hot path and
+ * read on a cold one, and a half-written or hand-edited record must degrade to
+ * "no run" rather than to a claim.
+ *
+ * @param {unknown} raw
+ * @returns {{running:boolean, startedAt:number, cancelRequested:boolean,
+ *   cancelRequestedAt:number|null, phase:string|null, heartbeatAt:number,
+ *   epoch:string|null}|null}
+ */
+function coerceSyncRun(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const startedAt = Number(raw.startedAt);
+  return {
+    running: raw.running === true,
+    startedAt: Number.isFinite(startedAt) && startedAt > 0 ? startedAt : 0,
+    cancelRequested: raw.cancelRequested === true,
+    cancelRequestedAt: Number.isFinite(Number(raw.cancelRequestedAt)) ? Number(raw.cancelRequestedAt) : null,
+    phase: typeof raw.phase === 'string' && raw.phase ? raw.phase : null,
+    heartbeatAt: Number.isFinite(Number(raw.heartbeatAt)) ? Number(raw.heartbeatAt) : 0,
+    epoch: typeof raw.epoch === 'string' && raw.epoch ? raw.epoch : null,
+  };
+}
+
+/**
+ * Read the run record. A missing record means "no run in flight", which is the
+ * answer on a fresh install and after a browser restart — both correct.
+ * @returns {Promise<ReturnType<typeof coerceSyncRun>|null>}
+ */
+async function readSyncRun() {
+  try {
+    const stored = await chrome.storage.session.get(STORAGE_KEYS.SESSION_SYNC_RUN);
+    return coerceSyncRun(stored[STORAGE_KEYS.SESSION_SYNC_RUN]);
+  } catch (runReadErr) {
+    log('warn', 'sync.run_read_failed', { error: describeError(runReadErr) });
+    return null;
+  }
+}
+
+/**
+ * Merge a patch into the run record. `epoch` is stamped on every write and is
+ * never taken from the caller, so a record can only ever claim the worker that
+ * wrote it.
+ *
+ * `chrome.storage.session` has no merge primitive, so this is a read-then-write
+ * and two of its callers can interleave: the awaited cancel write and the
+ * fire-and-forget per-page heartbeat. A lost update here can cost one field —
+ * `phase`, or a heartbeat — and the one field that would actually matter
+ * (`cancelRequested`) is written to the crawl cursor as well and read from BOTH
+ * by `cancelRequestedWording`, precisely so this race cannot cost the user the
+ * distinction between "the crawl broke" and "your Stop never landed".
+ *
+ * A failed write is logged and NOT retried: the crawl itself does not depend on
+ * this record (the cursor still advances and the run still resumes), and the
+ * reconciliation below treats a missing record as "no run", which is the honest
+ * reading when we cannot prove one.
+ *
+ * @param {{running?:boolean, startedAt?:number, cancelRequested?:boolean,
+ *   cancelRequestedAt?:number|null, phase?:string|null, heartbeatAt?:number}} patch
+ * @returns {Promise<void>}
+ */
+async function writeSyncRun(patch) {
+  try {
+    const current = (await readSyncRun()) || {
+      running: false,
+      startedAt: 0,
+      cancelRequested: false,
+      cancelRequestedAt: null,
+      phase: null,
+      heartbeatAt: 0,
+    };
+    const next = Object.assign({}, current, patch || {}, { epoch: SYNC_RUN_EPOCH });
+    await chrome.storage.session.set({ [STORAGE_KEYS.SESSION_SYNC_RUN]: next });
+  } catch (runWriteErr) {
+    log('warn', 'sync.run_write_failed', { error: describeError(runWriteErr) });
+  }
+}
+
+/**
+ * Forget the run entirely. Called on every terminal path, so its absence is the
+ * normal steady state and never means "something went wrong".
+ * @returns {Promise<void>}
+ */
+async function clearSyncRun() {
+  try {
+    await chrome.storage.session.remove(STORAGE_KEYS.SESSION_SYNC_RUN);
+  } catch (runClearErr) {
+    log('warn', 'sync.run_clear_failed', { error: describeError(runClearErr) });
+  }
+}
+
+/**
+ * How stale may the run record's own heartbeat be before we believe it?
+ *
+ * Generous for the same reason `SYNC_STALE_MS` is: a page can be held for a
+ * long rate-limit backoff, and calling a live crawl dead is the same
+ * over-confident report as the bug being fixed.
+ */
+const SYNC_RUN_HEARTBEAT_FLOOR_MS = 5000;
+
+/**
+ * The stored run and the stored cursor, reduced to the two facts reconciliation
+ * needs.
+ *
+ * THE EVICTION SIGNATURE, stated once so the reconciliation below reads as the
+ * rule it is:
+ *
+ *   persisted "a crawl is in flight"   AND   no `syncController` in THIS worker
+ *
+ * The first half is only ever written by `startSync`, which also creates the
+ * controller, and it is cleared on every terminal path. The second half is true
+ * on every worker instance except the one that started the run — and only one
+ * worker exists at a time, so a mismatch cannot be a race between two of them.
+ * The heartbeat age is checked as well, but only as a floor for the case where
+ * the cursor row is the sole evidence (a pre-fix install, or a run started
+ * before this record existed): `SYNC_STALE_MS` there is a REASON with a number
+ * in it, and this one is only ever a guard against reconciling a run that
+ * `startSync` created moments ago in this same worker.
+ *
+ * @param {object|null} cursor the stored `syncState.feed` row
+ * @param {unknown} [runRecord] the stored run record, already read by the caller
+ * @returns {{orphaned:boolean, cancelRequested:boolean, ageMs:number|null,
+ *   ageSource:string, epochMismatch:boolean, cursorOnly:boolean}}
+ */
+function syncEvictionVerdict(cursor, runRecord) {
+  const row = cursor && typeof cursor === 'object' ? cursor : null;
+  const cursorSaysRunning = !!row && row.state === 'running';
+  const cursorAt = row ? Number(row.heartbeatAt) : NaN;
+  const cursorAgeMs = Number.isFinite(cursorAt) && cursorAt > 0 ? Math.max(0, Date.now() - cursorAt) : null;
+
+  /* The run record is PASSED IN rather than fetched here: reconciliation is the
+   * one place that must not re-read and re-race, so the caller reads both
+   * records once and judges them from the same snapshot. */
+  const run = coerceSyncRun(runRecord);
+  const runSaysRunning = !!run && run.running === true;
+  const epochMismatch = runSaysRunning && run.epoch !== SYNC_RUN_EPOCH;
+  const anyCancelRequested = syncCancelRequested === true
+    || (run && run.cancelRequested === true)
+    || !!(row && row.cancelRequested === true);
+
+  if (syncController) {
+    return {
+      orphaned: false,
+      cancelRequested: anyCancelRequested,
+      ageMs: 0,
+      ageSource: 'controller',
+      epochMismatch: false,
+      cursorOnly: false,
+    };
+  }
+  if (!runSaysRunning && !cursorSaysRunning) {
+    return {
+      orphaned: false,
+      cancelRequested: anyCancelRequested,
+      ageMs: cursorAgeMs,
+      ageSource: 'none',
+      epochMismatch: false,
+      cursorOnly: false,
+    };
+  }
+
+  const ageMs = runSaysRunning && run.heartbeatAt > 0
+    ? Math.max(0, Date.now() - run.heartbeatAt)
+    : cursorAgeMs;
+  /* CURSOR-ONLY: no run record claimed a crawl, so the row is the sole evidence.
+   * That is a browser restart (session storage cleared with it), an install from
+   * a build that predates the record, or a run whose record write failed. It
+   * still means the same thing — nothing owns that row — but it gets the SAME
+   * 90-second grace the read paths already give it, because without a record
+   * there is nothing to compare an epoch against and we would rather be late
+   * than reconcile a crawl that started seconds ago. */
+  const cursorOnly = !runSaysRunning;
+  const floorMs = cursorOnly ? SYNC_STALE_MS : SYNC_RUN_HEARTBEAT_FLOOR_MS;
+  const orphaned = ageMs !== null && ageMs > floorMs;
+
+  return {
+    orphaned,
+    cancelRequested: anyCancelRequested,
+    ageMs,
+    ageSource: runSaysRunning ? 'run-record' : 'cursor-row',
+    epochMismatch,
+    cursorOnly,
+  };
+}
+
+/**
+ * Reconcile a run that an eviction took with it, and tell every surface.
+ *
+ * WHAT "RECONCILE" MEANS HERE, and it is deliberately the SAME operation the
+ * read paths already perform (`reconcileStaleCursor`) plus one push:
+ *
+ *   1. The cursor row is turned into an honest `interrupted` one by the existing
+ *      helper, so `completed:false`, `truncated:true` and a named reason are on
+ *      disk before anything is said. Nothing here can produce `completed:true`,
+ *      and it never will: an eviction is not evidence of completeness and
+ *      `docs/ARCHITECTURE.md:655-657` is explicit that a wrong answer in the
+ *      cautious direction is still a wrong answer, which is exactly why this
+ *      path is only allowed to say "incomplete".
+ *   2. A terminal push goes out. THE PUSH IS THE POINT. The reconciliation
+ *      helpers healed the row, but every terminal push in this section is
+ *      emitted from memory, so a surface that only LISTENS never learns the run
+ *      ended — the popup kept an indeterminate "Stopping" slider and the page
+ *      overlay kept a live bar, because the last thing either was told was
+ *      `SYNC_CANCEL_REQUESTED`. `SYNC_CANCELLED` is the one push every surface
+ *      already treats as terminal-with-no-verdict: it stops the poll, clears the
+ *      cancelling flag, and then re-reads the cursor. Carrying no verdict is a
+ *      FEATURE here — a push cannot be a second source of truth about
+ *      completeness, and the row it re-reads is the one true one.
+ *   3. The run record is cleared, which is what makes the whole thing IDEMPOTENT
+ *      in the strong sense: after it runs there is no record and the cursor is
+ *      no longer `running`, so every later wake sees nothing to reconcile. No
+ *      tombstone, no marker, no risk of a duplicate terminal push.
+ *
+ * The cursor's own `state` is the idempotence guard for the case where the run
+ * record is gone but the row is not (`cursorOnly`), and the re-read of the row
+ * immediately before healing is the guard against clobbering a crawl that
+ * started in this same worker while we were awaiting storage.
+ *
+ * @param {object|null} cursor the row read by the caller
+ * @param {object|null} [run] the run record read by the caller
+ * @param {{orphaned:boolean}} verdict `syncEvictionVerdict(cursor, run)`
+ * @returns {Promise<boolean>} true when a run was reconciled
+ */
+async function reconcileSyncRunOnWake(cursor, run, verdict) {
+  if (!verdict || !verdict.orphaned) return false;
+
+  /* Re-read before writing. `reconcileStaleCursor` merges, so a row that
+   * changed underneath us would come back carrying a live crawl's progress with
+   * `state:'interrupted'` written over the top of it. Cheap next to getting it
+   * wrong, and it is the only thing standing between this and a crawl that is
+   * declared dead while it is still running. */
+  const fresh = await DB.syncState.get('feed', null).catch((reReadErr) => {
+    log('warn', 'sync.eviction_reread_failed', { error: describeError(reReadErr) });
+    return null;
+  });
+  if (!fresh || fresh.state !== 'running' || syncController) {
+    log('debug', 'sync.eviction_skipped', {
+      state: fresh ? fresh.state : null,
+      hasController: !!syncController,
+    });
+    /* The record is cleared ONLY when there is genuinely nothing in flight. If a
+     * controller appeared while we were awaiting storage, a `SYNC_START` landed
+     * on this same worker during bootstrap and the record now belongs to that
+     * crawl — clearing it would leave a live run with no run record, which is the
+     * cursor-only case this whole section exists to avoid. */
+    if (!syncController) await clearSyncRun();
+    return false;
+  }
+
+  /* THE WORDING IS NOT INVENTED HERE. `reconcileStaleCursor` already owns the
+   * sentence, already names the no-page interval, and already picks
+   * `stopReason:'interrupted'`; it is the same text the user has now seen and
+   * the same one `GET_BOOT` / `SYNC_STATUS` will show afterwards. The one
+   * addition is the cancel case, which had no wording at all before: a stop that
+   * was asked for and then lost with the worker is neither "the user cancelled"
+   * nor "the crawl broke", and reporting it as the latter would send the user
+   * off to debug a fault they did not cause. */
+  const live = syncLiveness(fresh);
+  const afterCancel = cancelRequestedWording(verdict, fresh);
+  const noPageFor = verdict.ageMs !== null ? ' (no page for ' + Math.round(verdict.ageMs / 1000) + 's)' : '';
+  const healed = Object.assign({}, fresh, {
+    state: 'interrupted',
+    stopReason: 'interrupted',
+    error: afterCancel
+      ? 'you asked to stop this crawl, but the extension worker was stopped before the stop '
+        + `could take effect${noPageFor} — press Sync to continue; indexed clips are kept`
+      : `the extension worker was stopped mid-crawl${noPageFor} — press Sync to continue; indexed clips are kept`,
+    completed: false,
+    truncated: true,
+    /* `cancelRequested` is CLEARED here, not merely left set. It is the flag
+     * every surface reads to decide whether to render "Stopping", it is written
+     * by `cancelSync` and cleared nowhere else, and `DB.syncState.set` MERGES —
+     * so before this, one cancel in a browser session made every later
+     * `SYNC_STATUS` report `cancelling:true` for every subsequent run, forever.
+     * That is the second half of the stuck "Stopping" button: even after the
+     * popup learned the run had ended, the flag it re-read on the next open
+     * said a cancellation was still in progress. */
+    cancelRequested: false,
+    cancelRequestedAt: null,
+    interrupted: true,
+    interruptedAt: Date.now(),
+    interruptedAfterCancel: afterCancel,
+    heartbeatAt: live.heartbeatAt,
+  });
+  try {
+    await DB.syncState.set('feed', healed);
+  } catch (healErr) {
+    log('error', 'sync.eviction_heal_failed', { error: describeError(healErr) });
+    // The row stays `running`, so the next read reconciles it again. Do NOT
+    // broadcast a terminal push for a run we could not record as finished:
+    // telling the surfaces it ended while the cursor still claims otherwise is
+    // the disagreement this whole function exists to prevent.
+    return false;
+  }
+  try {
+    await DB.journal.append({
+      batchId: 'sync',
+      phase: 'interrupted',
+      detail: {
+        stopReason: 'interrupted',
+        afterCancel: healed.interruptedAfterCancel === true,
+        ageMs: verdict.ageMs,
+        ageSource: verdict.ageSource,
+        epochMismatch: verdict.epochMismatch === true,
+        pagesDone: healed.pagesDone || 0,
+        seen: healed.totalSeen || 0,
+        expectedTotal: healed.expectedTotal || 0,
+      },
+    });
+  } catch (journalErr) {
+    log('warn', 'sync.eviction_journal_failed', { error: describeError(journalErr) });
+  }
+
+  await clearSyncRun();
+  log('warn', 'sync.evicted_mid_crawl', {
+    ageMs: verdict.ageMs,
+    ageSource: verdict.ageSource,
+    epochMismatch: verdict.epochMismatch === true,
+    cursorOnly: verdict.cursorOnly === true,
+    afterCancel: healed.interruptedAfterCancel === true,
+    pagesDone: healed.pagesDone || 0,
+    seen: healed.totalSeen || 0,
+    expectedTotal: healed.expectedTotal || 0,
+  });
+
+  /* The terminal push. `orphanedCursorCleared:true` is the flag all three
+   * surfaces already read to mean "the row claimed a run that nobody owned, and
+   * it has been cleared", and `stale:true` is the same fact the read paths
+   * report. No contract rides on it: each surface stops polling and re-reads the
+   * cursor it just healed. */
+  await broadcast({
+    type: 'SYNC_CANCELLED',
+    state: 'interrupted',
+    running: false,
+    cancelRequested: false,
+    orphanedCursorCleared: true,
+    stale: true,
+    interrupted: true,
+    afterCancel: healed.interruptedAfterCancel === true,
+    heartbeatAt: Date.now(),
+  });
+  return true;
+}
+
+/**
+ * Did the run we are about to declare evicted have a cancel the user asked for?
+ *
+ * Read from BOTH records because neither is complete on its own: the run record
+ * is the one written by THIS build, the cursor carries the same flag for the
+ * window where the record write failed or the run predates the record, and
+ * `writeSyncRun` is a read-then-write that a per-page heartbeat can interleave
+ * with — so either source alone can lose the flag and neither may be trusted
+ * alone.
+ *
+ * @param {{cancelRequested:boolean}} verdict
+ * @param {object|null} cursor
+ * @returns {boolean}
+ */
+function cancelRequestedWording(verdict, cursor) {
+  if (verdict && verdict.cancelRequested === true) return true;
+  return !!(cursor && cursor.cancelRequested === true);
+}
+
+/**
+ * The wake-time reconciliation, called once from `bootstrap()`.
+ *
+ * It is deliberately separate from `reconcileStaleCursor`, which heals a row on
+ * READ. That is enough for a surface that polls — the panel polls `SYNC_STATUS`
+ * on every open — and not enough for a surface that LISTENS: the push types are
+ * only ever emitted from memory, so a worker that died before reaching one of
+ * them tells nobody. Running this at wake means the terminal push is emitted
+ * whether or not anybody ever asks again.
+ *
+ * NEVER THROWS, and never blocks the rest of bootstrap: it runs after the
+ * database is open and its failures are logged, because a failed reconciliation
+ * must degrade to "the next read reconciles it" and not to a worker that cannot
+ * start.
+ *
+ * @returns {Promise<{reconciled:boolean, verdict:object|null}>}
+ */
+async function reconcileSyncRunOnBootstrap() {
+  let cursor = null;
+  let run = null;
+  let verdict = null;
+  try {
+    // Read the run record and the cursor CONCURRENTLY, then judge them together.
+    const read = await Promise.all([readSyncRun(), DB.syncState.get('feed', null)]);
+    run = read[0];
+    cursor = read[1];
+    verdict = syncEvictionVerdict(cursor, run);
+    if (!verdict.orphaned) {
+      log('debug', 'sync.wake_no_orphan', {
+        runRecord: run ? 'present' : 'absent',
+        cursorState: cursor ? cursor.state : null,
+        ageSource: verdict.ageSource,
+        hasController: !!syncController,
+      });
+      /* Nothing in flight, so a leftover record that claims otherwise is stale
+       * and is cleared — leaving one behind is how the NEXT wake reconciles a run
+       * that has been over for hours.
+       *
+       * …but NOT when a controller exists. `bootstrap` yields at every `await`
+       * above this point, so a `SYNC_START` can land on this worker while it is
+       * still starting; that crawl's controller and record are both live and both
+       * belong to it. Clearing the record there would strip a running crawl of
+       * the one durable liveness record it has, which is the same defect this
+       * section fixes, reached from the other direction. */
+      if (!syncController && run && (run.running === true || run.cancelRequested === true)) {
+        await clearSyncRun();
+      }
+      return { reconciled: false, verdict };
+    }
+    const reconciled = await reconcileSyncRunOnWake(cursor, run, verdict);
+    return { reconciled, verdict };
+  } catch (wakeErr) {
+    log('error', 'sync.wake_reconcile_failed', { error: describeError(wakeErr) });
+    return { reconciled: false, verdict };
+  }
+}
+
+/**
+ * The library-crawl health line for `GET_DIAGNOSTICS`, in the shape
+ * `MISSING_LIBS` / `MISSING_PARTS` already established: a short list of plain
+ * sentences saying what is wrong, empty when nothing is.
+ *
+ * WHY IT IS NOT A COUNTER OR A LIST OF EVENTS. Those two live in the ring buffer
+ * and in the `sync` journal, and both are answers to "what happened". This is the
+ * answer to "is the crawl in a state a person needs to act on", which is what a
+ * diagnostics panel exists to say, and it has to survive the worker: the
+ * symptom this whole section exists for was an in-memory fact that vanished at
+ * exactly the moment it became interesting. So it is derived from the durable
+ * cursor row every time, and it is a CURRENT-STATE line rather than a history.
+ *
+ * Never throws — a health line that cannot be computed is a health line that says
+ * nothing, and this route must always answer.
+ *
+ * @returns {Promise<string[]>} empty when the crawl needs nothing
+ */
+async function syncHealthLines() {
+  try {
+    const row = await DB.syncState.get('feed', null);
+    if (!row || typeof row !== 'object') return [];
+    const lines = [];
+    if (row.interrupted === true) {
+      lines.push(row.interruptedAfterCancel === true
+        ? 'library/background.js: a Stop was requested and the extension worker was evicted before it could take '
+          + 'effect — the crawl was recorded as interrupted, and the library on disk is INCOMPLETE'
+        : 'library/background.js: the extension worker was evicted mid-crawl — the crawl was recorded as '
+          + 'interrupted, and the library on disk is INCOMPLETE');
+    }
+    if (row.state === 'running') {
+      /* A row claiming `running` that the reconciliation did NOT touch is the one
+       * state that needs a person: either a crawl really is in flight, or the
+       * cursor-only grace window is still open. Either way a diagnostics panel
+       * should be able to say so out loud. */
+      lines.push('library/background.js: the crawl cursor still claims `running`; if no progress is arriving, this '
+        + 'is an orphaned cursor and a Stop press will clear it');
+    }
+    if (row.cancelRequested === true && row.state === 'running') {
+      lines.push('library/background.js: a Stop is still outstanding for the last crawl');
+    }
+    if (row.completed === true && row.truncated === true) {
+      /* Structural, not reachable by this build's writers — `truncated` is derived
+       * as `!completed` in `syncContractView` — and reported rather than ignored
+       * because `docs/ARCHITECTURE.md:655-657` says a disagreement between those
+       * two IS the wrong answer, in whichever direction it points. */
+      lines.push('library/background.js: the last crawl row is self-contradictory (completed with truncated set); '
+        + 'the completeness contract is broken and no verdict from it can be trusted');
+    }
+    return lines;
+  } catch (healthErr) {
+    log('warn', 'sync.health_read_failed', { error: describeError(healthErr) });
+    return [];
+  }
 }
 
 /* -------------------------------------------------------------------------
@@ -9339,8 +10084,33 @@ const ROUTES = {
               lastError: cursor.lastError || null,
               durationMs: cursor.durationMs || null,
               /* Liveness, so a surface can tell "in flight" from "orphaned by a
-               * worker eviction" without recomputing a timestamp itself. */
-              interrupted: live.stale === true,
+               * worker eviction" without recomputing a timestamp itself.
+               * `live.stale` alone was not enough: it is true only inside the
+               * 90-second grace the read paths use, so a page opened straight
+               * after an eviction saw `interrupted:false` and a `state` of
+               * `running` on a row no worker owned. The row's own marker is
+               * written by the §13c reconciliation and stays true afterwards,
+               * so this survives being read before that reconciliation ran. */
+              interrupted: live.stale === true
+                || cursor.interrupted === true
+                /* …and the same rule `SYNC_STATUS` now applies, stated here too:
+                 * a row claiming `running` that THIS worker owns nothing is not a
+                 * running crawl, whatever its heartbeat says. A surface that opens
+                 * in the cursor-only grace window — before the §13c reconciliation
+                 * has run — gets the honest answer immediately instead of a frozen
+                 * "Syncing" for another 90 seconds. */
+                || (!syncController && cursor.state === 'running'),
+              /* The stop intent, published for the same reason — and GATED on the
+               * run still being live. The stored flag outlives the run it belonged
+               * to by design: `cancelSync` writes it, the run's verdict and the
+               * §13c reconciliation clear it, and a row written by a build that
+               * predates the clearing keeps it forever. Publishing it ungated
+               * meant a popup opened after one cancelled crawl in the session
+               * rendered "Stopping" for a crawl nobody had started. The history
+               * is not lost by gating it — the row keeps it, `error` says which
+               * of the two interruptions happened, and `interruptedAfterCancel`
+               * is the machine-readable form of that. */
+              cancelRequested: cursor.cancelRequested === true && cursor.state === 'running',
               heartbeatAt: live.heartbeatAt,
             }
           )
@@ -9397,6 +10167,14 @@ const ROUTES = {
    *   drm:object|null,                SunoDRM.stats()
    *   audioWarnings:string[],         non-fatal Web Audio degradations
    *   missingLibs:string[],           global names that failed to register
+   *   missingParts:string[],          extracted sections that failed to register
+   *                                    (see `MISSING_PARTS`; the load-time sibling
+   *                                    of `missingLibs`)
+   *   syncHealth:string[],            current-state library-crawl problems, in the
+   *                                    same "what is wrong" shape. Durable: read
+   *                                    from the crawl cursor, so it survives the
+   *                                    worker eviction that used to erase the
+   *                                    evidence. Empty when the crawl is fine
    *   rateLimiter:object|null,
    *   mainWorldOps:string[],          the exact ops `RUN_MAIN_WORLD` accepts
    *   feedProbe:object|null,          the last `PROBE_FEED` shape report, so the
@@ -9433,6 +10211,22 @@ const ROUTES = {
       // step answered — no guessing, and no credential in either.
       mainWorldOps: MAIN_WORLD_OP_NAMES,
       lastAuthFailure,
+      /* THE LIBRARY-CRAWL HEALTH LINE, in the same shape as `missingLibs` /
+       * `missingParts`: a short, human-readable list of what is wrong, empty when
+       * nothing is. Those two are LOAD-time failures — a file that did not
+       * register — and this is a RUN-time one, so it is a separate field rather
+       * than an addition to either: an eviction is not a broken install and must
+       * not read as one.
+       *
+       * It is derived from the durable cursor row, not from anything in memory,
+       * which is the whole point: the signal that matters here is precisely the
+       * one that used to die with the worker. `interrupted` is the row marker the
+       * §13c reconciliation writes, so it stays true after the push that
+       * announced it has been heard by nobody.
+       *
+       * NO TOKEN MATERIAL, no clip content — a state name, two counts and a
+       * reason, all of which are already published on `GET_BOOT.sync`. */
+      syncHealth: await syncHealthLines(),
     }),
   },
 
@@ -9513,10 +10307,33 @@ const ROUTES = {
        * still claims a run, the controller is gone. Reconciling here means the
        * very next poll — and the panel polls on every open — turns the frozen
        * "Syncing" into an honest "interrupted", without waiting for the user to
-       * press anything. */
+       * press anything.
+       *
+       * The wake-time reconciliation in §13c normally gets there first and emits
+       * the terminal push; this is the second line of defence for the cases it
+       * cannot judge yet (a cursor-only orphan inside the 90-second grace) and
+       * for a surface that polls while no wake ever happens. */
       const live = syncLiveness(stored);
       const cursor = live.stale ? await reconcileStaleCursor(stored, live) : stored;
-      const runningNow = !!syncController || (live.live && !live.stale);
+      /* `running` IS THE CONTROLLER, AND NOTHING ELSE. The old expression ORed in
+       * `live.live` — "the stored heartbeat is younger than 90 seconds" — and that
+       * is precisely the lie this bug was made of: a heartbeat written by a
+       * worker that has since been evicted stays fresh for ninety seconds, so
+       * every poll in that window was told a crawl was in flight when nothing
+       * could cancel it and no page would ever commit. There is exactly one
+       * worker at a time, so "no controller" cannot mean "a different worker
+       * owns this", and the row's own state is the honest answer either way.
+       * This is the fix for the popup that stayed on an indeterminate
+       * "Stopping" slider with a live Stop button. */
+      const runningNow = !!syncController;
+      /* A cancellation is only a cancellation while something is still running
+       * to be cancelled. The stored flag outlives the run it belonged to by
+       * design — it is written on the press and cleared at the run's verdict and
+       * at the wake-time reconciliation — so gating on `runningNow` is belt and
+       * braces rather than a substitute for clearing it, and it means a stale
+       * row cannot put a surface into "Stopping" on its own. */
+      const cancellingNow = runningNow
+        && (syncCancelRequested === true || (cursor && cursor.cancelRequested === true));
       /* `nextPage` and `pass` are STRIPPED from the row on the way out by
        * `cursorForWire`: they are page-era fields this crawl never writes
        * (`freshCursor` nulls them only so `syncState.set`'s merge cannot resurrect
@@ -9537,33 +10354,40 @@ const ROUTES = {
            running: runningNow,
            interrupted: false,
            heartbeatAt: 0,
-           cancelRequested: syncCancelRequested === true,
-           cancelling: syncCancelRequested === true,
+           cancelRequested: cancellingNow,
+           cancelling: cancellingNow,
            cursor: null,
           completed: null,
-          truncated: null,
-          stopReason: null,
-          error: null,
-          expectedTotal: null,
-          totalSeen: null,
-          uniqueSeen: null,
-          examined: null,
-          missing: null,
-          oracleApplied: null,
-          advisory: null,
-          workspaces: [],
-          state: null,
-          pagesDone: 0,
-          total: await DB.clips.count(),
-        };
+           truncated: null,
+           stopReason: null,
+           error: null,
+           expectedTotal: null,
+           totalSeen: null,
+           uniqueSeen: null,
+           examined: null,
+           missing: null,
+           oracleApplied: null,
+           advisory: null,
+           workspaces: [],
+           state: null,
+           pagesDone: 0,
+           total: await DB.clips.count(),
+         };
       }
       return {
         ok: true,
         running: runningNow,
-        interrupted: live.stale === true,
+        interrupted: live.stale === true
+          || (cursor && cursor.interrupted === true)
+          /* Same rule as `running`, which is the controller and nothing else: a
+           * row claiming `running` that this worker owns nothing is orphaned, and
+           * saying so immediately is what un-sticks the poll loop. The 90-second
+           * grace below is the read-path fallback for a row the wake-time
+           * reconciliation has not reached yet. */
+          || (!syncController && cursor.state === 'running'),
         heartbeatAt: live.heartbeatAt,
-        cancelRequested: syncCancelRequested === true || (cursor && cursor.cancelRequested === true),
-        cancelling: syncCancelRequested === true || (cursor && cursor.cancelRequested === true),
+        cancelRequested: cancellingNow,
+        cancelling: cancellingNow,
         /* The whole cursor goes back, so `completed` / `truncated` / `stopReason` /
          * `error` / `expectedTotal` / `missing` / `advisory` / `workspaces` are
          * present one level down exactly as `GET_BOOT.sync` presents them flat —
@@ -10219,6 +11043,24 @@ async function bootstrap() {
   await restoreActiveDownloads();
   await reconcileDownloadsOnStartup();
 
+  /* THE AUTH CACHE, REFILLED BEFORE ANYTHING ASKS FOR A TOKEN (§5). Every
+   * module-scope binding died with the previous worker, `authCache` among them,
+   * and the first request of this one would otherwise run the whole MAIN-world
+   * mint sweep — a scripting injection per Suno tab and up to 12 s of waiting —
+   * for a token that has been sitting in `chrome.storage.session` the whole time.
+   * It is a cache refill, not a credential fetch: nothing is persisted here, and
+   * a missing or stale record is logged and left for `getAuthToken` to handle.
+   *
+   * Placed BEFORE the database work deliberately. The database calls are where a
+   * wake spends its time, and the whole point is that the first API request of
+   * this worker does not have to wait for all of it. */
+  try {
+    const warm = await warmAuthCacheOnWake();
+    log('debug', 'bootstrap.auth_cache', { warmed: warm.warmed, expiresAt: warm.expiresAt });
+  } catch (authWarmErr) {
+    log('warn', 'bootstrap.auth_cache_failed', { error: describeError(authWarmErr) });
+  }
+
   // Resume an interrupted batch rather than losing it to an eviction.
   try {
     const batchId = await DB.meta.get(META_KEYS.ACTIVE_BATCH, null);
@@ -10242,24 +11084,75 @@ async function bootstrap() {
     log('error', 'bootstrap.resume_failed', { error: describeError(resumeErr) });
   }
 
-  // A crawl that was interrupted mid-page resumes on wake too.
+  /* THE EVICTION RECONCILIATION (§13c), AND IT REPLACES THE LOG-ONLY BLOCK THAT
+   * USED TO BE HERE.
+   *
+   * That block logged `sync.interrupted_state_noted` and stopped, which was
+   * enough for a DIAGNOSIS and nothing else: every terminal push in the sync
+   * section is emitted from memory, so a worker that died before reaching one
+   * told no surface anything, and the page overlay plus the popup stayed on a
+   * live progress bar with a Stop button until somebody polled. This now heals
+   * the row and emits the terminal push at wake, so a surface that only listens
+   * un-sticks without anyone asking.
+   *
+   * Ordered AFTER the batch resume on purpose. Both reconcile "the previous
+   * worker left something running", and if `reconcileDownloadsOnStartup` or the
+   * batch resume is slow this runs late rather than never — while running it
+   * BEFORE the batch resume would have it racing `runBatch` for the database and
+   * broadcasting a terminal sync push while a download was starting.
+   *
+   * Never throws: `reconcileSyncRunOnBootstrap` catches and logs its own
+   * failures, because a failed reconciliation has to degrade to "the next read
+   * reconciles it" and not to a worker that cannot finish starting. */
+  try {
+    const wake = await reconcileSyncRunOnBootstrap();
+    log('info', 'bootstrap.sync_wake', {
+      reconciled: wake.reconciled,
+      orphaned: wake.verdict ? wake.verdict.orphaned === true : false,
+      ageSource: wake.verdict ? wake.verdict.ageSource : null,
+      epochMismatch: wake.verdict ? wake.verdict.epochMismatch === true : false,
+      cursorOnly: wake.verdict ? wake.verdict.cursorOnly === true : false,
+      afterCancel: wake.verdict ? wake.verdict.cancelRequested === true : false,
+    });
+  } catch (wakeErr) {
+    log('error', 'bootstrap.sync_wake_failed', { error: describeError(wakeErr) });
+  }
+
+  /* Whatever the reconciliation did not consume, this is the record of what the
+   * previous worker left, for the diagnostics route and for the log line below.
+   * Read AFTER the reconciliation on purpose: it is the post-reconciliation
+   * cursor, so `interrupted` here means what it says.
+   *
+   * STILL DELIBERATELY NOT AUTO-RESUMED, exactly as before: a crawl can be
+   * hundreds of requests and silently restarting one on every worker wake would
+   * hammer the API. `SYNC_START` with `force:false` picks up from the stored
+   * cursor, at workspace granularity. What this block does instead of nothing is
+   * stop the surfaces believing the run is still in flight. */
+  let syncWakeState = null;
   try {
     const cursor = await DB.syncState.get('feed', null);
-    if (cursor && cursor.state === 'running') {
+    if (cursor) {
       /* `nextPage` is gone: `/api/feed/v3` pages by cursor, so what an evicted
        * worker leaves behind is a PROJECT PLAN plus the list of workspaces it
        * finished, not a page ordinal. */
-      log('info', 'sync.interrupted_state_noted', {
+      log('info', 'sync.wake_state', {
+        state: cursor.state || null,
+        interrupted: cursor.interrupted === true,
         projects: Array.isArray(cursor.projectIds) ? cursor.projectIds.length : 0,
         projectsDone: Array.isArray(cursor.projectsDone) ? cursor.projectsDone.length : 0,
         nextProjectIndex: cursor.nextProjectIndex || 0,
         pagesDone: cursor.pagesDone || 0,
         expectedTotal: cursor.expectedTotal || 0,
       });
-      // Deliberately NOT auto-resumed: a crawl can be hundreds of requests and
-      // silently restarting one on every worker wake would hammer the API.
-      // SYNC_START with force:false picks up from the stored cursor, at
-      // workspace granularity.
+      syncWakeState = {
+        state: typeof cursor.state === 'string' ? cursor.state : null,
+        interrupted: cursor.interrupted === true,
+        interruptedAfterCancel: cursor.interruptedAfterCancel === true,
+        pagesDone: Number.isFinite(cursor.pagesDone) ? cursor.pagesDone : 0,
+        totalSeen: Number.isFinite(cursor.totalSeen) ? cursor.totalSeen : 0,
+        expectedTotal: Number.isFinite(cursor.expectedTotal) ? cursor.expectedTotal : 0,
+        stopReason: typeof cursor.stopReason === 'string' ? cursor.stopReason : null,
+      };
     }
   } catch (cursorErr) {
     log('warn', 'bootstrap.cursor_read_failed', { error: describeError(cursorErr) });
@@ -10270,6 +11163,7 @@ async function bootstrap() {
     missingParts: MISSING_PARTS,
     filter: FILTER_AVAILABLE,
     tagger: TAGGER_AVAILABLE,
+    syncWake: syncWakeState,
   });
 }
 
