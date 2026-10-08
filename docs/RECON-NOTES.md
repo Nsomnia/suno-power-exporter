@@ -16,31 +16,47 @@ owns one custom model (`../suno-recon/reports/FINDINGS.md:3-6`).
 
 ## ✅ Built on — verified live
 
-### The 23 verified routes
+### The 24 verified routes
 
-`SunoAPI.ENDPOINTS`, `lib/api.js:909-940`. **23 entries**, asserted at construction
-time (`lib/api.js:1034-1046`): every entry must be an absolute `/api/...` path and
-must survive the forbidden-fragment guard, or the client refuses to construct.
+`SunoAPI.ENDPOINTS`, `lib/api.js:1084-1122`. **24 entries**, asserted at
+construction time (`lib/api.js:1212`, `_assertEndpoints` at `:1223-1235`): every
+entry must be an absolute `/api/...` path and must survive the forbidden-fragment
+guard, or the client refuses to construct.
 
-Three grades, per `lib/api.js:902-909`:
+Four grades, per `lib/api.js:1074-1083`:
 
 > `CONFIRMED LIVE` = 200 with a known body · `CONFIRMED REFUSAL` = live, answers
 > 200 with `{ok,reason,message}` · `CONFIRMED REGISTERED` = 401/405/422 proves the
-> route exists; **body unknown**
+> route exists; **body unknown** · `CONFIRMED IN CLIENT` = the shipped web client's
+> own OpenAPI caller names it — **route and envelope known from source, no
+> authenticated capture**
 
-#### CONFIRMED LIVE (200 + known body) — 9
+#### CONFIRMED LIVE (200 + known body) — 8
 
 | route | returns |
 |---|---|
-| `GET /api/feed/v2` | `{"clips":[...]}` — **page size UNKNOWN** |
 | `GET /api/project/me` | `{num_total_results, current_page, projects:[...]}` |
-| `GET /api/project/feed` | `{items:[{type, added_at_ms, clip}]}` |
+| `GET /api/project/feed` | `{items:[{type, added_at_ms, clip}], next_cursor}` |
 | `GET /api/playlist/me` | `{num_total_results, current_page, playlists:[...]}` |
 | `GET /api/profiles/pinned-clips` | `{pinned_clips:[...]}` |
 | `GET /api/persona/get-personas/` | `{personas:[...]}` |
 | `GET /api/persona/get-loved-personas/` | — |
 | `GET /api/persona/get-followed-personas/` | — |
 | `GET /api/billing/info/` | **entitlement ground truth** |
+
+#### CONFIRMED IN CLIENT (bundle chunk, no authenticated capture) — 3
+
+| route | returns | evidence |
+|---|---|---|
+| `POST /api/feed/v3` | `{clips:[...], next_cursor}` — **the only route this client enumerates a library with** | `suno-recon/out/chunks/1r1sqgyc3uj2o.js:5`; `POST("/api/feed/v3",{body:{cursor,limit,filters}})` returning `{clips, nextCursor}` |
+| `POST /api/feed/v3/offset` | the **offset** sibling: `POST {offset, filters}` | same chunk; the web client calls it from the same file |
+| `GET /api/clips/get_songs_by_ids` | **`{clips:[…]}` — confirmed, not unknown.** `ids` is required (422 without it) and the shipped client guards on `Array.isArray(t.data?.clips)` | `suno-recon/out/chunks/0zj00x725960e.js:3` |
+
+> ⚠️ **None of these three has an authenticated capture.** The recon captured the
+> route but never a 200 from it. `limit`'s maximum, the accepted filter keys and
+> v3's `num_total_results` semantics all rest on the bundle plus two working
+> third-party extensions — **evidence-backed, not live-verified.** See
+> [`KNOWN-LIMITS.md`](KNOWN-LIMITS.md).
 
 #### CONFIRMED LIVE, known refusal contract — 2
 
@@ -49,12 +65,11 @@ Three grades, per `lib/api.js:902-909`:
 | `GET /api/studio/clip/{id}/download` | answers **200 with `{ok:false, reason:'no_permission'}`** |
 | `GET /api/download/clip/{id}` | same |
 
-#### CONFIRMED REGISTERED — bodies NOT confirmed — 12
+#### CONFIRMED REGISTERED — bodies NOT confirmed — 11
 
 | route | how existence is proven |
 |---|---|
 | `GET /api/profiles/me` | 422 — **both** sort params required |
-| `GET /api/clips/get_songs_by_ids` | 422 — `ids` required; envelope unknown |
 | `GET /api/clips/parent` | 422 — `clip_id` required |
 | `GET /api/clips/aligned_clip_siblings` | 422 — `clip_id` required |
 | `GET /api/gen/{id}/waveform-aggregates` | 401 unauthenticated |
@@ -66,24 +81,37 @@ Three grades, per `lib/api.js:902-909`:
 | `GET /api/gen/{id}/wav_file/` | signed S3 URL, observed TTL 3599 s |
 | `POST /api/mango/rights` | 422 — **nesting UNCONFIRMED; do not trust 422 `loc`** |
 
-> **A 401/405/422 is proof of existence, not of shape.** Every one of these twelve
+> **A 401/405/422 is proof of existence, not of shape.** Every one of these eleven
 > carries an explicit "bodies and envelopes are NOT confirmed" warning in the table
-> itself (`lib/api.js:926-928`). Nothing above is documented as a schema.
+> itself (`lib/api.js:1108-1110`). Nothing above is documented as a schema.
 
 ### Behaviour constants that are verified, not guessed
 
-`SunoAPI.LIMITS`, `lib/api.js:943-951`:
+`SunoAPI.LIMITS`, `lib/api.js:1125-1135`:
 
 | constant | value | why it matters |
 |---|---|---|
 | `zipChunkSize` | **200** | confirmed server max for `clip_ids` |
 | `idsChunkSize` | **100** | conservative max for `?ids=` |
+| `feedPageLimit` | **100** | **the confirmed server maximum for `/api/feed/v3`'s `limit`** — larger values are rejected |
+| `feedPageRetries` | **5** | a library walk only; the global default stays at 3 |
+| `projectFeedLimit` | **30** | the shipped client's own page size for `/api/project/feed` |
+| `defaultMaxPages` | **500** | 500 pages × 100 = 50,000 clips |
 | `ratePerSecond` | **4** | the production pace |
 | `concurrency` | **3** | global in-flight cap |
-| `stallPageLimit` | **2** | two empty pages ends a crawl |
 | `bulkUnavailableMarker` | `Bulk download is not available` | verbatim refusal string |
 
-`SIGNED_URL_TTL_SECONDS = 3599` (`lib/api.js:969`) — observed, not documented.
+> ⚠️ **`stallPageLimit` is GONE, and that is the point.** It used to be `2` — *"two
+> empty pages ends a crawl"* — which is how a feed that hiccuped twice was read as
+> the end of a library. A single empty page that still carries a cursor is now an
+> **error** (`stopReason: 'empty_page'`), not a stopping condition.
+
+`SIGNED_URL_TTL_SECONDS = 3599` (`lib/api.js:1153`) — observed, not documented.
+
+`FEED_PAGE_BYTES_HINT = 140_000` (`lib/api.js:1161-1167`) was measured on the
+**removed** `/api/feed/v2` route and is a **per-request constant for progress
+estimation only** — a v3 page of 100 clips is roughly five times it, and no
+correctness decision may depend on it.
 
 ### Verified clip fields
 
@@ -96,7 +124,7 @@ Every field the filter engine reads is recon-verified. The full mapping lives in
 | real audio is `media_urls[].url`, a CloudFront object with `content_type: "m4a-opus"` | `lib/drm.js:15-16` |
 | liking is per-clip `is_liked` | `lib/suno.js:897-899` |
 | `major_model_version` is **frequently the empty string** | `lib/suno.js:44-48`, `:893` |
-| **no project field on a clip** — membership is joined from `/api/project/feed` | `background/background.js:4443` |
+| **no project field on a clip** — membership is joined from `/api/project/feed` | `background/background.js:5581-5583` |
 | the `action_config.actions` entitlement enum | `lib/suno.js:71-77` |
 | model keys: v6=`chirp-hawk`, v6-wild=`chirp-hawk-wild`, v6-mini=`chirp-goose`, remaster=`chirp-halibut` | `../suno-recon/reports/LIVE-2026-09-30.md:74-75`, `../suno-recon/reports/THIRD-PARTY-2026-09-30.md:140-141` |
 
@@ -162,16 +190,16 @@ const FORBIDDEN_HOST_FRAGMENTS = Object.freeze([
   'staging', '-beta', '-dev', '-preview', '-canary'
 ]);
 ```
-— `lib/api.js:81-87`
+— `lib/api.js:97-103`
 
-`_assertBaseUrls` (`lib/api.js:1054-1073`) throws `forbidden_base_url` at
+`_assertBaseUrls` (`lib/api.js:1243`) throws `forbidden_base_url` at
 **construction time** on any host containing one of those substrings. It cannot be
 configured away: `baseUrls` is validated before any request can be built. The other
 `tiers don't even resolve (`../suno-recon/reports/FINDINGS.md:210-211`).
 
 ### 3. `/api/playlist/liked/` — **does not exist**
 
-**Status:** fiction. `lib/api.js:76-80` builds the fragment from concatenated parts
+**Status:** fiction. `lib/api.js:90-94` builds the fragment from concatenated parts
 so the guard cannot reintroduce the literal:
 
 ```js
@@ -184,7 +212,7 @@ const FORBIDDEN_ROUTE_FRAGMENTS = Object.freeze([
 
 **Why not built on:** there is no liked-songs route at all. The old build paged it
 and **silently got nothing** — which is why "liked only" never worked.
-`lib/api.js:11-12`:
+`lib/api.js:12-13`:
 
 > there is NO liked-songs route at all. Liking is per-clip state carried on each
 > clip object (`is_liked`). It is derived locally by filtering the feed.
@@ -192,15 +220,40 @@ and **silently got nothing** — which is why "liked only" never worked.
 The old filter also read `upvote_count` as a proxy for a like, which is why
 "liked only" matched 100% of the library. Two bugs, one symptom.
 
-### 4. `suno.com/api/*` — the web origin does not proxy `/api/*`
+### 4. 🚨 `GET /api/feed/v2` — **it answers, and it is still wrong. Do not enumerate through it.**
+
+**Status:** live, but **not a Suno web-app route.** It was previously listed in
+this document's *verified* table with an honest *"page size UNKNOWN"* note. That
+was wrong in the way that matters: an unknown page size on the right route is an
+open question, and this is the wrong route entirely. It is recorded here now as a
+**do-not-build-on** item, because three independent lines of evidence agree and
+because a 200 is not proof of a route.
+
+| # | evidence | what it shows |
+|---|---|---|
+| 1 | **0 of 96** minified bundle chunks contain the string `api/feed/v2`. The shipped client's own feed caller POSTs `/api/feed/v3` with `{cursor, limit, filters}` and follows `next_cursor` (`suno-recon/out/chunks/1r1sqgyc3uj2o.js:5`) | Suno's web app never calls it |
+| 2 | **0 occurrences** in `scratchpad/captured_endpoints.txt`. The only feed route in the entire capture log is `POST /api/feed/v3` (`scratchpad/captured_endpoints.txt:27`) | it was never captured being used |
+| 3 | **one authenticated run, same session, same account:** v2 page 0 returned `num_total_results: 21` and **20 clips**, while `/api/project/me` reported `default` alone holding **3,444** clips (and `num_total_results: 55` *projects*) — `suno-recon/out/authed/_api_feed_v2_hide_disliked_true_page_0.json` vs `_api_project_me.json` | its own total is off by two orders of magnitude |
+
+**Its page size is a fixed 20** — observed directly in capture 3, and that is
+precisely why a 5,500-clip library came back as **20 pages / 400 clips**, which is
+arithmetically indistinguishable from a finished crawl.
+
+**Why not built on:** a build that enumerated through it indexed 400 clips of
+~5,500 and **reported success**. The route is removed from `SunoAPI.ENDPOINTS`
+outright (`lib/api.js:14-22`) rather than "kept as a fallback", because a fiction
+you keep as a fallback is a fiction you will eventually request. Library
+enumeration is `POST /api/feed/v3`.
+
+### 5. `suno.com/api/*` — the web origin does not proxy `/api/*`
 
 **Status:** every such call 404s. `suno.com` is the Next.js web origin
-(`lib/api.js:17-18`); the two verified hosts are `studio-api-prod.suno.com` and
-`studio-api.prod.suno.com` (`lib/api.js:55-58`).
+(`lib/api.js:26-27`); the two verified hosts are `studio-api-prod.suno.com` and
+`studio-api.prod.suno.com` (`lib/api.js:70-73`).
 
 **Enforced by:** the `suno.com/api` forbidden fragment above, plus `_assertEndpoints`
 running `assertRouteAllowed` over the whole table at construction
-(`lib/api.js:1043`).
+(`lib/api.js:1212`, `:1223-1235`).
 
 > ⚠️ **A trap in the recon methodology, worth repeating.** Vercel sets
 > `x-matched-path: /` with a **200** on a large number of *nonexistent* paths,
@@ -212,7 +265,7 @@ running `assertRouteAllowed` over the whole table at construction
 > That single correction accounts for 192 of the 550 probed paths
 > (`../suno-recon/reports/LIVE-2026-09-30.md:582`).
 
-### 5. 422 `loc` chains — **fabricated**
+### 6. 422 `loc` chains — **fabricated**
 
 **Status:** the validation error path is not the accepted path.
 
@@ -230,7 +283,7 @@ at runtime so it can be pinned down later.
 Bonus finding worth knowing: `detail` is a **string containing a Python
 `repr()`**, not a JSON array (`../suno-recon/reports/LIVE-2026-09-30.md:405-407`). No RFC 9457.
 
-### 6. `/api/session/` as the model catalogue — it is stale
+### 7. `/api/session/` as the model catalogue — it is stale
 
 **Status:** the web branch serves a **stale list**. `/api/session/`'s model
 catalogue is *client-identity-keyed*; under an Android identity it returns
@@ -243,7 +296,7 @@ v6 / v6-wild / v6-mini / v5.5, while the web branch still advertises v4.5 as new
 > **trust `/api/billing/info/` for the real model catalogue, not
 > `/api/session/`**
 
-`lib/api.js:919` labels it exactly that: `billingInfo: '/api/billing/info/',
+`lib/api.js:1093` labels it exactly that: `billingInfo: '/api/billing/info/',
 // entitlement ground truth`.
 
 > **And this is NOT an entitlement bypass — do not report it as one.** The account
@@ -251,14 +304,14 @@ v6 / v6-wild / v6-mini / v5.5, while the web branch still advertises v4.5 as new
 > `can_use: true` (`../suno-recon/reports/FINDINGS.md:98-100`). What the header reveals is only
 > that the web branch is stale.
 
-### 7. The Studio-download-not-counted bypass — **closed**
+### 8. The Studio-download-not-counted bypass — **closed**
 
 **Status:** a third party documented Path D serving **42 WAVs without moving the
 counter** on 2026-09-04 (`../suno-recon/reports/THIRD-PARTY-2026-09-30.md:126-128`). Suno closed
 it by 2026-09-09; counting is now server-authoritative
 (`../suno-recon/reports/THIRD-PARTY-2026-09-30.md:126-128`; `../suno-recon/reports/FINDINGS.md:357-361`).
 
-**Why not built on:** it is a **closed bug**. `background/background.js:324-327` says so in the
+**Why not built on:** it is a **closed bug**. `background/background.js:405-407` says so in the
 ladder definition:
 
 > The old exploit — "the Studio route does not count toward quota" — was closed
@@ -269,14 +322,29 @@ ladder definition:
 plan whose other paths meter — is a **policy question for Suno**, not an exploit
 (`../suno-recon/reports/FINDINGS.md:357-361`).
 
-### 8. `event.source` in the page token relay — a closed gap
+### 9. The page token relay — the gap AND the mechanism are both gone
 
 **Status:** the old page relay validated `event.origin` but **not**
 `event.source`, so **any same-origin script** could post a token-shaped message and
 overwrite the extension's credential **profile-wide**.
 
-**How it is closed now** (`content/content.js:2966-2980`), with the reason in the
-comment:
+> ⚠️ **Superseded in 6.1.1 — do not re-add this from memory.** The gap was closed in
+> 6.0.1 by validating `origin` *and* `source`. **In 6.1.1 the whole relay was
+> deleted instead**, because it could never have worked: reading `window.Clerk` from
+> a content script required an inline `<script>`, which suno.com's CSP refuses to
+> execute, and the handler on the other end of the message could not have been fed.
+> MAIN-world access moved into the worker
+> (`chrome.scripting.executeScript({world:'MAIN'})`) behind a six-key allowlist, and
+> the token now comes from a passive `Authorization`-header tap plus a Clerk read
+> that polls **inside** the page. **There is no page-side relay, no
+> `SUNO_TOKEN_REQUEST` message and no `window.addEventListener('message', …)`
+> credential handler in this build.** See
+> [`ARCHITECTURE.md` § MAIN-world access](ARCHITECTURE.md) and
+> [`KNOWN-LIMITS.md` § 22](KNOWN-LIMITS.md). The reason is recorded in place at
+> `background/background.js:1494-1505` and `content/content.js:3212-3217`.
+
+The code that used to close it, kept here as the shape of the check rather than as a
+claim that it still exists:
 
 ```js
 // BOTH checks are required: origin alone would let any same-origin script
@@ -287,12 +355,14 @@ if (event.origin !== location.origin) return;
 if (d.source !== 'suno-master-dock' || d.kind !== 'token') return;
 ```
 
-Plus a shape check: the token must match `TOKEN_RE` or it is rejected as malformed
-(`content/content.js:2973-2978`).
+Plus a shape check: the token had to match `TOKEN_RE` or it was rejected as
+malformed. **None of that code remains**; the equivalent protection now is that no
+credential is ever accepted from the page at all — only from the worker, which
+reads it in the MAIN world itself and stores it in `chrome.storage.session`.
 
-### 9. The 84 experimental route names as a fallback list
+### 10. The 84 experimental route names as a fallback list
 
-**Status:** 168 requests, all 404 (`lib/api.js:13-16`):
+**Status:** 168 requests, all 404 (`lib/api.js:23-25`):
 
 > none of the 84 experimental route names probed (168 requests, both methods,
 > anonymous and authenticated) are deployed: all 404. Those names survive only in
@@ -301,7 +371,7 @@ Plus a shape check: the token must match `TOKEN_RE` or it is rejected as malform
 **Why:** a fiction you keep as a "fallback" is a fiction you will eventually
 successfully request. They are removed outright, not kept as alternates.
 
-### 10. Reseller-only routes
+### 11. Reseller-only routes
 
 **Status:** `/api/generate/sounds/`, `/api/sounds/`, `/api/generate/loop/`,
 `/api/loop/`, `/api/jingle/`, `/api/recovery-audio/`, `/api/generate/recovery-audio/`,
@@ -323,17 +393,17 @@ answer and the code cannot guess.
 ### The `format` enum is undocumented
 
 The download routes take `?format=`. **No source enumerates the accepted members.**
-`background/background.js:456-459` is the honest position:
+`background/background.js:537-539` is the honest position:
 
 > The value is passed straight through as the download route's `?format=`
 > parameter, whose enum members are undocumented — `lib/api.js` tallies every value
 > tried so the real members can be learned from telemetry.
 
-`VARIANTS` (`background/background.js:460`) lists **three**: `m4a`, `wav-48k`, `wav`.
+`VARIANTS` (`background/background.js:541`) lists **three**: `m4a`, `wav-48k`, `wav`.
 Seven values that used to be there — `mp3`, `mp3-256`, `mp3-320`, `flac`, `ogg`,
 `aac`, `opus` — were **removed** in 6.0.1 and have stayed off the list since. Two
 different reasons, and conflating them is the usual misreading
-(`background/background.js:421-459`):
+(`background/background.js:512-541`):
 
 - **`mp3` and `ogg` stay off because `variant` is the ROUTE's `?format=`, not a
   local conversion.** Both encoders are vendored and both work — as
@@ -347,7 +417,7 @@ different reasons, and conflating them is the usual misreading
 `lrc` / `cover` / `json` left the list for a third reason: they are sidecars,
 not containers.
 
-`lib/api.js:1020` keeps `_formatTally` for exactly this. **Only `m4a` is
+`lib/api.js:1209` keeps `_formatTally` for exactly this. **Only `m4a` is
 guaranteed**, because the free rungs deliver the source stream verbatim; `wav` and
 `wav-48k` are honest regardless, because they are rendered locally from whatever
 bytes arrived rather than asked for.
@@ -356,7 +426,7 @@ bytes arrived rather than asked for.
 
 `POST /api/download/clips/zip/prepare` is confirmed to exist, POST-only, flat body,
 `clip_ids` required, ≤200 per chunk. **What it returns on success has never been
-observed.** `background/background.js:2870-2874` refuses a job-shaped response rather than polling:
+observed.** `background/background.js:4196-4200` refuses a job-shaped response rather than polling:
 
 > the route returned a job id rather than a URL; job polling is not implemented
 
@@ -370,7 +440,7 @@ not a static free-tier grant — it tracks real remaining overflow, because the 
 accounts' values differ for a reason nobody has established.
 
 The extension surfaces it as `quota.additionalRemaining` and folds it into
-`effectiveRemaining` (`lib/api.js:2609`), so a batch will spend it. **It is a
+`effectiveRemaining` (`lib/api.js:3164-3172`), so a batch will spend it. **It is a
 question for the team, not something to burn 60 downloads finding out.**
 
 ### "My Taste" is real and has no backing route
@@ -416,17 +486,52 @@ telemetry pins it down, hard-code it.
 So `resolveUserKey` returns an ordered `attempts` array and the caller retries
 without a second network round trip.
 
-### The feed page size
+### ✅ The feed page size — CLOSED, and it was two different questions
 
-`lib/api.js:911` annotates it `// page size UNKNOWN` and nothing in the recon
-resolves it. Consequences in KNOWN-LIMITS, section 4.
+This question used to read *"`lib/api.js` annotates it `// page size UNKNOWN` and
+nothing in the recon resolves it."* That was true of **v2**, and v2 is no longer
+used. Both numbers are now settled:
+
+| route | page size | how it is settled |
+|---|---|---|
+| `GET /api/feed/v2` | **20, fixed** | **observed**: the authenticated capture holds exactly 20 clips on page 0 (`suno-recon/out/authed/_api_feed_v2_hide_disliked_true_page_0.json`). There is no query parameter that changes it |
+| `POST /api/feed/v3` | **`limit` in the body, maximum 100** | the bundle sends `limit` as a **body** field, and the working third-party extension records the cap as measured: `const BULK_LIBRARY_PAGE_SIZE = 100; // /api/feed/v3 rejects limit > 100 (verified 2026-09)` (`scratchpad/extracted/BetterSuno/background.js:43`). The client encodes `FEED_LIMIT_MAX = 100` and clamps (`lib/api.js:149-153`, `:2267-2270`) |
+
+> **Stated precisely, because the honesty bar here is high:** v3's `limit: 100`
+> cap is **evidence-backed from the shipped bundle plus a third-party
+> extension's own verification note — not live-verified by this project.** No
+> authenticated capture of `POST /api/feed/v3` exists in the recon. That does not
+> make it a guess: a too-large `limit` is rejected, not silently truncated, so
+> asking for 100 is the *safe* direction. The consequences are in
+> [`KNOWN-LIMITS.md`](KNOWN-LIMITS.md).
+
+### ❓ UNRESOLVED: `filters.user`'s id field is camelCase in one source and snake_case in another
+
+Recorded because **nobody should have to rediscover it by guessing.**
+
+| source | what it sends |
+|---|---|
+| **Suno's shipped web client** | `user: { presence: BooleanFilter.True, userId: <id> }` — **camelCase `userId`** (`suno-recon/out/chunks/1r1sqgyc3uj2o.js:5`, `getLibraryDefaultClipBrowserFilters` / `getPlaylistDefaultClipBrowserFilters`; also `2omiamzhiv6r5.js`) |
+| **BetterSuno** (a working third-party extension) | `filters.user = { presence: "True", user_id: userId }` — **snake_case `user_id`** (`scratchpad/extracted/BetterSuno/background.js:2483-2488`) |
+
+**Both are "in use" somewhere and neither can be right for the same server.** What
+makes this *unresolved* rather than *decided* is that **no authenticated capture
+of either shape exists in the recon**, and the bundle's own sibling filter uses
+camelCase (`workspace: { presence, workspaceId }`) which is weak corroboration for
+camelCase and nothing more.
+
+**This extension sends no `user` filter at all**, so the conflict cannot bite it
+today (`lib/api.js:2300-2308`). It is recorded because anyone adding a
+"one user's public clips" filter is about to pick one of these two spellings with
+no evidence to pick it by.
 
 ### The free-tier download figure
 
 Policy says 7 lifetime (`../suno-recon/reports/FINDINGS.md:340`); the extension writes "free 0"
-(`background/background.js:321`); the code encodes **`null`, verified: false**
-(`lib/api.js:960`). **None of these is verified** because the recon account was
-Premier. The code is right to refuse to substitute a number.
+(`background/background.js:402`, and again at `:4941`); the code encodes
+**`null`, verified: false** (`lib/api.js:1144`). **None of these is verified**
+because the recon account was Premier. The code is right to refuse to substitute a
+number.
 
 ---
 
@@ -469,16 +574,16 @@ production** (`../suno-recon/README.md:74`).
 | rule | where |
 |---|---|
 | Zero empty catch blocks; every failure logged with diagnosable context | `background/background.js:52-54` |
-| No token or key material logged, ever | `background/background.js:733`, `lib/api.js:166-172` |
+| No token or key material logged, ever | `background/background.js:814`, `lib/api.js:221-244` |
 | No token or key material outside `chrome.storage.session` | `background/background.js:50-51` |
-| Sender validation on **every** route: `id` **and** `url` | `background/background.js:1789-1798` |
-| Offscreen replies verified against the full sender envelope before they can settle a waiter | `background/background.js:2028-2045` |
-| Page relay validates origin **and** source | `content/content.js:2966-2980` |
-| Host denylist enforced at construction, not at request time | `lib/api.js:1054-1073` |
-| Route table validated at construction; unknown routes refused | `lib/api.js:1034-1046` |
+| Sender validation on **every** route: `id` **and** `url` | `background/background.js:2927-2937` |
+| Offscreen replies verified against the full sender envelope before they can settle a waiter | `background/background.js:3166-3183` |
+| MAIN-world replies verified on **both** sides — no code string, no token in a non-`token` field | `background/background.js:2028-2048`, `content/content.js:3219-3245` |
+| Host denylist enforced at construction, not at request time | `lib/api.js:1243` |
+| Route table validated at construction; unknown routes refused | `lib/api.js:1212`, `:1223-1235` |
 | Unwrapped content keys in an in-memory LRU **only** — never storage, never disk | `lib/drm.js:53-61` |
-| `EXPORT_SETTINGS` omits token, key material and diagnostics | `background/background.js:5604-5631` |
-| Hostile filename sanitisation (a title is attacker-influenced text) | `background/background.js:2205-2260` |
+| `EXPORT_SETTINGS` omits token, key material and diagnostics | `background/background.js:7621` |
+| Hostile filename sanitisation (a title is attacker-influenced text) | `background/background.js:3576-3597` |
 | No `innerHTML` anywhere in the content script — every node via `textContent` | `content/content.js:24-27` |
 | No remote code; MV3 CSP `script-src 'self'` | `manifest.json:77-79` |
 

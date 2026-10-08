@@ -240,9 +240,11 @@ const META_KEYS = Object.freeze({
   BATCH_PREFIX: 'batch.plan.',
   PROJECTS: 'projects.cached',
   SELECTION: 'selection.durable',
-  FEED_BASE_IDS: 'feed.baseIds',
+  // The disliked id set, produced by the `filters.disliked:'True'` walk. The
+  // symmetric-difference keys that sat beside it (`feed.baseIds`,
+  // `feed.seenIds`) are REMOVED: they existed only to work around v3's missing
+  // per-clip dislike field, which the server-side filter now covers.
   FEED_DISLIKED_IDS: 'feed.dislikedIds',
-  FEED_SEEN_IDS: 'feed.seenIds',
   LAST_BATCH_SUMMARY: 'batch.lastSummary',
 });
 
@@ -261,8 +263,22 @@ const KEEPALIVE_PERIOD_MINUTES = 0.5;
 /** Token freshness margin: re-mint well before the JWT's own `exp`. */
 const TOKEN_REFRESH_SKEW_MS = 90_000;
 
-/** How long a content-script token relay may take before it is abandoned. */
-const TOKEN_RELAY_TIMEOUT_MS = 2500;
+/**
+ * How long `clerk-token` is allowed to WAIT inside the page for Clerk to appear.
+ *
+ * This is the actual fix for the sign-in bug. The old primary pass injected with
+ * `injectImmediately:true`, i.e. at document_start, and read `window.Clerk`
+ * exactly once: at document_start Clerk has not constructed its instance yet, so
+ * the read returned undefined and there was no retry. A single un-waiting probe
+ * can only ever lose that race. Twelve seconds covers Clerk's own bundle load on
+ * a slow connection and still fits inside the request budget of every caller
+ * that triggers a mint.
+ */
+const CLERK_WAIT_DEFAULT_MS = 12000;
+
+/** Floor/ceiling for a caller-supplied `clerk-token` timeout. */
+const CLERK_WAIT_MIN_MS = 500;
+const CLERK_WAIT_MAX_MS = 30000;
 
 /** Ring-buffer cap for the diagnostics log (also persisted to storage.local). */
 const DIAG_BUFFER_CAP = 500;
@@ -271,14 +287,128 @@ const DIAG_BUFFER_CAP = 500;
 const DIAG_FLUSH_MS = 750;
 
 /**
- * Default per-page flush cadence for the two-pass dislike sets. Persisting a
+ * Default per-page flush cadence for the DISLIKED ID SET. Persisting a
  * 3,000-id array on every page would dominate the crawl; persisting only at the
- * end would lose the diff to an eviction. Five pages bounds both.
+ * end would lose the set to an eviction. Five pages bounds both.
+ *
+ * It used to also gate the two symmetric-difference id sets (`feed.baseIds`,
+ * `feed.seenIds`). Both are gone: `/api/feed/v3` filters disliked SERVER-SIDE
+ * (`filters.disliked`), so `dislikedMode:'both'` is two ordinary walks whose
+ * results need no differencing. Only the id set is still worth flushing.
  */
 const DISLIKED_FLUSH_EVERY_PAGES = 5;
 
 /** Hard ceiling on clips buffered in memory during a forced full rebuild. */
 const FULL_REBUILD_BUFFER_CAP = 25000;
+
+/**
+ * `syncState.feed` shape marker.
+ *
+ * WHY: `/api/feed/v2` paged by PAGE NUMBER and the cursor stored `nextPage`;
+ * `/api/feed/v3` pages by CURSOR and stores a per-project plan instead. A row
+ * left by the v2 era therefore has a `nextPage` that means nothing to a cursor
+ * walk and no project plan to resume from. A mismatched marker is treated as
+ * "not resumable" and the crawl starts from a fresh plan, rather than silently
+ * skipping the first N pages of the first project.
+ *
+ * BUMPED 2 -> 3 FOR THE `totalSeen` SPLIT, NOT FOR A NEW CRAWL SHAPE: schema 2
+ * stored one number under `totalSeen` (rows EXAMINED, repeats across projects
+ * included) and a different one under `uniqueSeen`. Schema 3 stores the UNIQUE
+ * count under `totalSeen` — so the stored row means what every reply means — and
+ * the examined count under `examined`, which is what the oracle is compared
+ * against. A schema-2 row therefore carries a `totalSeen` whose meaning is the
+ * OPPOSITE of a schema-3 row's, and reading it as the unique count would resume
+ * with a total larger than the library ("4,600 of ~4,500"). The marker is the
+ * mechanism that exists for exactly this, so it is used rather than a silent
+ * reinterpretation of an old field.
+ */
+const SYNC_CURSOR_SCHEMA = 3;
+
+/** Cursor fields from the page-number era. Never meaningful on a cursor walk. */
+const LEGACY_PAGE_FIELDS = Object.freeze(['nextPage', 'pass']);
+
+/**
+ * Page cap for the `/api/project/me` walk that enumerates the workspaces.
+ *
+ * The route is paged (20 per page) and `num_total_results` is the project count.
+ * `fetchProjects()` reads page 1 only, which on a 20-project account happens to
+ * be the whole list and on a 25-project account silently loses five of them.
+ * On the recon account that is the whole bug: `default` held 3,444 of ~5,500
+ * clips and every other project was unreachable, because only `default` was
+ * ever walked.
+ */
+const PROJECT_LIST_MAX_PAGES = 100;
+
+/**
+ * `/api/project/me` returns 20 projects per page.
+ *
+ * A PROGRESS HINT ONLY — never a stop condition. `num_total_results` is the stop
+ * condition; a short page with no advertised total is an incomplete list, not a
+ * finished one.
+ */
+const PROJECT_LIST_PAGE_HINT = 20;
+
+/**
+ * Feed-page size bounds for `settings.feedPageLimit`. The ceiling is the client's
+ * own documented maximum (`SunoAPI.LIMITS.feedPageLimit`) rather than a literal
+ * here, so the two can never disagree about what 100 means.
+ * @type {{min:number, max:number}}
+ */
+const FEED_PAGE_LIMIT_RANGE = Object.freeze({
+  min: 1,
+  max: SunoAPI && SunoAPI.LIMITS && Number.isFinite(SunoAPI.LIMITS.feedPageLimit)
+    ? SunoAPI.LIMITS.feedPageLimit
+    : 100,
+});
+
+/**
+ * How much of a workspace may be missing before a shortfall stops being
+ * explainable by trashed/disliked accounting.
+ *
+ * THE ARITHMETIC BEHIND THE NUMBER. `project.clip_count` is a project ROW count
+ * and the default walk is a FILTERED request (`filters.trashed:'False'`,
+ * `filters.disliked:'False'`). Nothing in the wire contract says the count
+ * excludes those rows, so a small shortfall is exactly what that mismatch looks
+ * like: a handful of trashed or disliked clips on a workspace of thousands. The
+ * failure being hunted looks nothing like that — it loses 80-90% of the library,
+ * which is orders of magnitude larger — so anything at or below 5% of the
+ * workspace (and at least one row) is reported as `shortfallLikelyFilters`, and
+ * the copy is allowed to say "this may be trashed/disliked clips, OR truncation".
+ *
+ * NOT A TRUNCATION DETECTOR. It only decides which sentence the UI is allowed to
+ * lead with. The `completed:false` verdict does not depend on it, because a
+ * shortfall of either size means the library on disk is short of what the account
+ * says it has.
+ */
+const SHORTFALL_FILTER_CAUSE_SHARE = 0.05;
+
+
+/**
+ * `dislikedMode` -> the SERVER-SIDE tri-state filter handed to `iterateFeed`.
+ *
+ * WHY A TABLE: the previous build passed `mode` straight through as
+ * `iterateFeed({disliked})` and separately asked for `disliked:'both'`, whose
+ * `type:'dislikedIds'` envelope the client no longer emits. `for await` then
+ * never matched that envelope, so `dislikedIds` stayed null and the run recorded
+ * `dislikedCount: 0` — a hard "you have zero dislikes" claim built out of an
+ * envelope that was never read. Every value here is one of the three strings the
+ * client forwards as `filters.disliked` (`'True'` / `'False'` / `'Any'`).
+ */
+const DISLIKED_FILTER_BY_MODE = Object.freeze({
+  // "hide dislikes" -> ONE walk with `filters.disliked:'False'`.
+  exclude: 'exclude',
+  // "index everything" -> ONE walk with `filters.disliked:'Any'`. Suno exposes no
+  // per-clip dislike field, so WHICH of these clips are disliked is not knowable
+  // from this walk; `dislikedCount` stays unknown (null) rather than being
+  // reported as 0, which is what a null used to be silently converted into.
+  include: 'any',
+  // "index both, and tell me which" -> the library walk hides dislikes
+  // (`'False'`) and a SECOND walk over `'True'` yields the id set to stamp.
+  both: 'exclude',
+});
+
+/** The `iterateFeed` filter that returns ONLY the disliked clips. */
+const DISLIKED_ONLY_FILTER = 'only';
 
 /**
  * Rows per `clips.putMany` chunk.
@@ -675,6 +805,23 @@ const DEFAULT_SETTINGS = Object.freeze({
 
   /* ---- crawl ---- */
   syncMaxPages: 200,
+  /**
+   * Page size asked of `POST /api/feed/v3`, clamped to [1, 100].
+   *
+   * WHY A SETTING AT ALL, WHEN 100 IS THE DOCUMENTED MAXIMUM: because the
+   * maximum is UNVERIFIED. 100 is what the shipped web client's own caller sends,
+   * what the bundle contains, and what two third-party extensions claim; no live
+   * response has been checked against it. If the server really caps pages at 20,
+   * every "full page" inference and every page-count estimate is wrong by 5x —
+   * and the only way to find out on a real account, without a rebuild, is to ask
+   * for 100 and then ask for 20 and compare. That is what `PROBE_FEED` is for, and
+   * it takes a `limit` of its own so the experiment needs no settings change at
+   * all; this setting is the persistent form of the same experiment.
+   *
+   * NOT A PROOF OF COMPLETENESS: this value bounds what a page can hold, never
+   * where the library ends. Only the server's own cursor does that.
+   */
+  feedPageLimit: 100,
   dislikedMode: 'exclude',
   autoSync: false,
   syncIntervalMinutes: 60,
@@ -711,7 +858,8 @@ const DEFAULT_SETTINGS = Object.freeze({
 
 /** Push message types this worker emits. The router ignores all of them. */
 const PUSH_TYPES = Object.freeze(new Set([
-  'SYNC_PROGRESS', 'SYNC_DONE', 'SYNC_ERROR',
+  'SYNC_STARTED', 'SYNC_PROGRESS', 'SYNC_DONE', 'SYNC_ERROR',
+  'SYNC_CANCEL_REQUESTED', 'SYNC_CANCELLED',
   'DL_PROGRESS', 'DL_ITEM', 'DL_DONE', 'DL_ERROR',
   'TOKEN_CHANGED',
 ]));
@@ -1022,6 +1170,17 @@ function isAbortLike(err) {
  *   value yields 0.5. Never NaN, because it is handed straight to
  *   `new OggVorbisEncoder(rate, channels, quality)`.
  * @property {number} syncMaxPages
+ * @property {number} feedPageLimit page size asked of `POST /api/feed/v3`,
+ *   clamped to [1, `SunoAPI.LIMITS.feedPageLimit`] and floored to a whole number,
+ *   default 100. Coerced by `resolveFeedPageLimit`, which treats `null`/`''`/
+ *   absent as MISSING rather than as 0 — otherwise a cleared field would mean
+ *   "one clip per page". This is a CEILING ON WHAT WE ASK FOR, never a claim
+ *   about what the server grants or about where the library ends: the ceiling is
+ *   the shipped client's documented maximum and has never been checked against a
+ *   live response, which is what `PROBE_FEED` exists to settle. An account that
+ *   caps pages below this value is not truncated BY it — the cursor chain still
+ *   walks to the end — but the `pagesFull`/`lastPageSize` figures reported per
+ *   crawl will show it.
  * @property {'include'|'exclude'|'both'} dislikedMode
  * @property {boolean} autoSync
  * @property {number} syncIntervalMinutes
@@ -1070,6 +1229,11 @@ function coerceSettings(raw) {
   out.dataUrlMaxBytes = clampNumber(input.dataUrlMaxBytes, 64 * 1024, 64 * 1024 * 1024, DEFAULT_SETTINGS.dataUrlMaxBytes);
   out.wavSampleRate = clampNumber(input.wavSampleRate, 8000, 192000, DEFAULT_SETTINGS.wavSampleRate);
   out.syncMaxPages = clampNumber(input.syncMaxPages, 1, 2000, DEFAULT_SETTINGS.syncMaxPages);
+  // Feed page size. Floored (a page size of 20.7 is not a page size) and clamped
+  // to the client's documented ceiling; see `resolveFeedPageLimit` for why this is
+  // not `clampNumber` alone.
+  out.feedPageLimit = resolveFeedPageLimit(input.feedPageLimit, DEFAULT_SETTINGS.feedPageLimit);
+
   out.syncIntervalMinutes = clampNumber(input.syncIntervalMinutes, 5, 1440, DEFAULT_SETTINGS.syncIntervalMinutes);
   out.maxFolderDepth = clampNumber(input.maxFolderDepth, 0, 4, DEFAULT_SETTINGS.maxFolderDepth);
   out.folderDepth = clampNumber(input.folderDepth, 0, out.maxFolderDepth, DEFAULT_SETTINGS.folderDepth);
@@ -1227,12 +1391,53 @@ function snapToChoice(value, choices, fallback) {
   for (let i = 1; i < choices.length; i += 1) {
     const distance = Math.abs(num - choices[i]);
     if (distance < bestDistance) {
-      best = choices[i];
-      bestDistance = distance;
+    best = choices[i];
+    bestDistance = distance;
     }
   }
   return best;
 }
+
+/**
+ * Resolve `settings.feedPageLimit` — the page size the crawl asks
+ * `POST /api/feed/v3` for — to a whole number in [1, 100].
+ *
+ * WHY NOT `clampNumber`. Two things, both of which `clampNumber` gets wrong for
+ * this key:
+ *   - A page size must be an INTEGER. `limit: 20.7` is not a page size, and
+ *     forwarding a float to the wire turns "ask for 20" into a request no server
+ *     has ever been shown accepting.
+ *   - `clampNumber(null)` returns `0` (because `Number(null) === 0`), which the
+ *     clamp then raises to `1`. So a settings blob that carries the key with an
+ *     explicit `null` — an exported file, an options page that clears the field,
+ *     a JSON round trip — would silently turn a 5,500-clip crawl into a
+ *     5,500-request crawl at one clip per page. A missing value is a missing
+ *     value, not a request for the smallest legal page, which is why `null`,
+ *     `undefined`, `''` and booleans are treated as absent here exactly as
+ *     `snapToChoice` treats them.
+ *
+ * The range is [1, {@link SunoAPI.LIMITS}.feedPageLimit] and is read from the
+ * client rather than restated, so this file and `lib/api.js` cannot disagree about
+ * the ceiling. That ceiling is what the client will ASK for; it is not a verified
+ * statement about what the server grants — see `DEFAULT_SETTINGS.feedPageLimit`.
+ *
+ * @param {unknown} value
+ * @param {number} fallback used when `value` is absent or unusable
+ * @returns {number} an integer in [1, 100]; never NaN, never 0
+ */
+function resolveFeedPageLimit(value, fallback) {
+  const min = Number.isFinite(FEED_PAGE_LIMIT_RANGE.min) ? FEED_PAGE_LIMIT_RANGE.min : 1;
+  const max = Number.isFinite(FEED_PAGE_LIMIT_RANGE.max) ? FEED_PAGE_LIMIT_RANGE.max : 100;
+  const safe = Number.isFinite(fallback) ? Math.floor(fallback) : max;
+  const bounded = Math.min(max, Math.max(min, safe));
+  if (value === null || value === undefined || typeof value === 'boolean' || value === '') {
+    return bounded;
+  }
+  const num = Number(value);
+  if (!Number.isFinite(num)) return bounded;
+  return Math.min(max, Math.max(min, Math.floor(num)));
+}
+
 
 /**
  * Coerce anything to a finite number, or 0.
@@ -1409,8 +1614,19 @@ async function persistSettings(value) {
 /** @type {{token:string, exp:number, obtainedAt:number}|null} cache only. */
 let authCache = null;
 
-/** @type {Map<string,{resolve:Function,reject:Function,timer:any}>} relay waiters. */
-const tokenRelayWaiters = new Map();
+/**
+ * The content-script token relay's waiter map used to live here. It is gone:
+ * `content/content.js` has no `SUNO_TOKEN_REQUEST` handler and never had one —
+ * the only way a content script could read `window.Clerk` was an inline
+ * `<script>` element, which suno.com's own CSP refuses to execute while still
+ * letting the append "succeed". Nothing could ever have answered, so the waiter
+ * could only ever be resolved by its own timeout.
+ *
+ * What replaced it is the layered MAIN-world strategy in §5b: an `Authorization`
+ * header tap on Suno's own requests (`auth-tap`/`auth-read`), which does not
+ * depend on Clerk being a page global at all, with a real in-page wait
+ * (`clerk-token`) for the case where it is.
+ */
 
 /** Guards against a thundering herd of concurrent token mints. */
 let tokenMintInFlight = null;
@@ -1528,7 +1744,11 @@ async function clearAuthToken() {
 /**
  * Resolve a usable Clerk JWT, minting a new one when needed.
  *
- * @param {{force?:boolean}} [opts]
+ * `tabId` is the caller's own tab when the caller knows it. It only affects
+ * WHICH tab is tried first — the token is a page-agnostic bearer token — but
+ * preferring the tab the user is looking at beats an arbitrary sweep order.
+ *
+ * @param {{force?:boolean, tabId?:number}} [opts]
  * @returns {Promise<string|null>} the token, or null when none is obtainable
  */
 async function getAuthToken(opts) {
@@ -1541,135 +1761,308 @@ async function getAuthToken(opts) {
   }
   if (tokenMintInFlight) return tokenMintInFlight;
 
-  tokenMintInFlight = mintAuthToken(force)
+  tokenMintInFlight = mintAuthToken(force, opts && opts.tabId)
     .then(async (token) => {
-      tokenMintInFlight = null;
       if (!token) {
-        log('warn', 'auth.mint_failed', { reason: 'no suno tab with a Clerk session, and no relay answered' });
+        log('warn', 'auth.mint_failed', {
+          // `lastAuthFailure` is the answer to "which of the four layers was
+          // reached, and what did each one say". No token material: every
+          // field in it is a description of the search.
+          ...(lastAuthFailure || {}),
+          reason: 'no MAIN-world source produced a token on any tab',
+        });
         return null;
       }
       await writeSessionToken(token);
       return token;
     })
     .catch((err) => {
-      tokenMintInFlight = null;
       log('error', 'auth.mint_threw', { error: describeError(err) });
       return null;
-    });
+    })
+    // `finally`, not two separate assignments: the in-flight guard must be
+    // released on EVERY path — success, null, and throw. Clearing it inside
+    // `.then` and `.catch` separately is correct only while both exist, and a
+    // cached failed mint would block every later retry.
+    .finally(clearTokenMintInFlight);
   return tokenMintInFlight;
 }
 
 /**
- * Mint a JWT. Primary path: `chrome.scripting.executeScript` in the MAIN world.
- * Fallback: ask the content script to relay it, accepting only a reply that
- * passed `event.source === window` AND `event.origin` validation on its side.
+ * The tab the user is actually looking at, when it is a Suno tab.
+ *
+ * `mintAuthToken` used to sweep `findSunoTabs()` and take the FIRST tab that
+ * answered. With several Suno tabs open that ordering is arbitrary, and the tab
+ * the user is watching is the one whose Clerk session is guaranteed to be
+ * warm. `currentWindow:true` resolves to the most recently focused window from
+ * the worker, and the same `SUNO_TAB_PATTERNS` list is passed through so this
+ * cannot drift from what `findSunoTabs` considers a Suno tab.
+ *
+ * @returns {Promise<chrome.tabs.Tab|null>}
+ */
+async function activeSunoTab() {
+  try {
+    const active = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+      url: SUNO_TAB_PATTERNS,
+    });
+    const tab = Array.isArray(active) ? active[0] : null;
+    return tab && typeof tab.id === 'number' ? tab : null;
+  } catch (queryErr) {
+    // Not fatal: this is an ordering preference, and the sweep below still runs.
+    log('debug', 'auth.active_tab_query_failed', { error: describeError(queryErr) });
+    return null;
+  }
+}
+
+/**
+ * The tabs a mint may use, in order.
+ *
+ * Order of preference, and the ONLY ordering change: the caller's own tab, then
+ * the focused window's active Suno tab, then everything else. Taking the FIRST
+ * tab that yields a token is arbitrary when several Suno tabs are open, and the
+ * tab the user is looking at is the one whose Clerk session and whose outgoing
+ * API traffic are guaranteed to be warm. Duplicates are dropped so no tab is
+ * injected into twice in one pass.
+ *
+ * Tab ids only — a URL query string can carry a share id or an OAuth
+ * continuation and must never reach a log.
+ *
+ * @param {number} [preferredTabId]
+ * @returns {Promise<Array<{id:number, active?:boolean}>>}
+ */
+async function orderedMintTabs(preferredTabId) {
+  const [active, tabs] = await Promise.all([activeSunoTab(), findSunoTabs()]);
+  const ordered = [];
+  const seen = new Set();
+  const consider = (tab) => {
+    if (!tab || typeof tab.id !== 'number' || seen.has(tab.id)) return;
+    seen.add(tab.id);
+    ordered.push({ id: tab.id, active: tab.active === true });
+  };
+  if (Number.isFinite(preferredTabId)) consider({ id: preferredTabId });
+  consider(active);
+  for (const tab of tabs) consider(tab);
+  return ordered;
+}
+
+/**
+ * Is a MAIN-world token result a credential we are willing to hand on?
+ *
+ * Whole-or-nothing on purpose: a truncated or whitespace-bearing value is not a
+ * JWT, and forwarding one produces a 401 that reads like an expired session.
+ *
+ * @param {unknown} token
+ * @returns {boolean}
+ */
+function isUsableJwt(token) {
+  return typeof token === 'string' && token.length >= 20 && !/\s/.test(token);
+}
+
+/**
+ * Mint a Clerk JWT through a LAYERED strategy over the MAIN-world ops.
+ *
+ * WHY LAYERED. Two independent things are not knowable from this build:
+ *
+ *   * Whether Suno publishes `window.Clerk` as a page global. If it does not,
+ *     every Clerk-based path is a guaranteed miss and the user is signed in and
+ *     still told otherwise — which is exactly the bug being fixed.
+ *   * Whether a given tab is past document_start when we look at it. Clerk's
+ *     instance does not exist that early, so a single un-waiting read can only
+ *     ever lose the race. `clerk-token` waits inside the page, which is the fix.
+ *
+ * So the order below is cheapest-and-most-likely first, and the expensive wait
+ * LAST:
+ *
+ *   a. `auth-read`  — the tap's captured header. No page dependency, and once the
+ *                    tap is installed it is one instant MAIN-world call. This is
+ *                    the fast common path: a working tap never reaches (c).
+ *   b. `auth-tap`   — idempotent; installs the tap if the content script has not
+ *                    already done so on mount, then re-run (a).
+ *   c. `clerk-token` — the real wait (default `CLERK_WAIT_DEFAULT_MS`). This is
+ *                    what fixes the document-start race, and it is why it is
+ *                    third and not first: it costs up to 12 seconds, and (a)/(b)
+ *                    have already answered or proved they cannot.
+ *   d. `auth-read`  — once more, because the page may well have made an
+ *                    authenticated request while (c) was waiting.
+ *
+ * First non-empty token wins.
  *
  * @param {boolean} force
+ * @param {number} [preferredTabId] the caller's own tab, when the caller had one
  * @returns {Promise<string|null>}
  */
-async function mintAuthToken(force) {
-  const tabs = await findSunoTabs();
-  for (const tab of tabs) {
-    if (typeof tab.id !== 'number') continue;
-    try {
-      const results = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        world: 'MAIN',
-        injectImmediately: true,
-        // Self-contained: it is stringified and evaluated in the page, so it
-        // cannot close over anything here.
-        func: () => {
-          try {
-            const clerk = window.Clerk;
-            if (clerk && clerk.session && typeof clerk.session.getToken === 'function') {
-              return Promise.resolve(clerk.session.getToken()).then((token) => (token || null));
-            }
-            return null;
-          } catch (err) {
-            return null;
-          }
-        },
-      });
-      const token = Array.isArray(results) && results.length ? results[0].result : null;
-      if (typeof token === 'string' && token.length > 20) {
-        log('info', 'auth.minted_from_clerk', { tabId: tab.id, forced: force });
-        return token;
-      }
-    } catch (execErr) {
-      log('warn', 'auth.execute_script_failed', { tabId: tab.id, error: describeError(execErr) });
+async function mintAuthToken(force, preferredTabId) {
+  const ordered = await orderedMintTabs(preferredTabId);
+  const steps = [];
+  let reachedOp = null;
+  let tapInstalled = false;
+  let usedTabId = null;
+
+  log('debug', 'auth.mint_start', { tabsFound: ordered.length, tabIds: ordered.map((t) => t.id) });
+
+  if (!ordered.length) {
+    lastAuthFailure = {
+      at: Date.now(),
+      reason: 'no_suno_tab',
+      tabsFound: 0,
+      tabsTried: 0,
+      tabIds: [],
+      usedTabId: null,
+      tapInstalled: false,
+      reachedOp: null,
+      steps: [],
+    };
+    return null;
+  }
+
+  /** Record one step of the search and keep it for the diagnostics reply. */
+  const record = (op, tabId, ok, code, error) => {
+    steps.push({ op, tabId, ok, code: code || null, error: error || null });
+    return ok;
+  };
+
+  /** Run one op on one tab and normalise it into `{ok, token, result}`. */
+  const tryOp = async (op, tabId, payload) => {
+    const reply = await injectMainWorldOp(op, tabId, payload || {});
+    if (!reply.ok) {
+      record(op, tabId, false, reply.code, reply.error);
+      return { ok: false, token: null, result: null };
+    }
+    const result = reply.result;
+    const opOk = result.ok !== false && !result.error;
+    if (op === 'auth-read' || op === 'clerk-token') {
+      const token = isUsableJwt(result.token) ? result.token : null;
+      record(op, tabId, !!token, null, token ? null : (result.error || 'no usable token'));
+      return { ok: !!token, token, result };
+    }
+    record(op, tabId, opOk, null, result.error || null);
+    return { ok: opOk, token: null, result };
+  };
+
+  // --- (a) read the tap, if one is already there --------------------------
+  for (const tab of ordered) {
+    reachedOp = 'auth-read';
+    const hit = await tryOp('auth-read', tab.id);
+    if (hit.ok) {
+      usedTabId = tab.id;
+      log('info', 'auth.minted_from_tap', { tabId: tab.id, forced: force, ageMs: hit.result.ageMs });
+      return hit.token;
     }
   }
-  return relayAuthToken();
-}
 
-/**
- * Ask every Suno tab's content script for the token. The content script is the
- * authority on whether its own relay was trustworthy; here we only bound the
- * wait and validate that the reply came from a Suno origin.
- * @returns {Promise<string|null>}
- */
-async function relayAuthToken() {
-  const tabs = await findSunoTabs();
-  if (!tabs.length) return null;
-  const requestId = 'tr' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
-  const reply = new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      tokenRelayWaiters.delete(requestId);
-      resolve(null);
-    }, TOKEN_RELAY_TIMEOUT_MS);
-    tokenRelayWaiters.set(requestId, {
-      resolve: (token) => {
-        clearTimeout(timer);
-        tokenRelayWaiters.delete(requestId);
-        resolve(token);
-      },
-    });
-  });
-  let asked = 0;
-  for (const tab of tabs) {
-    if (typeof tab.id !== 'number') continue;
-    asked += 1;
-    try {
-      // Deliberately not awaited: we want the FIRST answer, and awaiting a
-      // per-tab sendMessage would serialise the 2.5s timeout. The rejection is
-      // logged, not swallowed — a tab with no content script is normal, but a
-      // silent rejection here is exactly how a dead relay looks identical to a
-      // working one.
-      chrome.tabs.sendMessage(tab.id, { type: 'SUNO_TOKEN_REQUEST', requestId }).catch((relayErr) => {
-        log('debug', 'auth.relay_no_listener', { tabId: tab.id, error: describeError(relayErr) });
+  // --- (b) install the tap, then read it again -----------------------------
+  // The content script also fires `RUN_MAIN_WORLD {op:'auth-tap'}` on mount, so
+  // the tap is normally in place before this runs. This step is the worker-side
+  // guarantee for a tab whose content script never mounted (a signed-in Suno tab
+  // with no dock, an about:blank that just navigated) — and `authTap()` is
+  // idempotent, so re-installing over an existing one is a cheap no-op.
+  for (const tab of ordered) {
+    reachedOp = 'auth-tap';
+    const install = await tryOp('auth-tap', tab.id);
+    if (install.ok) {
+      tapInstalled = true;
+      log('debug', 'auth.tap_ready', {
+        tabId: tab.id,
+        alreadyInstalled: install.result.alreadyInstalled === true,
+        fetchHooked: install.result.fetchHooked === true,
+        xhrOpenHooked: install.result.xhrOpenHooked === true,
+        xhrHeaderHooked: install.result.xhrHeaderHooked === true,
       });
-    } catch (sendErr) {
-      log('debug', 'auth.relay_send_failed', { tabId: tab.id, error: describeError(sendErr) });
+    }
+    reachedOp = 'auth-read';
+    const hit = await tryOp('auth-read', tab.id);
+    if (hit.ok) {
+      usedTabId = tab.id;
+      log('info', 'auth.minted_from_tap_after_install', { tabId: tab.id, forced: force });
+      return hit.token;
     }
   }
-  if (!asked) return null;
-  const token = await reply;
-  if (token) log('info', 'auth.minted_from_relay', { tabId: tabs[0].id });
-  return token;
+
+  // --- (c) Clerk, with a real in-page wait ---------------------------------
+  for (const tab of ordered) {
+    reachedOp = 'clerk-token';
+    const hit = await tryOp('clerk-token', tab.id, { timeoutMs: CLERK_WAIT_DEFAULT_MS });
+    if (hit.ok) {
+      usedTabId = tab.id;
+      log('info', 'auth.minted_from_clerk', { tabId: tab.id, forced: force, waitedMs: hit.result.waitedMs });
+      return hit.token;
+    }
+  }
+
+  // --- (d) the page may have called the API while we waited ----------------
+  for (const tab of ordered) {
+    reachedOp = 'auth-read';
+    const hit = await tryOp('auth-read', tab.id);
+    if (hit.ok) {
+      usedTabId = tab.id;
+      log('info', 'auth.minted_from_tap_after_wait', { tabId: tab.id, forced: force, ageMs: hit.result.ageMs });
+      return hit.token;
+    }
+  }
+
+  // Nothing worked. Publish the structured account of WHY, so the next "not
+  // signed in" report can be answered instead of guessed at. Nothing in here is
+  // token material: it is the op, the tab id, and the error string each op
+  // produced.
+  lastAuthFailure = {
+    at: Date.now(),
+    reason: 'no_source_produced_a_token',
+    tabsFound: ordered.length,
+    tabsTried: ordered.length,
+    tabIds: ordered.map((t) => t.id),
+    usedTabId,
+    tapInstalled,
+    reachedOp,
+    steps,
+  };
+  return null;
 }
 
 /**
- * Resolve a relay answer that arrived through the `SET_TOKEN` route.
- * @param {string} requestId
- * @param {string} token
- * @returns {void}
- */
-function resolveTokenRelay(requestId, token) {
-  const waiter = tokenRelayWaiters.get(String(requestId || ''));
-  if (!waiter) return;
-  waiter.resolve(typeof token === 'string' && token.length > 20 ? token : null);
-}
-
-/**
- * Every Suno tab we may talk to, most recently active first.
+ * Every Suno tab we may talk to.
+ *
+ * `chrome.tabs.query({url})` is URL-FILTERED, and whether it is honoured depends
+ * on how the browser grants host-permission-scoped tab reads. An empty result
+ * from it therefore does NOT prove there is no Suno tab — it may mean the filter
+ * was not applied. So an empty answer falls back to an unfiltered query with the
+ * SAME patterns applied in JS, and only an empty result from both is reported as
+ * "no Suno tabs".
+ *
  * @returns {Promise<Array<chrome.tabs.Tab>>}
  */
 async function findSunoTabs() {
   try {
     const tabs = await chrome.tabs.query({ url: SUNO_TAB_PATTERNS });
-    return Array.isArray(tabs) ? tabs : [];
+    if (Array.isArray(tabs) && tabs.length) return tabs;
   } catch (queryErr) {
     log('warn', 'auth.tabs_query_failed', { error: describeError(queryErr) });
+  }
+  // Fallback: filter in JS against the same patterns.
+  try {
+    const all = await chrome.tabs.query({});
+    if (!Array.isArray(all)) return [];
+    const matchers = SUNO_TAB_PATTERNS.map((pattern) => {
+      try {
+        return new RegExp(pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*'));
+      } catch (compileErr) {
+        void compileErr;
+        return null;
+      }
+    }).filter(Boolean);
+    const matched = all.filter((tab) => {
+      const url = tab && typeof tab.url === 'string' ? tab.url : '';
+      if (!url) return false;
+      for (const matcher of matchers) {
+        if (matcher.test(url)) return true;
+      }
+      return false;
+    });
+    log('debug', 'auth.tabs_query_fallback', { scanned: all.length, matched: matched.length });
+    return matched;
+  } catch (fallbackErr) {
+    log('warn', 'auth.tabs_query_fallback_failed', { error: describeError(fallbackErr) });
     return [];
   }
 }
@@ -1732,6 +2125,888 @@ function classifyAuthFailure(err) {
       : 'The Suno session expired. Sign in again on suno.com.',
     badToken: false,
   };
+}
+
+/* ==========================================================================
+ * 5b. MAIN-WORLD OPERATIONS
+ *
+ * WHY THIS SECTION EXISTS. suno.com ships
+ *
+ *   script-src 'self' 'wasm-unsafe-eval' 'inline-speculation-rules' …
+ *
+ * with no `'unsafe-inline'`. A content script that builds a `<script>` element,
+ * assigns `.textContent` and appends it to `document.head` gets a SUCCESSFUL
+ * APPEND and a BLOCKED EXECUTION — the CSP violation is reported afterwards — so
+ * an inline-injection helper returns `true` while nothing ran at all. That
+ * silently killed three things: the `window.MediaSource` patch never landed, so
+ * every HLS capture burned a 20s poll and then failed with a misleading "no
+ * manifest appeared"; the page token reader never ran, so `requestPageToken()`
+ * was a no-op; and the RESTORE never ran either, which means that if a patch
+ * ever HAD landed, the page would have been left with `MediaSource` destroyed
+ * and Suno's own player broken. There is no way to make inline injection work
+ * from a content script, and the page's CSP is not to be worked around.
+ *
+ * `chrome.scripting.executeScript({world:'MAIN'})` runs in the page's main world
+ * but is NOT subject to the page's CSP. That is the only route this build uses.
+ *
+ * THE CONTRACT EVERY FUNCTION BELOW MUST HONOUR
+ *
+ * 1. SELF-CONTAINED. `executeScript` stringifies `func` and evaluates it in the
+ *    page, so a MAIN-world function CANNOT close over anything in this file.
+ *    Every constant it needs is a literal inside its own body. (That is also why
+ *    `MAIN_WORLD_OPS` exists rather than a name the page resolves: the map is
+ *    the worker's copy, and only the value — the source text — crosses.)
+ * 2. NEVER THROW ACROSS THE BRIDGE. A MAIN-world exception surfaces at the
+ *    worker as an opaque `inject_failed`, destroying the distinction between
+ *    "the operation ran and failed" and "the operation never ran". So every one
+ *    of them catches internally and returns a plain object carrying `ok:false`
+ *    and an `error` string.
+ * 3. PLAIN, JSON-SERIALISABLE VALUES ONLY. No function objects, no DOM nodes, no
+ *    `Headers`, no `Request`. The result is copied through Chrome's own
+ *    serialiser to reach this worker, so anything exotic comes back mangled or
+ *    missing.
+ * 4. NO TOKEN EVER APPEARS IN A FIELD THAT IS NOT `token`. `token` is the only
+ *    field any caller is allowed to forward, and it must be whole: a truncated
+ *    or malformed JWT is worse than none, because it produces a 401 that reads
+ *    like an expired session.
+ * ======================================================================== */
+
+/**
+ * Reachability diagnostic. Answers "what can this page actually give us?" in
+ * one injection, which is the question every "not signed in" report should be
+ * answered with instead of a guess.
+ *
+ * `href` is reported as origin + pathname only. A suno.com query string can
+ * carry a share id, a search, or an OAuth continuation, and this result is
+ * written into a diagnostics ring buffer that is PERSISTED to
+ * chrome.storage.local — so the query is dropped here rather than at every
+ * call site.
+ *
+ * @returns {{ok:boolean, href:string, hasClerk:boolean, hasSession:boolean,
+ *   getTokenType:string|null, hasMediaSource:boolean, mediaSourceType:string|null,
+ *   hasFetch:boolean, hasXHR:boolean, tapInstalled:boolean, tapHasToken:boolean,
+ *   readyState:string, error:string|null}}
+ */
+function mainWorldProbe() {
+  /** typeof, or null for absent — never the value itself. */
+  const typeName = (value) => (value === null || value === undefined ? null : typeof value);
+  const out = {
+    ok: false,
+    href: '',
+    hasClerk: false,
+    hasSession: false,
+    getTokenType: null,
+    hasMediaSource: false,
+    mediaSourceType: null,
+    hasFetch: false,
+    hasXHR: false,
+    tapInstalled: false,
+    tapHasToken: false,
+    readyState: '',
+    error: null,
+  };
+  try {
+    out.href = String(location.origin || '') + String(location.pathname || '');
+    out.readyState = String(document.readyState || '');
+    const clerk = window.Clerk;
+    out.hasClerk = !!clerk;
+    out.hasSession = !!(clerk && clerk.session);
+    out.getTokenType = out.hasSession ? typeName(clerk.session.getToken) : null;
+    out.hasMediaSource = 'MediaSource' in window;
+    out.mediaSourceType = typeName(window.MediaSource);
+    out.hasFetch = typeof window.fetch === 'function';
+    out.hasXHR = typeof window.XMLHttpRequest === 'function';
+    // `read` is a getter, `hasToken` a predicate: neither is ever RETURNED, only
+    // called, because a function object cannot survive the bridge.
+    const holder = window.__smAuthTap;
+    out.tapInstalled = !!(holder && holder.version === 1);
+    out.tapHasToken = out.tapInstalled && typeof holder.hasToken === 'function'
+      ? holder.hasToken() === true
+      : false;
+    out.ok = true;
+    return out;
+  } catch (probeErr) {
+    out.error = 'probe failed: ' + (probeErr && probeErr.message ? String(probeErr.message) : 'unknown');
+    return out;
+  }
+}
+
+/**
+ * Install a passive observer that captures the `Authorization: Bearer <jwt>`
+ * header off Suno's OWN requests.
+ *
+ * This is the proven approach — it is what the working third-party extensions in
+ * `scratchpad/extracted/` do — and it is here because the alternative cannot be
+ * relied on: whether Suno publishes `window.Clerk` as a page global is not
+ * knowable from this build, and if it does not, every `Clerk`-based path is a
+ * guaranteed miss. Suno sends a real `Authorization` header on its own API calls
+ * whether or not it also exposes the instance.
+ *
+ * TRANSPARENCY, which is the only thing that makes page tampering acceptable:
+ * every inspection is individually wrapped, and the original is ALWAYS called
+ * through — the wrappers cannot alter, delay, reorder or block a request, and
+ * cannot throw into the page's call. If any inspection throws, the request
+ * happens exactly as it would have without us.
+ *
+ * READ-ONLY. Nothing is added to, removed from, or rewritten on any request.
+ *
+ * IDEMPOTENT. `window.__smAuthTap` is written BEFORE any wrapper is installed,
+ * so a second call can never double-wrap `fetch` or `XMLHttpRequest.prototype`
+ * even if the first call died part-way. A double-wrap is a permanent,
+ * unbounded page regression; a partial install is merely reported. Per-hook
+ * outcomes are recorded on the holder so the lost information is not lost.
+ *
+ * THE TOKEN'S EXPOSURE, stated honestly rather than implied away: the captured
+ * value is kept in a closure and is reachable only through the holder's `read()`
+ * getter, but that holder lives on `window`. Any script the page itself runs can
+ * therefore read it. That grants a same-origin page script nothing it does not
+ * already have — the JWT is in the page's own memory and in every outgoing
+ * request header — and this build does not send it anywhere except the worker,
+ * which stores it in `chrome.storage.session` and presents it to Suno. It is
+ * still worth being accurate about: this is the page's credential, not a
+ * credential this extension created.
+ *
+ * @returns {{ok:boolean, alreadyInstalled:boolean, installedAt:number|null,
+ *   fetchHooked:boolean, xhrOpenHooked:boolean, xhrHeaderHooked:boolean,
+ *   hasToken:boolean, errors:string[]}}
+ */
+function mainWorldAuthTap() {
+  const out = {
+    ok: false,
+    alreadyInstalled: false,
+    installedAt: null,
+    fetchHooked: false,
+    xhrOpenHooked: false,
+    xhrHeaderHooked: false,
+    hasToken: false,
+    errors: [],
+  };
+
+  // Re-derive the current state of an existing install rather than reporting
+  // only what the first call recorded: a hook can be removed later by the page
+  // itself, and then `probe`/`authRead` must see the truth.
+  const describeExisting = (holder) => {
+    out.alreadyInstalled = true;
+    out.installedAt = Number.isFinite(holder.installedAt) ? holder.installedAt : null;
+    try {
+      out.fetchHooked = window.fetch && window.fetch.__smAuthTapWrapped === true;
+      out.xhrOpenHooked = typeof window.XMLHttpRequest === 'function'
+        && window.XMLHttpRequest.prototype.open.__smAuthTapWrapped === true;
+      out.xhrHeaderHooked = typeof window.XMLHttpRequest === 'function'
+        && window.XMLHttpRequest.prototype.setRequestHeader.__smAuthTapWrapped === true;
+      out.hasToken = typeof holder.hasToken === 'function' ? holder.hasToken() === true : false;
+    } catch (inspectErr) {
+      out.errors.push('inspect: ' + (inspectErr && inspectErr.message ? String(inspectErr.message) : 'unknown'));
+    }
+    out.ok = true;
+    return out;
+  };
+
+  try {
+    const existing = window.__smAuthTap;
+    if (existing && existing.version === 1) return describeExisting(existing);
+  } catch (readErr) {
+    out.errors.push('marker read: ' + (readErr && readErr.message ? String(readErr.message) : 'unknown'));
+  }
+
+  // The captured credential. Closure-private: nothing outside this install can
+  // name `state`, only call `holder.read()`.
+  const state = { token: null, at: 0, hits: 0 };
+
+  const record = (value) => {
+    try {
+      if (typeof value !== 'string') return;
+      const trimmed = value.trim();
+      // Only a real bearer credential. Anything shorter than 20 chars, or
+      // containing whitespace, is a malformed value and must not be handed on
+      // as a token — a truncated JWT produces a 401 indistinguishable from an
+      // expired session.
+      if (trimmed.slice(0, 7).toLowerCase() !== 'bearer ') return;
+      const token = trimmed.slice(7).trim();
+      if (!token || token.length < 20 || /\s/.test(token)) return;
+      state.token = token;
+      state.at = Date.now();
+      state.hits += 1;
+    } catch (recordErr) {
+      void recordErr;
+    }
+  };
+
+  // Hosts inlined rather than read from SUNO_API_* constants: this function is
+  // evaluated in the page and cannot see this file's scope.
+  const isSunoApi = (raw) => {
+    try {
+      if (!raw) return false;
+      const u = new URL(String(raw), location.href);
+      const host = String(u.hostname || '').toLowerCase();
+      return host === 'studio-api-prod.suno.com' || host === 'studio-api.prod.suno.com';
+    } catch (urlErr) {
+      return false;
+    }
+  };
+
+  const urlOf = (input) => {
+    try {
+      if (typeof input === 'string') return input;
+      if (input && typeof input.url === 'string') return input.url;     // Request
+      if (input && typeof input.href === 'string') return input.href;   // URL
+    } catch (inErr) {
+      void inErr;
+    }
+    return '';
+  };
+
+  /**
+   * Read `Authorization` out of whatever header container `fetch` was handed:
+   * a `Headers` instance, a plain object, or an array of `[name, value]` pairs.
+   * All three are legal in the Fetch spec and Suno's own bundle uses more than
+   * one, so supporting only the first would silently miss captures.
+   */
+  const authFromHeaders = (headers) => {
+    if (!headers) return null;
+    try {
+      if (typeof headers.get === 'function') {
+        const v = headers.get('authorization');
+        return typeof v === 'string' ? v : null;
+      }
+    } catch (headersErr) {
+      void headersErr;
+    }
+    try {
+      if (Array.isArray(headers)) {
+        for (let i = 0; i < headers.length; i++) {
+          const pair = headers[i];
+          if (!pair || pair.length < 2) continue;
+          if (String(pair[0]).toLowerCase() === 'authorization') {
+            return typeof pair[1] === 'string' ? pair[1] : null;
+          }
+        }
+        return null;
+      }
+      const keys = Object.keys(headers);
+      for (let i = 0; i < keys.length; i++) {
+        if (keys[i].toLowerCase() === 'authorization') {
+          const v = headers[keys[i]];
+          return typeof v === 'string' ? v : null;
+        }
+      }
+    } catch (plainErr) {
+      void plainErr;
+    }
+    return null;
+  };
+
+  const nativeFetch = window.fetch;
+  const XHR = window.XMLHttpRequest;
+  const nativeOpen = XHR && XHR.prototype ? XHR.prototype.open : null;
+  const nativeSetHeader = XHR && XHR.prototype ? XHR.prototype.setRequestHeader : null;
+
+  // Marker written FIRST (see the JSDoc: at-most-once wrapping beats a
+  // retryable partial install).
+  const installedAt = Date.now();
+  const holder = {
+    version: 1,
+    installedAt,
+    host: String(location.hostname || ''),
+    read: () => ({ token: state.token, at: state.at, hits: state.hits }),
+    hasToken: () => state.token !== null,
+  };
+  try {
+    window.__smAuthTap = holder;
+  } catch (installErr) {
+    out.errors.push('marker write: ' + (installErr && installErr.message ? String(installErr.message) : 'unknown'));
+  }
+  out.installedAt = installedAt;
+
+  if (typeof nativeFetch === 'function') {
+    const wrappedFetch = function () {
+      try {
+        if (isSunoApi(urlOf(arguments[0]))) {
+          const init = arguments[1];
+          if (init && init.headers) record(authFromHeaders(init.headers));
+        }
+      } catch (inspectErr) {
+        // Swallowed on purpose: an inspection failure must not change the
+        // request, so there is nothing here worth reporting to the page.
+        void inspectErr;
+      }
+      // Always call through. `window` is passed explicitly because a detached
+      // `fetch` call must still satisfy fetch's WindowOrWorkerGlobalScope `this`.
+      return nativeFetch.apply(window, arguments);
+    };
+    try {
+      wrappedFetch.__smAuthTapWrapped = true;
+      window.fetch = wrappedFetch;
+      // Verified, not assumed: assigning to a non-writable `window.fetch` is a
+      // SILENT no-op in sloppy mode, and `ok:true` with a fetch hook that is not
+      // there would be the same phantom success this operation exists to avoid.
+      out.fetchHooked = window.fetch === wrappedFetch;
+      if (!out.fetchHooked) {
+        out.errors.push('fetch: window.fetch is not writable, so the hook did not take');
+      }
+    } catch (fetchErr) {
+      out.errors.push('fetch: ' + (fetchErr && fetchErr.message ? String(fetchErr.message) : 'unknown'));
+    }
+  } else {
+    out.errors.push('fetch: window.fetch is not a function');
+  }
+
+  if (typeof nativeOpen === 'function' && typeof nativeSetHeader === 'function') {
+    // WeakMap rather than a property on the XHR instance: it cannot collide
+    // with a page key and cannot be enumerated by page code.
+    const urlByXhr = new WeakMap();
+
+    const wrappedOpen = function (method, url) {
+      try {
+        urlByXhr.set(this, typeof url === 'string' ? url : urlOf(url));
+      } catch (openErr) {
+        void openErr;
+      }
+      return nativeOpen.apply(this, arguments);
+    };
+    const wrappedSetHeader = function (name, value) {
+      try {
+        if (String(name).toLowerCase() === 'authorization' && isSunoApi(urlByXhr.get(this))) {
+          record(value);
+        }
+      } catch (headerErr) {
+        void headerErr;
+      }
+      return nativeSetHeader.apply(this, arguments);
+    };
+    try {
+      wrappedOpen.__smAuthTapWrapped = true;
+      XHR.prototype.open = wrappedOpen;
+      out.xhrOpenHooked = XHR.prototype.open === wrappedOpen;
+    } catch (xhrOpenErr) {
+      out.errors.push('xhr.open: ' + (xhrOpenErr && xhrOpenErr.message ? String(xhrOpenErr.message) : 'unknown'));
+    }
+    try {
+      wrappedSetHeader.__smAuthTapWrapped = true;
+      XHR.prototype.setRequestHeader = wrappedSetHeader;
+      out.xhrHeaderHooked = XHR.prototype.setRequestHeader === wrappedSetHeader;
+    } catch (xhrHeaderErr) {
+      out.errors.push('xhr.setRequestHeader: ' + (xhrHeaderErr && xhrHeaderErr.message ? String(xhrHeaderErr.message) : 'unknown'));
+    }
+  } else {
+    out.errors.push('xhr: XMLHttpRequest.prototype.open/setRequestHeader not available');
+  }
+
+  try {
+    out.hasToken = holder.hasToken();
+  } catch (hasErr) {
+    void hasErr;
+  }
+  out.ok = out.errors.length === 0;
+  return out;
+}
+
+/**
+ * Read the token the tap captured, if any. The cheapest of the MAIN-world
+ * operations — no page dependency beyond the marker, and once the tap is
+ * installed it answers immediately.
+ *
+ * ABSENCE IS NOT FAILURE. A missing tap, or a tap that has not yet seen an
+ * authenticated request, returns `ok:true` with `token:null` and a human
+ * `reason`. It previously returned `ok:false` + `error`, which the content
+ * script surfaced as a red error strip on every page load — so "Suno has not
+ * made a request yet" was displayed as a fault. The worker's own ladder is
+ * unaffected: `tryOp` keys on `isUsableJwt(result.token)`, not on `result.ok`.
+ *
+ * @returns {{ok:boolean, token:string|null, source:'tap'|null, ageMs:number|null,
+ *   hits:number, reason:string|null, error:string|null}}
+ */
+function mainWorldAuthRead() {
+  try {
+    const holder = window.__smAuthTap;
+    if (!holder || holder.version !== 1 || typeof holder.read !== 'function') {
+      return {
+        ok: true,
+        token: null,
+        source: null,
+        ageMs: null,
+        hits: 0,
+        reason: 'no auth tap is installed in this page',
+        error: null,
+      };
+    }
+    const got = holder.read();
+    const token = got && typeof got.token === 'string' ? got.token : null;
+    // Whole-or-nothing: a short or whitespace-bearing value is not a JWT and is
+    // never forwarded.
+    if (!token || token.length < 20 || /\s/.test(token)) {
+      return {
+        ok: true,
+        token: null,
+        source: null,
+        ageMs: null,
+        hits: got && Number.isFinite(Number(got.hits)) ? Number(got.hits) : 0,
+        reason: got && got.hits
+          ? 'auth tap has seen ' + String(got.hits) + ' Authorization header(s) but holds no usable token'
+          : 'auth tap has not captured an Authorization header yet',
+        error: null,
+      };
+    }
+    const at = Number(got.at);
+    return {
+      ok: true,
+      token,
+      source: 'tap',
+      ageMs: Number.isFinite(at) && at > 0 ? Math.max(0, Date.now() - at) : null,
+      hits: got && Number.isFinite(Number(got.hits)) ? Number(got.hits) : 0,
+      reason: null,
+      error: null,
+    };
+  } catch (readErr) {
+    return {
+      ok: false,
+      token: null,
+      source: null,
+      ageMs: null,
+      error: 'auth read failed: ' + (readErr && readErr.message ? String(readErr.message) : 'unknown'),
+    };
+  }
+}
+
+/**
+ * Poll for `window.Clerk` up to `timeoutMs`, then call `session.getToken()`.
+ *
+ * WAITING IS THE FIX FOR THE DOCUMENT-START RACE. The old primary pass injected
+ * with `injectImmediately:true`, i.e. at document_start, read `window.Clerk`
+ * once, found nothing, and gave up: Clerk had not constructed its instance yet.
+ * An un-waiting probe can only ever lose that race, which is why sign-in looked
+ * permanently broken while the user was in fact signed in.
+ *
+ * `timeoutMs` arrives through `executeScript`'s `args`, which is a VALUE
+ * channel, not a code channel — it is safe for a caller to influence, and the
+ * worker validates and clamps it before it gets here.
+ *
+ * @param {number} timeoutMs
+ * @returns {Promise<{ok:boolean, token:string|null, waitedMs:number,
+ *   hasClerk:boolean, error:string|null}>}
+ */
+function mainWorldClerkToken(timeoutMs) {
+  // Poll cadence. 100ms is far below any budget that matters and keeps a 12s
+  // wait at ~120 wakeups. It is a literal here and ONLY here: this function is
+  // stringified and evaluated in the page, so there is no worker-side constant to
+  // keep in step with it — a duplicate would be a constant nothing reads, and a
+  // trap for whoever changes the wrong one.
+  const POLL_MS = 100;
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const limit = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Number(timeoutMs) : 0;
+    let poll = null;
+    let deadline = null;
+    let settled = false;
+    // A `getToken()` call that never settles must not hold the whole op open:
+    // Clerk's promise can outlive any reasonable wait on a hung network.
+    let awaitingToken = false;
+    // Whether Clerk was EVER seen. The deadline has to consult this, otherwise a
+    // page where Clerk simply never loads is misreported as "Clerk was present
+    // but getToken() hung" — a diagnostic that sends the reader down the wrong
+    // path entirely.
+    let seenClerk = false;
+
+    const finish = (payload) => {
+      if (settled) return;
+      settled = true;
+      try { if (poll !== null) clearInterval(poll); } catch (clearPollErr) { void clearPollErr; }
+      try { if (deadline !== null) clearTimeout(deadline); } catch (clearDeadlineErr) { void clearDeadlineErr; }
+      resolve(Object.assign({ waitedMs: Date.now() - started }, payload));
+    };
+
+    const giveUp = (sawClerk) => finish(sawClerk
+      ? {
+        ok: false,
+        token: null,
+        hasClerk: true,
+        error: 'Clerk was present but session.getToken() did not settle within the wait',
+      }
+      : {
+        ok: false,
+        token: null,
+        hasClerk: false,
+        error: 'window.Clerk never appeared within ' + String(limit) + 'ms',
+      });
+
+    deadline = setTimeout(() => giveUp(seenClerk), Math.max(50, limit));
+
+    const attempt = () => {
+      if (settled || awaitingToken) return;
+      let clerk = null;
+      try {
+        clerk = window.Clerk;
+      } catch (accessErr) {
+        void accessErr;
+      }
+      if (clerk && clerk.session && typeof clerk.session.getToken === 'function') {
+        seenClerk = true;
+        awaitingToken = true;
+        let settledHere = false;
+        let pending = null;
+        try {
+          pending = Promise.resolve(clerk.session.getToken());
+        } catch (callErr) {
+          finish({
+            ok: false,
+            token: null,
+            hasClerk: true,
+            error: 'Clerk getToken() threw: ' + (callErr && callErr.message ? String(callErr.message) : 'unknown'),
+          });
+          return;
+        }
+        pending.then(
+          (token) => {
+            if (settledHere) return;
+            settledHere = true;
+            if (typeof token === 'string' && token.length >= 20 && !/\s/.test(token)) {
+              finish({ ok: true, token, hasClerk: true, error: null });
+            } else {
+              finish({
+                ok: false,
+                token: null,
+                hasClerk: true,
+                error: 'Clerk session exists but getToken() returned no usable token — the page is signed out',
+              });
+            }
+          },
+          (err) => {
+            if (settledHere) return;
+            settledHere = true;
+            finish({
+              ok: false,
+              token: null,
+              hasClerk: true,
+              error: 'Clerk getToken() rejected: ' + (err && err.message ? String(err.message) : 'unknown'),
+            });
+          }
+        );
+        return;
+      }
+      if (Date.now() - started >= limit) giveUp(seenClerk);
+    };
+
+    poll = setInterval(attempt, POLL_MS);
+    // First attempt immediately, so a Clerk that is ALREADY present does not
+    // cost one poll interval.
+    attempt();
+  });
+}
+
+/**
+ * Patch the page's `window.MediaSource` so Suno's player falls back to a plain
+ * fetch and the resulting `manifest.m3u8` becomes readable.
+ *
+ * The step order and the per-step guards below are the contract recorded in
+ * `content/content.js` §20 and are reproduced exactly, because each one exists
+ * to make the page RESTORABLE:
+ *
+ *   1. `__smHlsActive` short-circuit. A second patch must not clobber
+ *      `__smHlsSavedMS` — the restore would then put back an already-overwritten
+ *      value and permanently destroy the real `MediaSource`.
+ *   2. `__smHlsActive = true`.
+ *   3. `__smHlsHadMS = ('MediaSource' in window)`, recorded BEFORE the write: a
+ *      page that never had the property must be restored by DELETING it, not by
+ *      assigning it.
+ *   4. `__smHlsSavedMS = window.MediaSource` in its own try/catch, so a throwing
+ *      getter aborts neither the patch nor the flag recording.
+ *   5. `window.MediaSource = undefined` in its own try/catch, so a non-writable
+ *      property is reported as a patch error instead of throwing the whole
+ *      operation away half-applied — the flags are already set, so the restore
+ *      still has everything it needs.
+ *
+ * @returns {{ok:boolean, patched:boolean, alreadyActive:boolean,
+ *   hadMediaSource:boolean, error:string|null}}
+ */
+function mainWorldHlsPatch() {
+  const out = {
+    ok: false,
+    patched: false,
+    alreadyActive: false,
+    hadMediaSource: false,
+    error: null,
+  };
+  try {
+    if (window.__smHlsActive) {
+      out.alreadyActive = true;
+      out.ok = true;
+      return out;
+    }
+  } catch (guardErr) {
+    out.error = 're-entry guard threw: ' + (guardErr && guardErr.message ? String(guardErr.message) : 'unknown');
+    return out;
+  }
+
+  try { window.__smHlsActive = true; } catch (flagErr) {
+    out.error = 'could not set __smHlsActive: ' + (flagErr && flagErr.message ? String(flagErr.message) : 'unknown');
+    return out;
+  }
+  try {
+    window.__smHlsHadMS = 'MediaSource' in window;
+    out.hadMediaSource = window.__smHlsHadMS === true;
+  } catch (hadErr) {
+    out.error = 'could not record __smHlsHadMS: ' + (hadErr && hadErr.message ? String(hadErr.message) : 'unknown');
+  }
+  try { window.__smHlsSavedMS = window.MediaSource; } catch (saveErr) {
+    out.error = (out.error ? out.error + '; ' : '')
+      + 'could not save MediaSource: ' + (saveErr && saveErr.message ? String(saveErr.message) : 'unknown');
+  }
+  try {
+    window.MediaSource = undefined;
+    // VERIFY the write landed. Assignment to a non-writable property is a
+    // SILENT no-op in sloppy mode, so trusting it would reproduce the exact
+    // "reported success but did nothing" failure this whole operation exists to
+    // eliminate — the same lie the CSP-blocked inline script used to tell.
+    if (window.MediaSource !== undefined) {
+      out.error = 'MediaSource is not writable; the page still exposes it, so the patch did not land';
+    } else {
+      out.patched = true;
+    }
+  } catch (patchErr) {
+    out.error = (out.error ? out.error + '; ' : '')
+      + 'MediaSource is not writable: ' + (patchErr && patchErr.message ? String(patchErr.message) : 'unknown');
+  }
+  out.ok = out.patched;
+  return out;
+}
+
+/**
+ * Undo `mainWorldHlsPatch`. Safe to call any number of times, including after
+ * zero, one or two patches — the flags are the source of truth and are always
+ * cleared, so a failed patch is always undoable and a repeated restore is a
+ * no-op.
+ *
+ * The both-branches-in-one-try/catch below is deliberate: a failure to restore
+ * must still REACH the flag-clearing step, or the page is left both broken and
+ * un-restorable by the next attempt.
+ *
+ * @returns {{ok:boolean, restored:boolean, note:string, error:string|null}}
+ */
+function mainWorldHlsRestore() {
+  const out = { ok: false, restored: false, note: '', error: null };
+  let active = false;
+  try {
+    active = window.__smHlsActive === true;
+  } catch (readErr) {
+    out.note = 'notActive';
+    out.error = 'could not read __smHlsActive: ' + (readErr && readErr.message ? String(readErr.message) : 'unknown');
+    return out;
+  }
+  if (!active) {
+    // Reported as `notActive` rather than success: a restore with nothing to
+    // undo must not claim credit over a patch that never landed.
+    out.note = 'notActive';
+    out.ok = true;
+    return out;
+  }
+
+  let hadMS = false;
+  try { hadMS = window.__smHlsHadMS === true; } catch (hadErr) { void hadErr; }
+
+  try {
+    if (hadMS) {
+      window.MediaSource = window.__smHlsSavedMS;
+      out.note = 'restored';
+      out.restored = true;
+    } else {
+      // The page had NO MediaSource before the patch, so the patch CREATED the
+      // property (as `undefined`). Restoring means deleting it again — not
+      // leaving a property the page never had. The re-check below catches a
+      // delete that silently failed.
+      delete window.MediaSource;
+      if ('MediaSource' in window && window.MediaSource !== undefined) {
+        window.MediaSource = undefined;
+        out.note = 'deleteFailed';
+        out.error = 'delete window.MediaSource did not take effect; property left as undefined';
+      } else {
+        out.note = 'deleted';
+        out.restored = true;
+      }
+    }
+  } catch (restoreErr) {
+    out.error = 'restore step failed: ' + (restoreErr && restoreErr.message ? String(restoreErr.message) : 'unknown');
+  }
+
+  try {
+    delete window.__smHlsActive;
+  } catch (flagErr) {
+    void flagErr;
+    try { window.__smHlsActive = false; } catch (flagFallbackErr) { void flagFallbackErr; }
+  }
+  try { delete window.__smHlsHadMS; } catch (clearHadErr) { void clearHadErr; }
+  try { delete window.__smHlsSavedMS; } catch (clearSavedErr) { void clearSavedErr; }
+
+  out.ok = out.error === null || out.note === 'deleteFailed';
+  return out;
+}
+
+/**
+ * The op -> function map. EXACT keys, looked up with
+ * `Object.prototype.hasOwnProperty` (never inherited lookup) so `constructor`,
+ * `toString` and friends cannot resolve to something.
+ *
+ * `Object.freeze` prevents the map being mutated by a later route; it does NOT
+ * seal the prototype chain, which is exactly why the exact-key guard exists.
+ *
+ * @type {Readonly<Record<string,Function>>}
+ */
+const MAIN_WORLD_OPS = Object.freeze({
+  probe: mainWorldProbe,
+  'auth-tap': mainWorldAuthTap,
+  'auth-read': mainWorldAuthRead,
+  'clerk-token': mainWorldClerkToken,
+  'hls-patch': mainWorldHlsPatch,
+  'hls-restore': mainWorldHlsRestore,
+});
+
+/** Every op this build can run in a page, for the diagnostics reply. */
+const MAIN_WORLD_OP_NAMES = Object.freeze(Object.keys(MAIN_WORLD_OPS));
+
+/**
+ * Validate and clamp a caller-supplied `clerk-token` timeout.
+ *
+ * `args` is a VALUE channel, so this cannot inject code — but it is still
+ * caller-influenced, and an object, a string or a NaN must not reach the page.
+ * Coerce, then reject anything not finite, then clamp into
+ * [CLERK_WAIT_MIN_MS, CLERK_WAIT_MAX_MS].
+ *
+ * @param {unknown} value
+ * @returns {number}
+ */
+function validateClerkTimeout(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return CLERK_WAIT_DEFAULT_MS;
+  return clampNumber(num, CLERK_WAIT_MIN_MS, CLERK_WAIT_MAX_MS, CLERK_WAIT_DEFAULT_MS);
+}
+
+/**
+ * Run one MAIN-world op in a specific tab. This is the worker's INTERNAL entry
+ * point — `runMainWorldOp` is the route wrapper, and `mintAuthToken` calls this
+ * directly because it must drive tabs other than the caller's own.
+ *
+ * @param {string} op exact key into `MAIN_WORLD_OPS`
+ * @param {number} tabId
+ * @param {object} [payload] caller payload; only `timeoutMs` is ever read
+ * @returns {Promise<{ok:true, op:string, result:object}|{ok:false, code:string, error:string}>}
+ */
+async function injectMainWorldOp(op, tabId, payload) {
+  if (typeof op !== 'string' || !Object.prototype.hasOwnProperty.call(MAIN_WORLD_OPS, op)) {
+    return { ok: false, code: 'bad_op', error: 'unknown MAIN-world op: ' + String(op).slice(0, 40) };
+  }
+  if (!Number.isFinite(tabId)) {
+    return { ok: false, code: 'no_tab', error: 'no tab id to run a MAIN-world op in' };
+  }
+
+  const args = [];
+  if (op === 'clerk-token') args.push(validateClerkTimeout(payload && payload.timeoutMs));
+
+  let results = null;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      // Immediate, because these ops are called on demand from a warm tab, not
+      // as document-start hooks. `clerk-token` supplies its own document-start
+      // tolerance by polling INSIDE the page.
+      injectImmediately: true,
+      func: MAIN_WORLD_OPS[op],
+      args,
+    });
+  } catch (injectErr) {
+    // `describeError().message`, not the whole object: the reply's `error` is
+    // rendered as text by content.js (`String(msg)`), and "[object Object]" is
+    // not a diagnostic.
+    return { ok: false, code: 'inject_failed', error: describeError(injectErr).message };
+  }
+
+  if (!Array.isArray(results) || results.length === 0) {
+    return { ok: false, code: 'inject_failed', error: 'executeScript returned no results' };
+  }
+  const first = results[0];
+  const result = first && typeof first === 'object' ? first.result : undefined;
+  if (!result || typeof result !== 'object') {
+    return { ok: false, code: 'inject_failed', error: 'executeScript reported success but returned no result object' };
+  }
+  return { ok: true, op, result };
+}
+
+/**
+ * The `RUN_MAIN_WORLD` route body.
+ *
+ * WHY THIS ROUTE EXISTS: inline script injection from a content script is
+ * CSP-blocked on suno.com (see §5b), so the page-side work — the auth tap, the
+ * Clerk read, the MediaSource patch — has to be driven from here.
+ *
+ * The op is resolved by EXACT key from `MAIN_WORLD_OPS`. There is no `eval`,
+ * no `new Function`, and no string-to-function path anywhere in this build: the
+ * page is never handed code as text, it is handed one of six functions this
+ * file already contains.
+ *
+ * The tab is the CALLER'S OWN tab (`sender.tab`), unlike `mintAuthToken`, which
+ * has to guess. An extension page has no `sender.tab` and is therefore refused
+ * with `no_tab` — correct, because this route exists for content scripts and
+ * the worker drives its own tabs through `injectMainWorldOp` instead.
+ *
+ * @param {object} payload `{op: string, timeoutMs?: number}`
+ * @param {chrome.runtime.MessageSender} sender
+ * @returns {Promise<{ok:true, op:string, result:object}|{ok:false, code:string, error:string}>}
+ */
+async function runMainWorldOp(payload, sender) {
+  const op = payload && typeof payload.op === 'string' ? payload.op : '';
+
+  const tabId = sender && sender.tab && Number.isFinite(sender.tab.id) ? sender.tab.id : null;
+  if (tabId === null) {
+    return {
+      ok: false,
+      code: 'no_tab',
+      error: 'the caller has no tab; RUN_MAIN_WORLD is a content-script route',
+    };
+  }
+
+  // Defence in depth: `validateSender` already gated this message, but this is
+  // the one route that injects into a page, so the sender URL is re-checked
+  // here rather than assumed.
+  const senderUrl = sender && typeof sender.url === 'string' ? sender.url : '';
+  let trusted = false;
+  for (const pattern of TRUSTED_PAGE_PATTERNS) {
+    if (pattern.test(senderUrl)) {
+      trusted = true;
+      break;
+    }
+  }
+  if (!trusted) {
+    return { ok: false, code: 'forbidden', error: 'sender url is not allowlisted for page injection' };
+  }
+
+  return injectMainWorldOp(op, tabId, payload);
+}
+
+/**
+ * Structured record of the last failed mint, surfaced by `GET_DIAGNOSTICS` and
+ * `GET_BOOT` so the next "not signed in" report is answerable without guesswork.
+ *
+ * It records WHICH op was reached and what each op returned — deliberately not
+ * the token material any op may have seen. Everything in here is a description
+ * of the search, never a credential.
+ *
+ * @type {{at:number, reason:string, tabsFound:number, tabsTried:number,
+ *   tabIds:number[], usedTabId:number|null, tapInstalled:boolean,
+ *   reachedOp:string|null, steps:Array<{op:string, tabId:number|null,
+ *   ok:boolean, code:string|null, error:string|null}>}|null}
+ */
+let lastAuthFailure = null;
+
+/**
+ * Drop the cached "minting in progress" promise. Called from a `finally`, so a
+ * FAILURE can never be cached in a way that blocks later retries: the previous
+ * code cleared the field inside `.then` and inside `.catch`, which is correct
+ * only while both exist and would silently wedge every future mint if either
+ * were ever removed.
+ *
+ * @returns {void}
+ */
+function clearTokenMintInFlight() {
+  tokenMintInFlight = null;
 }
 
 /* ==========================================================================
@@ -4529,17 +5804,53 @@ async function retryFailedBatch() {
 
 /** @type {AbortController|null} live sync; recreated per worker wake. */
 let syncController = null;
+/** @type {number|null} watchdog timer for the current crawl. */
+let syncWatchdogTimer = null;
+/** True when the watchdog (not the user) aborted the current run. */
+let syncWatchdogFired = false;
+/**
+ * Clear the sync watchdog timer if one is armed. Never throws.
+ */
+function clearWatchdog() {
+  if (syncWatchdogTimer !== null) {
+    clearTimeout(syncWatchdogTimer);
+    syncWatchdogTimer = null;
+  }
+  syncWatchdogFired = false;
+}
+/**
+ * True once a cancel has been signalled for the CURRENT run.
+ *
+ * Aborting is cooperative, so a second press is a normal thing to do — the user
+ * cannot see whether the first one landed. Without this the second press
+ * repeated the first press's log line verbatim, which read as the button being
+ * broken rather than as "already stopping".
+ */
+let syncCancelRequested = false;
 
 /**
- * A resumable crawl.
+ * Start the crawl. `runSync` is fire-and-forget; this returns immediately.
  *
- * - The cursor is written to `syncState` after EVERY page, so an evicted worker
- *   resumes instead of restarting.
+ * INVARIANTS THE CRAWL KEEPS (each one is a bug this build fixed):
+ *
+ * - EVERY project from `/api/project/me` is walked, `default` included. A
+ *   `workspace:'default'` walk alone reached 3,444 of ~5,500 clips on the recon
+ *   account and reported success, because the clips in every other project were
+ *   never requested.
+ * - `POST /api/feed/v3` pages by CURSOR, and the cursor is written to `syncState`
+ *   after EVERY page, so an evicted worker resumes instead of restarting. It
+ *   resumes at WORKSPACE granularity: `iterateFeed` accepts no `startCursor`
+ *   (it accepts and explicitly ignores `startPage`), so completed workspaces are
+ *   skipped entirely and the workspace that was in flight is re-walked from
+ *   `cursor:null`. Writes are additive and idempotent by clip id, so that is
+ *   safe, just not free.
  * - Each page is committed with `clips.putMany` (ONE transaction per page, never
- *   one per clip).
+ *   one per clip), and `project/feed` is walked ONCE per sync rather than once
+ *   per hydrating batch.
  * - `clips.clear()` is NEVER called. A forced rebuild buffers and then uses
- *   `clips.bulkReplace`, which is a single atomic transaction: an abort leaves
- *   the previous library completely intact.
+ *   `clips.bulkReplace`, which is a single atomic transaction, and only when the
+ *   crawl COMPLETED — replacing a library with a truncated one would delete the
+ *   clips the crawl never reached. An abort leaves the previous library intact.
  * - `maxPages` is honoured and reported. A user with 3,000 clips must not
  *   silently lose 2,000 to a page cap, so truncation is surfaced everywhere.
  *
@@ -4549,12 +5860,11 @@ let syncController = null;
 async function startSync(options) {
   await loadSettings();
   if (syncController) {
+    log('warn', 'sync.start_rejected_running', {});
     return { ok: false, error: 'a sync is already running', code: 'sync_running' };
   }
-  syncController = new AbortController();
-  const signal = syncController.signal;
-  const settings = settingsCache;
 
+  const settings = settingsCache;
   const mode = ['include', 'exclude', 'both'].indexOf(options.dislikedMode) >= 0
     ? String(options.dislikedMode)
     : settings.dislikedMode;
@@ -4562,92 +5872,1320 @@ async function startSync(options) {
   const maxPages = Number.isFinite(requestedMaxPages) && requestedMaxPages > 0
     ? Math.floor(requestedMaxPages)
     : settings.syncMaxPages;
+  const feedPageLimit = resolveFeedPageLimit(settings.feedPageLimit, DEFAULT_SETTINGS.feedPageLimit);
+  const total = await DB.clips.count();
 
-  const reply = {
-    ok: true,
-    force: options.force === true,
-    dislikedMode: mode,
-    maxPages,
-    // `total` is the library size on disk so the UI can show "x of y".
-    total: await DB.clips.count(),
-    state: 'running',
-  };
+  let reply;
+  try {
+    syncController = new AbortController();
+    syncCancelRequested = false;
+    const watchdogStart = Date.now();
+    syncWatchdogTimer = setTimeout(() => {
+      const elapsedMs = Date.now() - watchdogStart;
+      log('error', 'sync.watchdog_fired', { elapsedMs });
+      syncWatchdogFired = true;
+      if (syncController && !syncController.signal.aborted) {
+        syncController.abort();
+      }
+    }, SYNC_WALL_CLOCK_MS);
 
-  void runSync({
-    force: options.force === true,
-    mode,
-    maxPages,
-    signal,
-  }).catch((err) => {
+    reply = {
+      ok: true,
+      force: options.force === true,
+      dislikedMode: mode,
+      maxPages,
+      feedPageLimit,
+      total,
+      state: 'running',
+    };
+
+    log('info', 'sync.started', {
+      force: options.force === true,
+      mode,
+      maxPages,
+      feedPageLimit,
+      total,
+    });
+
+    void broadcast({
+      type: 'SYNC_STARTED',
+      state: 'running',
+      running: true,
+      cancelRequested: false,
+      force: options.force === true,
+      dislikedMode: mode,
+      maxPages,
+      feedPageLimit,
+      total,
+      heartbeatAt: Date.now(),
+    });
+
+    void runSync({
+      force: options.force === true,
+      mode,
+      maxPages,
+      feedPageLimit,
+      signal: syncController.signal,
+    }).catch((err) => {
+      const info = describeError(err);
+      log('error', 'sync.threw', { error: info });
+      syncController = null;
+      syncCancelRequested = false;
+      clearWatchdog();
+      void broadcast({
+        type: 'SYNC_ERROR',
+        ...syncContractView(null, {
+          completed: false,
+          stopReason: isAbortLike(err) ? 'aborted' : 'page_failed',
+          error: info.message,
+          state: isAbortLike(err) ? 'cancelled' : 'error',
+          expectedTotal: 0,
+          examined: 0,
+          uniqueSeen: 0,
+          missing: 0,
+          oracleApplied: false,
+          advisory: 'the run failed before it could measure anything',
+          workspaces: [],
+          pagesDone: 0,
+        }),
+        projectList: null,
+        projectFeed: null,
+        dislikedCount: null,
+        dislikedApproximate: false,
+      });
+    });
+  } catch (err) {
     const info = describeError(err);
-    log('error', 'sync.threw', { error: info });
-    void broadcast({ type: 'SYNC_ERROR', error: info.message });
-  });
+    log('error', 'sync.start_failed', { error: info });
+    syncController = null;
+    syncCancelRequested = false;
+    clearWatchdog();
+    void broadcast({
+      type: 'SYNC_ERROR',
+      ...syncContractView(null, {
+        completed: false,
+        stopReason: 'page_failed',
+        error: info.message,
+        state: 'error',
+        expectedTotal: 0,
+        examined: 0,
+        uniqueSeen: 0,
+        missing: 0,
+        oracleApplied: false,
+        advisory: 'the run failed before it could measure anything',
+        workspaces: [],
+        pagesDone: 0,
+      }),
+      projectList: null,
+      projectFeed: null,
+      dislikedCount: null,
+      dislikedApproximate: false,
+    });
+    return { ok: false, error: info.message, code: 'sync_start_failed' };
+  }
 
   return reply;
 }
 
 /**
- * The crawl itself.
- * @param {{force:boolean, mode:string, maxPages:number, signal:AbortSignal}} opts
+ * EVERY project on the account, by paging `/api/project/me`.
+ *
+ * WHY THIS EXISTS, AND WHY IT IS NOT `fetchProjects`: `fetchProjects()` requests
+ * no query at all, so the server answers with page 1 — 20 projects. That is the
+ * entire list only on an account with <= 20 projects. On the recon account it
+ * was 20 of 25, and the five it dropped were five whole libraries. The route is
+ * documented as `{num_total_results, current_page, projects:[…]}`, and
+ * `num_total_results` is the PROJECT COUNT, which is exactly the completeness
+ * oracle a multi-workspace crawl needs. So this walks it until the advertised
+ * count is reached, and reports `complete:false` when it cannot prove it reached
+ * the end. A partial project list must never be reported as a finished one: the
+ * run would then claim `completed:true` over a library it never looked at.
+ *
+ * @param {{signal?:AbortSignal, maxPages?:number}} opts
+ * @returns {Promise<{projects:Array<object>, complete:boolean, pagesDone:number,
+ *   expectedProjects:number|null, stopReason:string, error:string|null}>}
+ */
+async function fetchAllProjects(opts = {}) {
+  const signal = opts.signal || null;
+  const maxPages = Number.isFinite(opts.maxPages) && opts.maxPages > 0
+    ? Math.floor(opts.maxPages)
+    : PROJECT_LIST_MAX_PAGES;
+  const projects = [];
+  const seenIds = new Set();
+  const seenPages = new Set();
+  let page = 1;
+  let pagesDone = 0;
+  let expectedProjects = null;
+  let complete = true;
+  let stopReason = 'complete';
+  let error = null;
+
+  while (pagesDone < maxPages) {
+    if (signal && signal.aborted) {
+      complete = false;
+      stopReason = 'aborted';
+      error = 'the project list walk was cancelled';
+      break;
+    }
+    if (seenPages.has(page)) {
+      complete = false;
+      stopReason = 'page_failed';
+      error = `/api/project/me repeated page ${page}: pagination is stuck`;
+      break;
+    }
+    seenPages.add(page);
+
+    /* The query is the one the 1.0.0 build shipped (legacy-1.0.0/extension/lib/
+     * api.js:247). `page` is the only field the route's own envelope documents
+     * as pagination; `sort`, `show_trashed` and `exclude_shared` are carried
+     * forward verbatim rather than invented here. */
+    const envelope = await SunoAPIClient.request(SunoAPI.ENDPOINTS.projectMe, {
+      method: 'GET',
+      query: { page, sort: 'created_at', show_trashed: 'false', exclude_shared: 'false' },
+      signal,
+    });
+    if (!envelope.ok) {
+      const aborted = isAbortLike(envelope.error) || !!(signal && signal.aborted);
+      complete = false;
+      stopReason = aborted ? 'aborted' : 'page_failed';
+      error = aborted
+        ? 'the project list walk was cancelled'
+        : `/api/project/me page ${page} failed: HTTP ${envelope.status || 0}`;
+      break;
+    }
+
+    const data = envelope.data && typeof envelope.data === 'object' ? envelope.data : null;
+    const batch = data && Array.isArray(data.projects) ? data.projects : null;
+    if (!batch) {
+      complete = false;
+      stopReason = 'page_failed';
+      error = `/api/project/me page ${page} carried no projects array`;
+      break;
+    }
+    if (data.current_page !== undefined && data.current_page !== null
+      && Number(data.current_page) !== page) {
+      complete = false;
+      stopReason = 'page_failed';
+      error = `/api/project/me page mismatch: asked for ${page}, received ${data.current_page}`;
+      break;
+    }
+    pagesDone += 1;
+    for (const project of batch) {
+      const id = project && project.id !== undefined && project.id !== null ? String(project.id) : '';
+      if (!id || seenIds.has(id)) continue;
+      seenIds.add(id);
+      projects.push({
+        id,
+        name: typeof project.name === 'string' ? project.name : '',
+        // THIS project's own oracle. `expectedClipTotal` sums them for the run,
+        // and each walk is compared against its own project so a short walk is
+        // never excused by a generous sibling.
+        clipCount: typeof project.clip_count === 'number' ? project.clip_count : null,
+      });
+    }
+    /* Up to 100 pages on a large account, and it is the FIRST thing a sync does —
+     * so without this the opening of every crawl is a silent gap that reads as a
+     * hung extension. Same reasoning as the `project/feed` walk's `onProgress`. */
+    if (typeof onProgress === 'function') {
+      safeCallback(onProgress, {
+        phase: 'planning',
+        pagesDone,
+        discovered: projects.length,
+        expectedProjects,
+      });
+    }
+
+    const advertised = Number(data.num_total_results);
+    if (Number.isFinite(advertised) && advertised >= 0) {
+      if (expectedProjects !== null && advertised !== expectedProjects) {
+        // The project list changed under the walk, so the set we hold is neither
+        // the old one nor the new one and cannot be called complete.
+        complete = false;
+        stopReason = 'page_failed';
+        error = `/api/project/me project count changed mid-walk (${expectedProjects} -> ${advertised})`;
+        break;
+      }
+      expectedProjects = Math.floor(advertised);
+    }
+    if (expectedProjects !== null && projects.length >= expectedProjects) {
+      stopReason = 'complete';
+      break;
+    }
+    if (expectedProjects === null && batch.length < PROJECT_LIST_PAGE_HINT) {
+      // No advertised total and a short page. Stopping here is the only option,
+      // but it is NOT proof that the list ended, so it is reported incomplete.
+      complete = false;
+      stopReason = 'page_failed';
+      error = '/api/project/me advertised no num_total_results, so the project list cannot be proven complete';
+      break;
+    }
+    page += 1;
+  }
+
+  if (complete && pagesDone >= maxPages && (expectedProjects === null || projects.length < expectedProjects)) {
+    complete = false;
+    stopReason = 'max_pages';
+    error = `the project list walk hit its ${maxPages}-page cap with ${projects.length} of `
+      + `${expectedProjects === null ? 'an unknown number of' : expectedProjects} projects`;
+  }
+
+  return { projects, complete, pagesDone, expectedProjects, stopReason, error };
+}
+
+/**
+ * The workspaces the crawl will walk, in a stable order, always including
+ * `default`.
+ *
+ * WHY `default` IS FORCED IN: `/api/project/me` always carries it on a real
+ * account, but a list that arrives without it (trashed projects excluded by a
+ * future default, a partial page) must not lose the unassigned clips that live
+ * there. It is APPENDED to the discovered order rather than substituted, so a
+ * genuinely empty list still produces exactly one walk and a normal list keeps
+ * the server's own ordering.
+ *
+ * @param {Array<{id:string,name:string,clipCount:number|null}>} projects
+ * @returns {Array<{id:string,name:string,clipCount:number|null}>}
+ */
+function buildWorkspacePlan(projects) {
+  const plan = [];
+  const seen = new Set();
+  for (const project of Array.isArray(projects) ? projects : []) {
+    const id = project && project.id !== undefined && project.id !== null ? String(project.id) : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    plan.push({ id, name: (project.name || id), clipCount: project.clipCount });
+  }
+  if (!seen.has('default')) {
+    plan.push({ id: 'default', name: 'My Workspace', clipCount: null });
+  }
+  return plan;
+}
+
+/**
+ * One workspace's outcome, in the exact shape the UIs read.
+ *
+ * `missing` starts as `null` — "not measured" — and only becomes a number where
+ * something actually compared this walk's total against a count. A row with no
+ * comparable count at all (no `clip_count`, or a walk of a different row set)
+ * stays `null` with `oracleApplied:false` and an `advisory` saying why, because
+ * `0` would be a claim — "I checked and found nothing missing" — that nothing
+ * checked.
+ *
+ * WHERE THIS USED TO DIVERGE FROM THE RUN, AND WHAT FIXED IT: `missing` was a
+ * number ONLY when `oracleApplied` was true, which on the default filtered
+ * settings is never — so a workspace that indexed 10-20% of its library reported
+ * `completed:true` and no shortfall at all. The comparison is now made for every
+ * workspace that HAS a comparable count, and `oracleApplied` answers the narrower
+ * and different question it always meant to: "is the count apples-to-apples with
+ * this filtered walk?". `shortfallLikelyFilters` carries the size of the gap so a
+ * reader can tell a trashed/disliked accounting difference from a feed that
+ * stopped early without having to re-derive either.
+ *
+ * @param {{projectId:string,name:string,expected:number|null,disliked:string,
+ *   oracleApplied:boolean,advisory:string|null}} init
+ * @returns {object}
+ */
+function newWorkspaceOutcome(init) {
+  const oracleApplied = init.oracleApplied === true;
+  const hasCount = Number.isFinite(init.expected) && init.expected >= 0;
+  return {
+    projectId: init.projectId,
+    name: init.name,
+    completed: false,
+    pagesDone: 0,
+    totalSeen: 0,
+    expected: hasCount ? init.expected : null,
+    missing: hasCount ? init.expected : null,
+    oracleApplied,
+    advisory: oracleApplied ? null : (init.advisory || null),
+    stopReason: null,
+    /* WHAT THE WALK ITSELF SAID, kept separately from `stopReason`.
+     *
+     * WHY TWO FIELDS: the shortfall block below replaces `stopReason` with
+     * `'expected_total'`, and that replacement destroys the one fact the run-level
+     * verdict needs in order to tell truncation from an ordinary shortfall —
+     * whether this walk ended on the feed's OWN end-of-feed signal (a cursor field
+     * that was present and null) or on a failure (a page error, a stuck cursor, a
+     * page cap). Reading it back off `stopReason` after the overwrite reports
+     * every short workspace as a failure, and `suspected_truncation` can then never
+     * fire — which is the verdict that matters most here.
+     *
+     * So: `walkStopReason` is the CLIENT's summary, verbatim, and is never
+     * rewritten. `stopReason` is the row's final verdict. */
+    walkStopReason: null,
+    error: null,
+    disliked: init.disliked,
+    /* True only when this row is short AND the gap is small enough to be the
+     * filter accounting (see `SHORTFALL_FILTER_CAUSE_SHARE`). Filled in by
+     * `crawlWorkspace` once the walk's total is known. */
+    shortfallLikelyFilters: false,
+    /* The full-page signal, carried off the walk's summary. `lastPageFull` means
+     * "the server filled the page we asked for and then said there was no more",
+     * which is visible evidence of truncation and is published rather than acted
+     * upon. */
+    pagesFull: 0,
+    lastPageSize: 0,
+    lastPageFull: false,
+  };
+}
+
+/**
+ * Walk ONE workspace to its end, committing and persisting after every page.
+ *
+ * Never throws. One failing workspace must not abort the other 19: that is the
+ * difference between "4,400 clips and one broken project" and "nothing", and the
+ * per-workspace row is what lets the summary NAME the broken one.
+ *
+ * @param {object} params
+ * @param {{id:string,name:string,clipCount:number|null}} params.project
+ * @param {string} params.disliked the server-side tri-state filter
+ * @param {number} params.maxPages per-workspace page cap
+ * @param {number} params.limit page size, already resolved from
+ *   `settings.feedPageLimit` by the caller
+ * @param {boolean} params.includeTrashed
+ * @param {AbortSignal} params.signal
+ * @param {Set<string>} params.uniqueSink ids to accumulate, mutated here. The
+ *        CALLER chooses the set, which is how phase 2 keeps its own tallies out
+ *        of the run's: its ids land in the disliked set, not in `totalSeen`.
+ * @param {number|null} params.expected the count that DESCRIBES THIS WALK, or
+ *        null when none does. Published on the row even when the comparison
+ *        cannot be FATAL (a filtered walk still benefits from "this project says
+ *        275, the walk saw 274"); null for the `disliked:'only'` walk, whose rows
+ *        are a different set and whose `clip_count` describes something it never
+ *        asks for. A row WITH a count is always compared against it — see the
+ *        shortfall block at the end of this function.
+ * @param {boolean} [params.oracleFatal] may this walk's shortfall be treated as
+ *        PROOF that the library is short, i.e. may it be worded as a checked
+ *        shortfall rather than a lower bound? TRUE only for a genuinely
+ *        unfiltered walk against a project that reported a `clip_count`. FALSE
+ *        for (a) the `disliked:'only'` walk, which by construction returns far
+ *        fewer rows than the project holds, (b) any walk whose server-side
+ *        filters hide rows that a project row count probably still includes, and
+ *        (c) a project whose `clipCount` is `null`, which has no oracle at all.
+ *        It no longer decides WHETHER a shortfall fails the walk — only how the
+ *        verdict is worded — and that is the whole point of the change.
+ * @param {string} [params.oracleAdvisory] why the oracle is not fatal here
+
+ * @param {(outcome:object, page:{projectId:string,page:number,clips:object[]})=>Promise<void>} params.onPage
+ * @param {(summary:object, projectId:string)=>void} [params.onSummary]
+ * @returns {Promise<object>} the workspace outcome row
+ */
+async function crawlWorkspace(params) {
+  const { project, disliked, maxPages, limit, includeTrashed, signal } = params;
+  const uniqueSink = params.uniqueSink instanceof Set ? params.uniqueSink : new Set();
+  log('info', 'sync.workspace_start', { projectId: project.id, name: project.name });
+  /* A WORKSPACE SHORT OF ITS OWN COUNT IS INCOMPLETE, AND `oracleApplied` ALONE
+   * IS NOT WHAT DECIDES THAT.
+   *
+   * `project.clip_count` is a PROJECT ROW COUNT and the walk is a FILTERED
+   * request: on the default settings the walk sends `filters.trashed:'False'` and
+   * `filters.disliked:'False'`, so it cannot return trashed or disliked rows, and
+   * nothing in the wire contract says `clip_count` omits them. That mismatch is
+   * real, and it is why the count is handed to `iterateFeed` as `expectedTotal`
+   * only when the two are comparable — otherwise the CLIENT would flip itself to
+   * `completed:false / 'expected_total'` permanently, by exactly the number of
+   * trashed + disliked rows, which is the "looks broken forever" failure this crawl
+   * was rebuilt to fix.
+   *
+   * But "the comparison is not apples-to-apples" is not the same statement as
+   * "a shortfall must be ignored", and collapsing the two is how a crawl that
+   * indexed 10-20% of the library came to report `completed:true`. So the count is
+   * NOT handed to the client when it is only a lower bound — and OUR row still
+   * compares against it, at the end of this function, where the wording can be
+   * chosen per row. `oracleApplied` is published per row either way, so a reader
+   * can tell "checked, apples-to-apples" from "checked, lower bound". */
+  const hasExpectedCount = Number.isFinite(params.expected) && params.expected >= 0;
+  const oracleFatal = params.oracleFatal === true && hasExpectedCount;
+  const expected = Number.isFinite(params.expected) && params.expected >= 0
+    ? Math.floor(params.expected)
+    : null;
+  const outcome = newWorkspaceOutcome({
+    projectId: project.id,
+    name: project.name,
+    // The count is PUBLISHED whenever one describes this walk, even when it
+    // cannot be enforced: "this project says 275, the walk saw 274" is worth
+    // showing. `missing` is the part that must not be invented — see below.
+    expected,
+    disliked,
+    oracleApplied: oracleFatal,
+    /* THE CALLER OWNS THE ROW SENTENCE: it is the only party that knows WHY this
+     * walk was not checked (a filtered pass, a disjoint `'only'` walk, a plan
+     * entry with no count), and the fallback covers the case where it said
+     * nothing. `oracleFatal` rows get no sentence — they were checked. */
+    advisory: params.oracleAdvisory || (oracleFatal ? null
+      : `workspace ${project.id} has no comparable clip_count for this walk`),
+  });
+  const onPage = typeof params.onPage === 'function' ? params.onPage : async () => {};
+  const onSummary = typeof params.onSummary === 'function' ? params.onSummary : () => {};
+
+  /* ROWS THIS WALK HAS ACCEPTED, counted here as well as in the client, and
+   * whether a client summary ever arrived.
+   *
+   * `outcome.totalSeen` is normally OVERWRITTEN by the summary batch
+   * (`seenIds.size`, de-duplicated within the walk) and that figure is the one
+   * `crawlInto` reconciles `examined` against. An ABORTED walk never reaches that
+   * summary: the loop below breaks straight after `onPage`, abandoning the
+   * generator before it yields one, so the only carrier of `totalSeen` was never
+   * read. The row then reported `totalSeen: 0` beside the pages it had just
+   * committed, and `crawlInto` reconciled `examined` against that zero — throwing
+   * away rows already in the database and reporting a run that examined fewer clips
+   * than it had written. `acceptedRows` is the floor for that case: it counts the
+   * same rows `afterPage` already added to `examined`, so reconciliation can never
+   * land below the rows actually persisted. A summary still wins where there is
+   * one, which leaves the normal path bit-for-bit unchanged. */
+  let acceptedRows = 0;
+  let summarySeen = false;
+
+  try {
+    const iterator = SunoAPIClient.iterateFeed({
+      /* WHY SCOPE IS `workspace` AND NOT `all`, PER PROJECT: `scope:'all'` drops
+       * the workspace filter and IS the documented way to read the whole library
+       * in one walk — but it cannot be compared against a per-project oracle, and
+       * it is not what the web app does when a project is open. This crawl
+       * enumerates the projects itself (which is what makes the clips outside
+       * `default` reachable) and then walks each one exactly as the app would. */
+      scope: 'workspace',
+      workspaceId: project.id,
+      disliked,
+      includeTrashed: includeTrashed === true,
+      limit,
+      maxPages,
+      /* THIS project's `clip_count`, never the account-wide sum — and only when
+       * the two measure the same set (see `oracleFatal`). Passing a count the
+       * walk cannot possibly meet is precisely how a filtered walk comes to
+       * report itself incomplete forever. It is the SAME number the row publishes
+       * as `expected`, so the client's verdict and ours are about one figure. */
+      expectedTotal: oracleFatal ? expected : null,
+      signal,
+    });
+    /* `startPage` IS DELIBERATELY NOT PASSED, and there is no pass-through to
+     * remove on this side: this call is the ONLY `iterateFeed` call in the build,
+     * `hydrate()` has never accepted the option, and no route forwards it. The
+     * option died with the v2 page walk — `/api/feed/v3` pages by cursor, so
+     * "resume at page N" is not expressible and the client would only ignore it
+     * (see `SunoAPI#iterateFeed` in lib/api.js, which keeps a warn-and-ignore
+     * guard so an OLDER caller that still sends one hears about it once instead
+     * of silently resuming from the wrong place). Resume here is the persisted
+     * cursor and the workspace plan, both written above `crawlInto`'s
+     * reconciliation. */
+    /* ROWS THIS WALK HAS ACCEPTED, counted here as well as in the client.
+     *
+     * `outcome.totalSeen` is normally OVERWRITTEN by the client's own summary
+     * (`seenIds.size`, de-duplicated within the walk) and that figure is the one
+     * `crawlInto` reconciles `examined` against. An ABORTED walk never reaches that
+     * summary: the loop below breaks straight after `onPage`, abandoning the
+     * generator before it yields one, so the only carrier of `totalSeen` was never
+     * read. The row then reported `totalSeen: 0` beside the pages it had just
+     * committed, and `crawlInto` reconciled `examined` against that zero — throwing
+     * away 100 rows already in the database and reporting a run that examined fewer
+     * clips than it wrote. This counter is the floor for that case: it is the same
+     * rows `afterPage` already added to `examined`, so reconciliation can never
+     * land below the rows actually persisted. A summary still wins where there is
+     * one, which leaves the normal path bit-for-bit unchanged. */
+    for await (const batch of iterator) {
+      /* The summary is read FIRST, including when the signal has fired: it is
+       * the only thing that carries `totalSeen` and the authoritative
+       * `completed`, and dropping it on cancel would report "no clips" for a
+       * workspace that indexed thousands. */
+      if (batch.type === 'summary') {
+        outcome.completed = batch.completed === true;
+        outcome.pagesDone = Number.isFinite(batch.pagesDone) ? batch.pagesDone : outcome.pagesDone;
+        outcome.totalSeen = Number.isFinite(batch.totalSeen) ? batch.totalSeen : outcome.totalSeen;
+        outcome.stopReason = batch.stopReason || outcome.stopReason || 'complete';
+        outcome.walkStopReason = outcome.stopReason;
+        if (batch.error) outcome.error = describeError(batch.error).message;
+        /* The full-page signal and the cursor spelling, straight off the client's
+         * own summary. `cursorAlias` is the direct answer to "is the field called
+         * what the bundle says?" — a name other than `next_cursor` means the
+         * bundle was wrong, and a null here with `stopReason:'cursor_missing'`
+         * means the parser found nothing at all. */
+        outcome.cursorAlias = batch.cursorAlias === undefined ? null : batch.cursorAlias;
+        outcome.pagesFull = Number.isFinite(batch.pagesFull) ? batch.pagesFull : outcome.pagesFull;
+        outcome.lastPageSize = Number.isFinite(batch.lastPageSize) ? batch.lastPageSize : outcome.lastPageSize;
+        outcome.lastPageFull = batch.lastPageFull === true;
+        /* "The final page had N of 100 clips", carried onto the row so a surface
+         * can say that instead of "we do not know". NEVER A VERDICT: the client
+         * does not read it, this file does not read it, and the walk that produced
+         * it reported `completed:false`. It is published so a future surface has
+         * a fact rather than an absence — see the note on `endOfFeedEvidence` in
+         * lib/api.js for why nothing may branch on it. */
+        outcome.endOfFeedEvidence = typeof batch.endOfFeedEvidence === 'string' ? batch.endOfFeedEvidence : null;
+        /* THE AUTOMATIC CURSOR-LESS PROBE — see `maybeAutoProbeFeed`.
+         *
+         * GATED ON THE CLIENT'S OWN ERROR CODE, not on a stop reason and not on a
+         * counter: `cursor_missing` is the page-with-clips-and-no-cursor case and
+         * `empty_page_no_cursor` is the 0-clips-and-no-cursor case, which are the
+         * only two that mean "this page had no cursor field under any spelling I
+         * know". An abort, a page failure, a page cap, a stuck cursor and a walk
+         * that simply ended on a null cursor are all reachable with a code outside
+         * that set, and none of them is the question the probe answers.
+         *
+         * `completed` is asserted false alongside it as a second, redundant guard:
+         * the one branch in the client that can set `completed` is the one that
+         * found a cursor field present and null, so this can only ever be an
+         * incomplete walk — but a probe that ever fired on a completed one would be
+         * a probe of a page that is already known to work, and that is the old
+         * useless measurement this exists to replace.
+         *
+         * `batch.stopCursor` is the token the FAILING request was sent with, so the
+         * probe asks for that page and not for page 1. */
+        const stopCode = batch.error && typeof batch.error.code === 'string' ? batch.error.code : null;
+        if (outcome.completed !== true && CURSOR_LESS_STOP_CODES.indexOf(stopCode) >= 0) {
+          maybeAutoProbeFeed({
+            workspaceId: project.id,
+            cursor: batch.stopCursor,
+            limit,
+            includeTrashed: includeTrashed === true,
+            dislikedWire: dislikedWireValue(disliked),
+            stopReason: batch.stopReason || null,
+            endOfFeedEvidence: outcome.endOfFeedEvidence,
+            /* The client's own measurement of the failing page, read straight off
+             * the error rather than off the log. `SunoApiError.evidence` is
+             * caller-attached (see lib/api.js), and this is the caller that
+             * attached it. */
+            evidence: batch.error && batch.error.evidence ? batch.error.evidence : null,
+            signal,
+          });
+        }
+        summarySeen = true;
+        onSummary(batch, project.id);
+        break;
+      }
+      if (signal && signal.aborted) {
+        /* A page the server ALREADY sent is never discarded: the request was
+         * paid for, its rows are real, and writing them is idempotent. The walk
+         * is then left to the client, which stops at the top of its own loop and
+         * reports `stopReason:'aborted'` on the summary this consumer reads
+         * next. Discarding the page here instead would let a cancel mid-page
+         * silently drop up to `limit` clips that had already arrived. */
+        outcome.stopReason = outcome.stopReason || 'aborted';
+        outcome.walkStopReason = outcome.walkStopReason || 'aborted';
+        outcome.error = outcome.error || 'the crawl was cancelled';
+      }
+      const pageClips = Array.isArray(batch.clips) ? batch.clips : [];
+      outcome.pagesDone = Number.isFinite(batch.pagesDone) ? batch.pagesDone : outcome.pagesDone + 1;
+      acceptedRows += pageClips.length;
+      for (const clip of pageClips) {
+        const id = clip && clip.id !== undefined && clip.id !== null ? String(clip.id) : '';
+        if (id) uniqueSink.add(id);
+      }
+      await onPage(outcome, {
+        projectId: project.id,
+        page: Number.isFinite(batch.page) ? batch.page : outcome.pagesDone,
+        clips: pageClips,
+      });
+      if (signal && signal.aborted) break;
+    }
+    if (!outcome.stopReason) outcome.stopReason = outcome.completed ? 'complete' : 'page_failed';
+    if (!outcome.walkStopReason) outcome.walkStopReason = outcome.stopReason;
+  } catch (err) {
+    /* A first-page failure THROWS out of the client (nothing was indexed, so
+     * there is nothing to keep). It becomes THIS workspace's row, not the run's:
+     * the other 19 projects still get walked. */
+    const info = describeError(err);
+    const aborted = isAbortLike(err);
+    outcome.completed = false;
+    outcome.stopReason = aborted ? 'aborted' : 'page_failed';
+    outcome.walkStopReason = outcome.stopReason;
+    outcome.error = aborted ? 'the crawl was cancelled' : info.message;
+    log('warn', 'sync.workspace_failed', { projectId: project.id, error: info });
+  }
+
+  /* NO SUMMARY BATCH ARRIVED — an abort is the ordinary way to get here, and a
+   * mid-walk throw is the other. Either way this workspace committed pages, so it
+   * must not report `totalSeen:0` and must not let `crawlInto` reconcile
+   * `examined` against zero: the run would then report examining fewer clips than
+   * it wrote, which is the claim the row above was making. `stopReason` is not
+   * touched — an aborted walk still says `'aborted'`, and this only corrects the
+   * COUNT beside it. A summary, when there is one, still wins: it is the client's
+   * own de-duplicated figure and is what the oracle was designed around. */
+  if (!summarySeen) outcome.totalSeen = acceptedRows;
+
+  /* A WORKSPACE SHORT OF ITS OWN `clip_count` IS INCOMPLETE, ALWAYS.
+   *
+   * The previous arrangement made this conditional on `oracleFatal`, i.e. on
+   * `oracleApplied`, which on the default settings is false on EVERY sync: the
+   * crawl sends `filters.trashed:'False'` and `filters.disliked:'False'`, so no
+   * walk and no project row count were ever declared comparable. The consequence
+   * was that a walk which indexed 10-20% of a workspace and ended on a full page
+   * reported `completed:true`, with `missing:null` to say the gap was never even
+   * measured. The filter accounting argument is real — a handful of trashed or
+   * disliked rows can legitimately make a filtered walk come up short — but it
+   * cannot explain a gap two orders of magnitude larger, and it must never be able
+   * to turn "my index is short" into "Up to date".
+   *
+   * So the comparison is now made for every workspace that HAS a comparable
+   * count, `missing` is published whenever one exists, and:
+   *   - `completed` becomes false and `stopReason:'expected_total'` on any gap;
+   *   - `shortfallLikelyFilters` is true when the gap is small enough to be the
+   *     filter accounting (`SHORTFALL_FILTER_CAUSE_SHARE`), which is what lets
+   *     the copy say "this may be trashed/disliked clips, OR truncation — try a
+   *     lower page limit" instead of asserting a cause it cannot support;
+   *   - a gap large enough to rule the filters out says so, and names the next
+   *     action (`PROBE_FEED`) rather than just the word "incomplete".
+   *
+   * An ALREADY-FAILED workspace keeps its own reason (`page_failed`,
+   * `cursor_missing`, `aborted`, …): this block only supplies a reason where
+   * there is none, because "the feed stopped on a parser miss" is a better
+   * diagnosis than "you are 900 clips short" and both are true. */
+  const hasCount = Number.isFinite(outcome.expected) && outcome.expected >= 0;
+  if (hasCount) {
+    const shortBy = Math.max(0, Math.floor(outcome.expected) - outcome.totalSeen);
+    outcome.missing = shortBy;
+    outcome.shortfallLikelyFilters = shortBy > 0
+      && !oracleFatal
+      && shortBy <= Math.max(1, Math.floor(Math.floor(outcome.expected) * SHORTFALL_FILTER_CAUSE_SHARE));
+    if (shortBy > 0) {
+      outcome.completed = false;
+      if (outcome.stopReason === 'complete' || !outcome.stopReason) outcome.stopReason = 'expected_total';
+      outcome.error = outcome.error || (outcome.shortfallLikelyFilters
+        ? `workspace ${project.id} ended at ${outcome.totalSeen} of ${outcome.expected} clips. This `
+          + "small gap may be trashed or disliked clips this walk's filters hide, or a truncated "
+          + `feed — try a lower feedPageLimit (currently ${limit}) and sync again`
+        : `workspace ${project.id} ended at ${outcome.totalSeen} of ${outcome.expected} clips, and the `
+          + `gap is far larger than the trashed/disliked rows these filters hide. Run PROBE_FEED to `
+          + 'check the feed page size and cursor field, then sync again');
+    } else if (oracleFatal) {
+      // Checked and met: `missing:0` is a real answer, and `stopReason` stays
+      // whatever the walk itself concluded.
+      outcome.missing = 0;
+    }
+  }
+  /* NOT `else { outcome.missing = 0 }`: without a comparable count there is no
+   * `missing` to report, and a hard `0` is a claim — "checked, found nothing
+   * missing" — that nothing here checked. `newWorkspaceOutcome` already left it
+   * `null` with `oracleApplied:false` and the sentence saying why. */
+  log('info', 'sync.workspace_done', {
+    projectId: project.id,
+    pages: outcome.pagesDone || 0,
+    seen: outcome.totalSeen || 0,
+    expected: outcome.expected,
+    completed: outcome.completed,
+    stopReason: outcome.stopReason,
+  });
+  return outcome;
+}
+
+/**
+ * Drop any row already recorded for a project id. Used when a workspace is
+ * re-walked after an eviction: its earlier partial row must not survive next to
+ * the new, complete one, or the summary would carry two rows for one project.
+ *
+ * @param {object[]} rows
+ * @param {string} projectId
+ * @returns {void}
+ */
+function dropWorkspaceRow(rows, projectId) {
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    if (rows[i].projectId === projectId) rows.splice(i, 1);
+  }
+}
+
+/**
+ * The `filters.disliked` string the walk actually puts ON THE WIRE.
+ *
+ * WHY THIS IS NOT JUST `libraryFilter`: whether the completeness oracle may be
+ * fatal depends on whether the walk was UNFILTERED, and "unfiltered" is a
+ * property of the string the SERVER receives (`'Any'`), not of the mode key this
+ * file uses internally (`'any'`). `DISLIKED_FILTER_BY_MODE` hands `iterateFeed`
+ * the lowercase key and the client normalises it (`normalizeDislikedFilter`), so
+ * the normalisation is MIRRORED here rather than assumed: if the two ever
+ * disagreed, a filtered walk would be judged against an unfiltered row count —
+ * which is the whole defect this exists to prevent. Duplicating a four-branch
+ * string map is a far smaller cost than a silently fatal comparison.
+ *
+ * @param {string} filter the value handed to `iterateFeed`
+ * @returns {'Any'|'True'|'False'} what `filters.disliked` will be
+ */
+function dislikedWireValue(filter) {
+  const key = String(filter === undefined || filter === null ? 'exclude' : filter).trim().toLowerCase();
+  if (key === 'any' || key === 'include' || key === 'all' || key === 'both') return 'Any';
+  if (key === 'only' || key === 'true' || key === 'disliked') return 'True';
+  return 'False';
+}
+
+/**
+ * A stored row, cleaned of the fields a v3 crawl has no meaning for.
+ *
+ * WHY THIS EXISTS BESIDE THE SCHEMA CHECK: `resumable` compares
+ * `stored.schema`, and the merge below is `Object.assign({}, freshCursor,
+ * stored || {})` — where STORED WINS. So the schema marker is the only thing
+ * standing between a resumed row and a stale `nextPage`/`pass` landing on the
+ * fresh cursor, and a version check is a single number that a future edit, a
+ * hand-patched row or a partial write can invalidate. The fields are therefore
+ * normalised BY NAME, which does not depend on the marker being right.
+ *
+ * The values are set to `null` rather than deleted, because `DB.syncState.set`
+ * MERGES its patch into the stored row (lib/db.js): omitting a key leaves the old
+ * one in place, and the explicit `null` in `freshCursor` exists for that same
+ * reason. Deleting here would let the legacy value survive the next write.
+ *
+ * @param {object|null} stored the row as read, or null
+ * @returns {object|null} a shallow copy safe to resume from, or null
+ */
+function normaliseResumedCursor(stored) {
+  if (!stored || typeof stored !== 'object') return null;
+  const row = Object.assign({}, stored);
+  for (const field of LEGACY_PAGE_FIELDS) row[field] = null;
+  return row;
+}
+
+/**
+ * The stored row as it goes on the wire.
+ *
+ * WHY `nextPage` IS STRIPPED RATHER THAN NULLED: it is read by nothing — a
+ * cursor walk resumes at WORKSPACE granularity and the page ordinal means
+ * nothing to `/api/feed/v3` — so every value it could carry is useless, and
+ * publishing `nextPage: 0` invites a reader to treat "page 0" as a position.
+ * It was null in the stored row already; keeping the name on the wire at all was
+ * the defect.
+ *
+ * WHY `advisory` IS ADDED UNDER ITS OWN NAME: the stored row spells the sentence
+ * `oracleAdvisory`, because that is what it is next to, and `cursorForWire`
+ * publishes the row nearly verbatim. The flat contract copy on the same reply
+ * (`syncContractView`) calls the same sentence `advisory`, so a reader that
+ * followed the "the contract is mirrored one level down" comment and read
+ * `cursor.advisory` got `undefined` while `advisory` was sitting right there at
+ * the top level. No shipped surface hit it — all three read the flat copy — but a
+ * trap is a trap. Both spellings now resolve: `advisory` is ADDED (the flat
+ * name), and `oracleAdvisory` is left in place so nothing that reads the stored
+ * spelling is broken by it.
+ *
+ * @param {object|null} cursor the stored row
+ * @returns {object|null} the row plus the `error` and `advisory` aliases, minus
+ *   the dead fields
+ */
+function cursorForWire(cursor) {
+  if (!cursor || typeof cursor !== 'object') return null;
+  const view = Object.assign({}, cursor, { error: cursor.lastError || null });
+  for (const field of LEGACY_PAGE_FIELDS) delete view[field];
+  // `advisory` is OPTIONAL in the sense that matters: it is always present on the
+  // wire, and `null` when there is nothing to say, which is what the flat copy
+  // publishes too. A legacy row has no `oracleAdvisory` and reads `null`.
+  view.advisory = typeof cursor.oracleAdvisory === 'string' && cursor.oracleAdvisory
+    ? cursor.oracleAdvisory
+    : (typeof cursor.advisory === 'string' && cursor.advisory ? cursor.advisory : null);
+  return view;
+}
+
+/**
+ * THE SYNC-SUMMARY CONTRACT, built once so every reply carries exactly the same
+ * keys with exactly the same meanings.
+ *
+ * WHY ONE BUILDER AND NOT SIX HAND-WRITTEN PAYLOADS: `SYNC_DONE` (normal and
+ * abort), `SYNC_ERROR` (both paths), `GET_BOOT.sync` and `SYNC_STATUS` were six
+ * separate literals, and they had already drifted — the abort path dropped
+ * `projectList`/`projectFeed`/`dislikedCount`, `SYNC_ERROR` dropped `truncated`
+ * — so `truncated === !completed` was not even checkable everywhere, and one
+ * reply published `totalSeen` as the unique count while the stored cursor of the
+ * same name held the examined count. A single builder makes the invariant
+ * structural instead of a convention that has to be re-remembered per literal.
+ *
+ * THE THREE NUMBERS, ONE NAME EACH:
+ *   `totalSeen`   UNIQUE clips indexed. What the user is waiting for and what
+ *                 "5,501 of ~5,500" has to mean.
+ *   `uniqueSeen`  the same number under its own name, so nothing has to guess
+ *                 which of the two a given reply used.
+ *   `examined`    rows EXAMINED, a clip in two projects counted twice. What the
+ *                 oracle (`sum of clip_count`) is compared against, because the
+ *                 sum double-counts the same clip the same way.
+ * `missing` is therefore `expectedTotal - examined`, which is why emitting the
+ * unique count under `totalSeen` next to an examined-based `missing` produced
+ * "1 clip is missing" on a library that had every clip.
+ *
+ * `missing` is AUTHORITATIVE whenever it is a number, `0` included: a
+ * `missing:0` beside `expectedTotal:5502` means "checked, nothing missing", and
+ * a reader that re-derives `expectedTotal - totalSeen` there gets a phantom
+ * shortfall. Deriving from `examined` happens only when the row carries no
+ * `missing` at all, so a stored row from an older build still reports something
+ * truthful instead of nothing.
+ *
+ * `truncated` is computed as `!completed` here and nowhere else, so the flag can
+ * never disagree with the verdict it summarises.
+ *
+ * `stopReason` IS A CLOSED VOCABULARY, and every value in it is actionable. The
+ * full list, in the order a reader should weigh them:
+ *   'complete'               the server said there was no more. Success.
+ *   'resumed'                a workspace was carried forward from an earlier run
+ *                            instead of being re-walked.
+ *   'suspected_truncation'   EVERY workspace ended on the feed's own end-of-feed
+ *                            signal and EVERY one of them is short of its
+ *                            `clip_count`. The feed is being cut short, not the
+ *                            library being small. Copy must name `PROBE_FEED` /
+ *                            a lower `feedPageLimit`.
+ *   'cursor_missing'         the feed response carried no cursor field this
+ *                            client recognises, so the walk could not be
+ *                            continued. A parser miss, loudly — never "finished".
+ *   'page_failed'            a page failed after at least one page had landed.
+ *   'empty_page'             a page carried 0 clips while a usable cursor was
+ *                            still on offer.
+ *   'stuck_cursor'           the server repeated a cursor already followed.
+ *   'no_new_ids'             a page advanced the cursor but added no new clip id.
+ *   'max_pages'              the page cap ended the walk with a cursor outstanding.
+ *   'expected_total'         the run came up short of the count it compared
+ *                            against — a project row count, or the project list.
+ *   'aborted'                the user cancelled. Not a fault.
+ * Anything else is a bug in the producer: render it as an unknown failure and
+ * show `error`, never as a success.
+ *
+ * @param {object|null} cursor the stored row, when there is one
+ * @param {object} [overrides] values this reply knows and the row does not yet
+ *        (the live run's figures on the failure paths). Presence, not
+ *        truthiness, is what selects an override — `missing: 0` overrides.
+ * @returns {object} the contract, same keys and same meanings on every reply
+ */
+function syncContractView(cursor, overrides) {
+  const row = cursor && typeof cursor === 'object' ? cursor : {};
+  const over = overrides && typeof overrides === 'object' ? overrides : {};
+  const has = (key) => Object.prototype.hasOwnProperty.call(over, key);
+  const pick = (key, fallback) => (has(key) ? over[key] : (row[key] === undefined ? fallback : row[key]));
+  const count = (key) => Math.max(0, numOr(pick(key, 0)));
+
+  const completed = pick('completed', false) === true;
+  const expectedTotal = count('expectedTotal');
+  const examined = count('examined');
+  const uniqueSeen = count('uniqueSeen');
+  const missingRaw = pick('missing', null);
+  const missing = Number.isFinite(missingRaw)
+    ? Math.max(0, missingRaw)
+    : Math.max(0, expectedTotal - examined);
+  const stopReasonRaw = pick('stopReason', null);
+  const errorRaw = has('error')
+    ? over.error
+    : (typeof row.error === 'string' && row.error ? row.error : row.lastError);
+  const stateRaw = pick('state', null);
+  const advisoryRaw = has('advisory') ? over.advisory : row.oracleAdvisory;
+  const workspacesRaw = pick('workspaces', []);
+
+  /* WHICH PHASE, so a surface that POLLS (`SYNC_STATUS`, `GET_BOOT`) shows the
+   * same thing as one that listens for `SYNC_PROGRESS` pushes. Without it the
+   * three surfaces disagreed during the long mapping walk — the push-driven ones
+   * had a note and the polling one said "starting", which is the confusion the
+   * user reported. */
+  const phaseRaw = pick('phase', null);
+  const phase = typeof phaseRaw === 'string' && phaseRaw ? phaseRaw : null;
+
+  return {
+    phase,
+    phasePagesDone: count('phasePagesDone'),
+    phaseJoined: count('phaseJoined'),
+    phaseItems: count('phaseItems'),
+    completed,
+    truncated: !completed,
+    stopReason: typeof stopReasonRaw === 'string' && stopReasonRaw
+      ? stopReasonRaw
+      : (completed ? 'complete' : null),
+    error: typeof errorRaw === 'string' && errorRaw ? errorRaw : null,
+    expectedTotal,
+    totalSeen: uniqueSeen,
+    uniqueSeen,
+    examined,
+    missing,
+    /* `oracleApplied` says whether the walk and the count measure the SAME SET:
+     * it is false when the walk was filtered, so a shortfall may be rows the
+     * filters removed rather than rows the crawl missed, and false when the server
+     * reported no count to check against. It is the WORDING switch, not the
+     * verdict: a shortfall fails the run either way (see `runSync`'s verdict
+     * block), and `advisory` is the human sentence for the caveat — kept in its
+     * own key because `error` is a failure and this is not one. */
+    oracleApplied: pick('oracleApplied', false) === true,
+    advisory: typeof advisoryRaw === 'string' && advisoryRaw ? advisoryRaw : null,
+    /* TRUE when every workspace that reported a count came up short AND its gap
+     * is small enough to be the trashed/disliked rows the walk's filters hide
+     * (`SHORTFALL_FILTER_CAUSE_SHARE`). The UI's licence to hedge: "this may be
+     * trashed/disliked clips, or truncation — try a lower page limit". FALSE with
+     * a shortfall means the gap is far too large for that, and the copy should
+     * point at `PROBE_FEED` instead. */
+    shortfallLikelyFilters: pick('shortfallLikelyFilters', false) === true,
+    /* THE FULL-PAGE SIGNAL. Published, never enforced: `pagesFull` counts pages
+     * that filled the requested `limit`, and `lastPageFull` says whether the run
+     * finished on one of them. A run that ends on a full page is worth showing to
+     * the user as such, because "ended on a full page of 100" and "reached the
+     * end of the library" look identical in every other number on this contract. */
+    pagesFull: count('pagesFull'),
+    lastPageSize: count('lastPageSize'),
+    lastPageFull: pick('lastPageFull', false) === true,
+    /* At least ONE workspace ended on a full page — the weaker, and more useful,
+     * of the two full-page readings for a UI: "some workspace's last page came
+     * back full and the feed then said there was no more". */
+    anyWorkspaceEndedFull: pick('anyWorkspaceEndedFull', false) === true,
+    feedPageLimit: count('feedPageLimit'),
+    /* THE TWO FACTS `suspected_truncation` IS DERIVED FROM, published so a reader
+     * can re-derive the verdict instead of trusting the wording:
+     *   everyWorkspaceShort   every workspace with a count came up short
+     *   endedOnTerminalCursor every walk reported the feed's own end-of-feed signal
+     * Both true is the truncation shape; neither is a guess about which. */
+    everyWorkspaceShort: pick('everyWorkspaceShort', false) === true,
+    endedOnTerminalCursor: pick('endedOnTerminalCursor', false) === true,
+    workspaces: Array.isArray(workspacesRaw) ? workspacesRaw : [],
+    state: typeof stateRaw === 'string' && stateRaw
+      ? stateRaw
+      : (completed ? 'idle' : 'incomplete'),
+    pagesDone: count('pagesDone'),
+  };
+}
+
+/**
+ * The crawl itself: every project, one walk each, de-duplicated across
+ * projects, resumable, and never silently incomplete.
+ *
+ * WHY PER-WORKSPACE AND NOT ONE `scope:'all'` WALK: the library is not one list.
+ * `/api/project/me` reported 3,444 clips in `default` on the recon account and
+ * ~5,500 across all of it, because a clip lives in the project it was generated
+ * into and the other projects (202, 574, 372, 75, 288 …) are never returned by a
+ * `workspace:'default'` walk. Walking `default` alone is what left ~2,000 clips
+ * permanently unreachable while the sync reported success. Enumerating the
+ * projects and walking each one is the only shape in which the summed oracle can
+ * actually be met.
+ *
+ * @param {{force:boolean, mode:string, maxPages:number, feedPageLimit:number,
+ *   signal:AbortSignal}} opts
  * @returns {Promise<void>}
  */
 async function runSync(opts) {
-  const { force, mode, maxPages, signal } = opts;
+  const { force, mode, maxPages, feedPageLimit, signal } = opts;
   const startedAt = Date.now();
+  /* The page size EVERY walk in this run asks for. It arrives as a value from
+   * `startSync` (already resolved through `resolveFeedPageLimit`) and is never
+   * re-derived here: the ceiling lives in `lib/api.js` and the setting lives in
+   * this file's settings, and the one caller that knows both resolves it once. */
+  const feedLimit = resolveFeedPageLimit(feedPageLimit, SunoAPI.LIMITS.feedPageLimit);
+  const includeTrashed = false;
+  /* The library walk's filter, resolved once at the top because the oracle's
+   * scope depends on it and the decision is made before the project list exists.
+   * `DISLIKED_FILTER_BY_MODE` is the only source of it, so the mode → filter
+   * mapping still has exactly one definition. */
+  const libraryFilter = DISLIKED_FILTER_BY_MODE[mode] || 'exclude';
+  /* The oracle's verdict on this run, and the sentence explaining it. Declared
+   * with their defaults BEFORE anything that can throw, because the failure path
+   * broadcasts them: a `let` still in its temporal dead zone there would turn a
+   * sync error into a `ReferenceError`. */
+  let oracleApplied = false;
+  let oracleAdvisory = null;
 
   const freshCursor = {
-    nextPage: 0,
+    schema: SYNC_CURSOR_SCHEMA,
+    mode,
+    maxPages,
+    includeTrashed,
+    /* The page size this run asked for, persisted for DIAGNOSIS ONLY. It is
+     * deliberately NOT part of the `resumable` predicate below: changing it
+     * mid-crawl changes nothing about which workspaces are finished or what the
+     * plan is, and refusing to resume because a user nudged a page size would
+     * turn a cosmetic change into a full re-walk. */
+    feedPageLimit: feedLimit,
+
+    /* The v2-era cursor fields, explicitly NULLed. `DB.syncState.set` MERGES its
+     * patch into the stored row, so merely omitting them would leave a legacy
+     * `nextPage`/`pass` visible on a row that no longer has those semantics.
+     * `cursorForWire` keeps them off the wire as well, because a published field
+     * that can only ever be `0` or `null` is a resume position that means
+     * nothing to a cursor walk. */
+    nextPage: null,
     pass: null,
+    /* --- the crawl plan (v3 shape) --------------------------------- */
+    projectIds: [],
+    projectNames: {},
+    nextProjectIndex: 0,
+    projectsDone: [],
+    /* `{projectId: nextCursor}`. The client publishes `nextCursor` only on the
+     * walk's SUMMARY, i.e. at the END of a workspace, and `iterateFeed` accepts
+     * NO `startCursor` option (it accepts and explicitly ignores `startPage`).
+     * So the cursors are recorded for diagnosis and for a future client that can
+     * accept one, but THIS worker resumes at WORKSPACE granularity: workspaces
+     * already in `projectsDone` are not re-walked at all, and the workspace that
+     * was in flight is re-walked from `cursor:null`. Writing are additive and
+     * idempotent by clip id, so re-walking is safe, just not free. */
+    cursors: {},
+    dislikedProjectsDone: [],
+    /* --- progress + the completeness contract ----------------------- */
     pagesDone: 0,
+    /* THE THREE TALLIES, THREE NAMES, THREE MEANINGS:
+     *   `totalSeen`  UNIQUE clips indexed — what the user is waiting for, and
+     *                 what every reply publishes under that name.
+     *   `uniqueSeen` the same number, under its own name, so a reader never has
+     *                 to work out which of two spellings a given reply used.
+     *   `examined`   rows EXAMINED with repeats included: a clip that lives in
+     *                 two projects is walked twice and counted twice, because
+     *                 `expectedTotal` is the SUM of per-project `clip_count`
+     *                 and that sum counts the same clip twice. It is therefore
+     *                 the ONLY tally `missing` may be computed from. */
     totalSeen: 0,
-    truncated: false,
+    uniqueSeen: 0,
+    examined: 0,
+    expectedTotal: 0,
+    missing: 0,
+    /* Was `missing` CHECKED against the oracle, or merely reported? Persisted
+     * because the UIs read it and must not treat an unchecked lower bound as a
+     * shortfall. `oracleAdvisory` is the same fact as a sentence, kept apart
+     * from `lastError` because it is not a failure. */
+    oracleApplied: false,
+    oracleAdvisory: null,
+    completed: false,
+    truncated: true,
+    stopReason: null,
+    lastError: null,
+    workspaces: [],
+    dislikedWorkspaces: [],
     dislikedCount: null,
     dislikedApproximate: false,
-    lastError: null,
-    maxPages,
-    mode,
+    projectList: null,
+    projectFeed: null,
+    /* --- run bookkeeping -------------------------------------------- */
     state: 'running',
+    force,
+    startedAt,
   };
-  const stored = force ? null : await DB.syncState.get('feed', null);
+
+  /* Normalised BEFORE the merge so the row that wins the `Object.assign` below
+   * cannot carry a page-era field. `Object.assign({}, freshCursor, stored)` lets
+   * STORED win on every colliding key, so `nextPage`/`pass` would otherwise be
+   * applied to a cursor walk that has no pages to resume from. The schema check
+   * in `resumable` is the primary defence and this is the one that does not
+   * depend on a version number being correct. */
+  const stored = force ? null : normaliseResumedCursor(await DB.syncState.get('feed', null));
+  log('info', 'sync.cursor_loaded', {
+    resumed: !!stored && stored.state === 'running',
+    storedState: stored ? stored.state : null,
+    pagesDone: stored ? (stored.pagesDone || 0) : 0,
+    projectsDone: stored ? (Array.isArray(stored.projectsDone) ? stored.projectsDone.length : 0) : 0,
+  });
   const cursor = Object.assign({}, freshCursor, stored || {});
-  // A cursor written by a different mode/maxPages cannot be resumed honestly.
-  if (stored && (cursor.mode !== mode || cursor.maxPages !== maxPages)) {
-    log('info', 'sync.cursor_incompatible', { wasMode: cursor.mode, wasMaxPages: cursor.maxPages });
-    cursor.nextPage = 0;
-    cursor.pass = null;
-    cursor.pagesDone = 0;
-    cursor.totalSeen = 0;
+  /* Resumability is a claim about the SAME crawl, so it is only honoured when
+   * every part of the plan agrees: the cursor shape, the state, the mode, the
+   * page cap, and — checked once the project list is in — the project plan
+   * itself.
+   *
+   * `state === 'running'` and nothing else is resumable. It is the one state an
+   * EVICTED worker leaves behind, because the last thing such a worker wrote was
+   * a page write, and a page write always records `running`. A run that reached a
+   * verdict — `idle`, `incomplete`, `error`, `cancelled` — is NOT resumed, and
+   * that is deliberate: skipping the workspaces a previous run completed would
+   * mean a sync could never see a clip created in one of them, which is the same
+   * class of bug as the v2 `nextPage` resume (a fresh sync starting at page 21
+   * of a walk that had already finished) only quieter. */
+  const resumable = !!(stored
+    && stored.schema === SYNC_CURSOR_SCHEMA
+    && stored.state === 'running'
+    && stored.mode === mode
+    && stored.maxPages === maxPages
+    && Array.isArray(stored.projectIds)
+    && Array.isArray(stored.projectsDone)
+    /* A row that claims this schema but carries no `examined` tally is not a row
+     * this build wrote, and resuming from it would restart the examined count at
+     * 0 while skipping the workspaces that produced it — i.e. report a shortfall
+     * of every clip already on disk. Cheap to check, and it makes a corrupt row
+     * restart instead of lie. */
+    && Number.isFinite(stored.examined));
+
+  /* The run's own locals, declared HERE so `runCtx()` below can read them.
+   *
+   * TDZ, and it is worth stating plainly because it bit this twice: `projectsDone`
+   * and `added` used to be declared hundreds of lines further down, while the first
+   * `reportSyncPhase('planning', …)` call sat above them. Reading a `let` inside its
+   * temporal dead zone throws `ReferenceError` — and `typeof` does NOT save you, as
+   * it would for an undeclared name. So the declarations that the phase reporter
+   * needs must precede its first call. */
+  let projectsDone = resumable ? stored.projectsDone.slice() : [];
+  let added = 0;
+  const runCtx = () => ({ cursor, added, projectsDone });
+  if (stored && !resumable) {
+    log('info', 'sync.cursor_not_resumed', {
+      wasSchema: stored.schema === undefined ? null : stored.schema,
+      wasState: stored.state || null,
+      wasMode: stored.mode || null,
+      wasMaxPages: stored.maxPages === undefined ? null : stored.maxPages,
+    });
+    Object.assign(cursor, freshCursor);
   }
+  cursor.schema = SYNC_CURSOR_SCHEMA;
   cursor.mode = mode;
   cursor.maxPages = maxPages;
+  cursor.feedPageLimit = feedLimit;
+  cursor.includeTrashed = includeTrashed;
   cursor.state = 'running';
+  cursor.heartbeatAt = Date.now();
   cursor.force = force;
   cursor.startedAt = startedAt;
 
-  /* ---- projects: the ONLY source of "workspace" membership ---------- */
-  let projects = [];
+  /* ---- projects: the only source of BOTH membership and the oracle --- */
+  /* The run's own locals, handed to `reportSyncPhase` because that helper is at
+   * module scope and cannot close over them. */
+  await reportSyncPhase('planning', { note: 'listing your workspaces' }, runCtx());
+  const projectList = await fetchAllProjects({ signal, maxPages: PROJECT_LIST_MAX_PAGES });
+  const plan = buildWorkspacePlan(projectList.projects);
+  const projectIds = plan.map((entry) => entry.id);
+  const expectedTotal = typeof SunoAPIClient.expectedClipTotal === 'function'
+    ? SunoAPIClient.expectedClipTotal(plan)
+    : plan.reduce(
+      (sum, entry) => sum + (Number.isFinite(entry.clipCount) && entry.clipCount > 0 ? entry.clipCount : 0),
+      0
+    );
+  cursor.projectList = {
+    complete: projectList.complete,
+    stopReason: projectList.stopReason,
+    error: projectList.error,
+    pagesDone: projectList.pagesDone,
+    discovered: plan.length,
+    expectedProjects: projectList.expectedProjects,
+  };
+  cursor.projectIds = projectIds;
+  cursor.projectNames = plan.reduce((acc, entry) => {
+    acc[entry.id] = entry.name;
+    return acc;
+  }, {});
+  cursor.expectedTotal = expectedTotal;
+
+  /* ---- WHETHER THE ORACLE MAY BE FATAL, DECIDED ONCE, UP FRONT ------- */
+  /* THE PROBLEM: the oracle is `project.clip_count` — a PROJECT ROW COUNT — and
+   * it is compared against a WALK, which is a FILTERED request. On the default
+   * settings this walk applies two filters the row count has no reason to share:
+   *
+   *   - `filters.trashed` is 'False' on every walk. `includeTrashed` is hard
+   *     false (set at the top of this function) and `iterateFeed` builds the
+   *     filter itself.
+   *   - `filters.disliked` is 'False' for the default `dislikedMode:'exclude'`.
+   *
+   * Nothing in the wire contract says `clip_count` excludes trashed or disliked
+   * rows, and if it does not — it is a row count from the same store the feed
+   * filters — then EVERY default-mode sync falls short by exactly
+   * trashed + disliked, permanently, and tells the user to raise a page cap that
+   * was never reached. Nobody can settle that from static reading, so the
+   * comparison is made HONEST instead of fatal: a shortfall from a filtered walk
+   * is reported as a LOWER BOUND (`oracleApplied:false` + `advisory`) and does
+   * not touch `completed`. The numbers are still published — they are the best
+   * information available — and the verdict stops claiming they prove anything.
+   *
+   * WHAT WOULD MAKE THE ORACLE FATAL AGAIN, CONCRETELY: an authenticated capture
+   * on an account holding at least one trashed clip and at least one disliked
+   * clip, showing that `clip_count` for a project is NOT greater than the number
+   * of rows an UNFILTERED `/api/feed/v3` walk returns for that same project —
+   * i.e. that the count is the count of what the unfiltered feed returns. Then
+   * `includeTrashed:true` + `disliked:'Any'` makes the walk and the count
+   * measure the same set, `oracleApplied` becomes true for that configuration
+   * (exactly the condition computed here), and a shortfall becomes proof again.
+   * Until that capture exists, the default configuration cannot fail a sync on a
+   * number nobody can vouch for.
+   *
+   * THE `null` COUNT IS THE SAME PROBLEM ONE WORKSPACE WIDER: `buildWorkspacePlan`
+   * appends a `default` project with `clipCount: null` when the list arrives
+   * without it, so that workspace has no oracle at all — it was reporting
+   * `completed:true` with no check whatsoever. Its row is marked
+   * `oracleApplied:false` too, and the run says how many rows were unchecked. */
+  const libraryWireFilter = dislikedWireValue(libraryFilter);
+  oracleApplied = includeTrashed === true && libraryWireFilter === 'Any';
+  const uncheckedWorkspaces = plan.filter((entry) => !Number.isFinite(entry.clipCount));
+  const advisories = [];
+  if (!oracleApplied) {
+    advisories.push(
+      `clip counts are a LOWER BOUND here: this walk asked the server for `
+      + `trashed='${includeTrashed ? 'Any' : 'False'}', disliked='${libraryWireFilter}', so it cannot see `
+      + `rows a project count may still include. A shortfall is reported, not treated as a failure.`
+    );
+  }
+  if (uncheckedWorkspaces.length) {
+    advisories.push(
+      `${uncheckedWorkspaces.length} of ${plan.length} workspaces reported no clip_count `
+      + `(${uncheckedWorkspaces.map((entry) => entry.id).slice(0, 5).join(', ')}) and cannot be checked`
+    );
+  }
+  oracleAdvisory = advisories.length ? advisories.join(' ') : null;
+  cursor.oracleApplied = oracleApplied;
+  cursor.oracleAdvisory = oracleAdvisory;
+  log('info', 'sync.projects', {
+    count: plan.length,
+    pagesFetched: projectList.pagesDone,
+    complete: projectList.complete,
+    expectedTotal,
+    oracleApplied,
+    uncheckedWorkspaces: uncheckedWorkspaces.length,
+    filters: { trashed: includeTrashed, disliked: libraryWireFilter },
+  });
   try {
-    projects = await SunoAPIClient.fetchProjects({ signal });
-    await DB.meta.set(META_KEYS.PROJECTS, { at: Date.now(), projects });
-    log('info', 'sync.projects', { count: projects.length });
-  } catch (projectsErr) {
-    log('warn', 'sync.projects_failed', { error: describeError(projectsErr) });
+    await DB.meta.set(META_KEYS.PROJECTS, { at: Date.now(), projects: plan });
+  } catch (projectsMetaErr) {
+    log('warn', 'sync.projects_meta_failed', { error: describeError(projectsMetaErr) });
   }
 
-  /* ---- project/clip membership join -------------------------------- */
-  let membershipsAll = null;
-  let addedAtMs = null;
+  /* The plan is only resumable if the account still has the same projects. A
+   * changed list means a changed library, so the old progress index would point
+   * into a different crawl. */
+  let nextProjectIndex = resumable && Number.isFinite(stored.nextProjectIndex) ? stored.nextProjectIndex : 0;
+  if (resumable && (stored.projectIds.length !== projectIds.length
+    || stored.projectIds.some((id, i) => id !== projectIds[i]))) {
+    log('info', 'sync.plan_changed', { was: stored.projectIds.length, now: projectIds.length });
+    projectsDone = [];
+    nextProjectIndex = 0;
+  }
+  projectsDone = projectsDone.filter((id) => projectIds.indexOf(String(id)) >= 0);
+  nextProjectIndex = Math.max(0, Math.min(nextProjectIndex, projectIds.length));
+
+  /* ---- project/clip membership join: EXACTLY ONCE per sync ---------- */
+  /* WHY ONCE, AND WHY A FAILED JOIN IS NOT RE-WALKED: `fetchProjectFeed` is a
+   * multi-page cursor walk (30 rows per page), so on a 5,500-clip library it is
+   * ~180 requests. `hydrate()` re-runs the WHOLE walk whenever it is handed no
+   * memberships — which the previous build did for every one of its batches,
+   * turning one sync into thousands of requests, and which it would still do
+   * after a first-page failure. So it is called exactly once here, its Map is
+   * cached for the run, and a failure hands `hydrate` an EMPTY (truthy) map so
+   * clips are written UNJOINED and the loss is reported rather than hidden. */
+  let membershipsAll = new Map();
+  let addedAtMs = new Map();
+  let projectFeed = null;
+  /* ~180 pages on a 5,500-clip library, and it runs BEFORE the first feed page,
+   * so it is the phase a user is most likely to interrupt by mistake — and the
+   * phase in which the library legitimately still holds zero new clips. */
+  await reportSyncPhase('mapping', { note: 'mapping clips to workspaces (~180 pages, no clips indexed yet)' }, runCtx());
+  let lastMappingEmit = 0;
   try {
-    const projectFeed = await SunoAPIClient.fetchProjectFeed({ signal });
-    membershipsAll = projectFeed.membershipsAll;
-    addedAtMs = projectFeed.addedAtMs;
-    if (projectFeed.inferred) {
-      log('info', 'sync.project_feed_inferred', { items: projectFeed.items });
+    const result = await SunoAPIClient.fetchProjectFeed({
+      signal,
+      limit: SunoAPI.LIMITS.projectFeedLimit,
+      maxPages,
+      onProgress: (p) => {
+        /* Throttled: one DB write and one broadcast per N pages, so a 180-page
+         * walk does not turn into 180 round trips of its own. */
+        const now = Date.now();
+        if (p && p.pagesDone && p.pagesDone % 10 === 0 && now - lastMappingEmit > 900) {
+          lastMappingEmit = now;
+          reportSyncPhase('mapping', {
+            pagesDone: p.pagesDone,
+            items: p.items,
+            joined: p.joined,
+            note: 'mapping clips to workspaces — ' + p.pagesDone + ' pages, ' + p.joined + ' joined (no clips indexed yet)',
+          }, runCtx()).catch((emitErr) => log('warn', 'sync.phase_emit_failed', { message: describeError(emitErr).message }));
+        }
+      },
+    });
+    membershipsAll = result.membershipsAll || new Map();
+    addedAtMs = result.addedAtMs || new Map();
+    projectFeed = {
+      ok: true,
+      completed: result.completed === true,
+      stopReason: result.stopReason || 'complete',
+      error: result.error ? describeError(result.error).message : null,
+      pagesDone: result.pagesDone || 0,
+      joined: membershipsAll.size,
+      inferred: result.inferred === true,
+    };
+    if (result.inferred) log('info', 'sync.project_feed_inferred', { items: result.items });
+    if (!result.completed) {
+      log('warn', 'sync.project_feed_incomplete', { stopReason: projectFeed.stopReason, joined: projectFeed.joined });
     }
   } catch (feedErr) {
-    log('warn', 'sync.project_feed_failed', { error: describeError(feedErr) });
+    const info = describeError(feedErr);
+    projectFeed = {
+      ok: false,
+      completed: false,
+      stopReason: isAbortLike(feedErr) ? 'aborted' : 'page_failed',
+      error: info.message,
+      pagesDone: 0,
+      joined: 0,
+      inferred: false,
+    };
+    log('warn', 'sync.project_feed_failed', { error: info });
   }
+  cursor.projectFeed = projectFeed;
 
   /* ---- the forced-rebuild buffer ----------------------------------- */
   // force:true + additive putMany would leave STALE clips behind forever, so a
@@ -4657,12 +7195,7 @@ async function runSync(opts) {
   const buffered = [];
   let buffering = force;
   let overflowed = false;
-  let added = 0;
 
-  /**
-   * @param {object[]} clips
-   * @returns {Promise<void>}
-   */
   /**
    * Write rows additively, one bounded transaction per chunk.
    *
@@ -4684,16 +7217,27 @@ async function runSync(opts) {
   };
 
   /**
-   * Commit one page. Buffered while a forced rebuild is accumulating, then a
-   * single `putMany` for the page once the crawl is incremental.
+   * Stamp the dislike verdict onto a page and write it.
+   *
+   * WHY THE FLAG IS STORED RATHER THAN ONLY DERIVED: `SunoFilter` reads
+   * `boolOf(rec.is_disliked)` plus `ctx.dislikedIds`, and the rows on disk are the
+   * RAW feed shape — the filter normalises them per query — so the verdict has to
+   * survive the round trip through IndexedDB. It is stamped as `is_disliked`, the
+   * field name `normalizeClip` and `SunoFilter.normalize` already read, and it is
+   * stamped for BOTH phases: a `'False'` walk can only contain non-disliked clips
+   * and a `'True'` walk can only contain disliked ones, because the server did the
+   * filtering. That makes `disliked:'only'` and `disliked:'exclude'` exact with no
+   * second pass over the rows and no difference of page sets.
    *
    * @param {object[]} clips
+   * @param {boolean} verdict `false` for the `'False'` walk, `true` for `'True'`
    * @returns {Promise<void>}
    */
-  const commitPage = async (clips) => {
+  const commitPage = async (clips, verdict) => {
     if (!clips.length) return;
+    const stamped = clips.map((clip) => ({ ...clip, is_disliked: verdict }));
     if (buffering) {
-      for (const clip of clips) buffered.push(clip);
+      for (const clip of stamped) buffered.push(clip);
       if (buffered.length >= FULL_REBUILD_BUFFER_CAP) {
         // Over the memory ceiling: stop buffering and go additive from here, so
         // the previous library is preserved rather than half-replaced.
@@ -4707,138 +7251,545 @@ async function runSync(opts) {
       return;
     }
     // One transaction per page.
-    const rows = await SunoAPIClient.hydrate(clips, { membershipsAll, addedAtMs, signal });
+    const rows = await SunoAPIClient.hydrate(stamped, { membershipsAll, addedAtMs, signal });
     added += (await DB.clips.putMany(Array.from(rows.values()))) || 0;
   };
 
-  const baseIds = new Set(mode === 'both' ? await DB.meta.get(META_KEYS.FEED_BASE_IDS, []) : []);
-  const seenIds = new Set(mode === 'both' ? await DB.meta.get(META_KEYS.FEED_SEEN_IDS, []) : []);
-  let pagesSinceFlush = 0;
-  let truncated = false;
-  let lastError = null;
-  let dislikedIds = null;
+  const uniqueIds = new Set();
+  /* A resumed run SKIPS the workspaces the evicted worker finished, so the run's
+   * accumulators have to start where that worker left off. Without the carry
+   * `examined` would restart at 0 while the oracle still counts the whole
+   * library, and the resumed run would report a shortfall of every clip already
+   * on disk — i.e. it would refuse to call itself complete precisely because it
+   * resumed. The workspaces it skipped are carried forward as their stored rows
+   * for the same reason: the summary must carry one row per project, and a
+   * workspace that is not re-walked cannot grow a row.
+   *
+   * `examined` is carried under its OWN name only. `stored.totalSeen` is not a
+   * fallback: on a schema-2 row it means rows-examined while on a schema-3 row it
+   * means unique clips, and reading it as either without knowing which is how a
+   * resume invents a shortfall (or hides one). `resumable` requires the schema,
+   * and `examined` is absent from every row this build did not write.
+   *
+   * THE ONE BOUND A RESUME PUTS ON THE UNIQUE COUNT: a skipped workspace's ids
+   * are not re-walked, so `carriedUniqueSeen` is trusted rather than recomputed,
+   * and a clip that lives in BOTH a skipped and a re-walked workspace is counted
+   * twice. `examined` and `missing` — the figures the verdict and the contract
+   * turn on — are exact regardless, and this bound is bounded by the number of
+   * skipped projects. Getting it exact would mean persisting every skipped
+   * workspace's id set, which is thousands of ids to save one duplicated row in a
+   * "X of ~Y" numerator on a resumed run. */
+  const carriedExamined = resumable && Number.isFinite(stored.examined) ? stored.examined : 0;
+  const carriedUniqueSeen = resumable && Number.isFinite(stored.uniqueSeen) ? stored.uniqueSeen : 0;
+  const workspaces = (resumable && Array.isArray(stored.workspaces) ? stored.workspaces : [])
+    .filter((row) => row && projectsDone.indexOf(String(row.projectId)) >= 0)
+    .map((row) => Object.assign({}, row));
+  const dislikedWorkspaces = (resumable && Array.isArray(stored.dislikedWorkspaces)
+    ? stored.dislikedWorkspaces
+    : [])
+    .filter((row) => row && row.completed === true)
+    .map((row) => Object.assign({}, row));
+  const dislikedIds = new Set();
+  /* PHASE 1 IS THE ONE THAT DEFINES COMPLETENESS, SO IT IS THE ONLY ONE THAT
+   * FEEDS THE RUN'S TALLIES. `examined` and `uniqueSeen` answer "how much of the
+   * library did this crawl see", and the oracle (`expectedTotal`, the sum of
+   * per-project `clip_count`) describes the LIBRARY walk — so phase 2's rows must
+   * not be added to either. Phase 2's ids go to `dislikedIds` only, which is
+   * what it exists for: stamping `is_disliked` and counting dislikes.
+   *
+   * WHY THIS MATTERS ENOUGH TO FIX: in `both` mode both walks fed the same
+   * accumulators, so the run reported "library rows + disliked rows" examined —
+   * a figure corresponding to nothing, since `expectedTotal` counts each clip
+   * once per project it lives in and the two walks are different row sets of the
+   * same library. `totalsMet` survived (more rows only made it easier to pass),
+   * but the number the UI shows as "X of ~Y" was meaningless, and the only reason
+   * it went unnoticed is that nobody looked at it in `both` mode.
+   *
+   * The 'True' walk cannot contain a clip the 'False' walk already counted —
+   * the server filtered by dislike state — so phase 1 alone is also the complete
+   * unique count for the library it walked, and dropping phase 2's ids from
+   * `totalSeen` loses nothing about what phase 1 indexed. */
+  let examined = carriedExamined;
+  let firstError = null;
+  let pagesSinceDislikeFlush = 0;
+
+  /** Unique clip ids PHASE 1 walked, including the carried-forward tally. */
+  const uniqueSeenTotal = () => carriedUniqueSeen + uniqueIds.size;
 
   /**
-   * @param {number} page
+   * The page hook. Commit, then persist, then broadcast.
+   *
+   * THE ORDER IS THE POINT: a cursor that claims a page the database does not
+   * hold would lose that page on resume, so the write comes first and the claim
+   * second. `DB.syncState.set('feed', cursor)` on EVERY page is what lets an
+   * evicted worker resume instead of restarting the crawl.
+   *
+   * `countsForOracle` is FALSE for phase 2: its pages are walked, written and
+   * counted in `pagesDone`, but they must not move `examined` or `totalSeen`,
+   * because those two are the library walk's figures and the oracle's operands
+   * (see the accumulator declaration). Phase 2's ids go to `dislikedIds`.
+   *
+   * @param {object} outcome the workspace row in progress
+   * @param {{projectId:string,page:number,clips:object[],verdict:boolean}} page
+   * @param {boolean} countsForOracle
    * @returns {Promise<void>}
    */
-  const flushIdSets = async (page) => {
-    if (mode !== 'both') return;
-    pagesSinceFlush += 1;
-    const atBoundary = page === 0;
-    if (!atBoundary && pagesSinceFlush < DISLIKED_FLUSH_EVERY_PAGES) return;
-    pagesSinceFlush = 0;
-    try {
-      await DB.meta.set(META_KEYS.FEED_SEEN_IDS, Array.from(seenIds));
-      // The base set is only complete once pass A has walked to the end; until
-      // then a partial flush would make the diff WRONG rather than merely
-      // imprecise, so it is only written at a pass boundary.
-      if (cursor.pass === 'hideDisliked=true') {
-        await DB.meta.set(META_KEYS.FEED_BASE_IDS, Array.from(baseIds));
-      }
-    } catch (flushErr) {
-      log('warn', 'sync.id_set_flush_failed', { error: describeError(flushErr) });
+  const afterPage = async (outcome, page, countsForOracle) => {
+    if (countsForOracle) examined += page.clips.length;
+    cursor.pagesDone += 1;
+    cursor.examined = examined;
+    cursor.totalSeen = uniqueSeenTotal();
+    cursor.uniqueSeen = cursor.totalSeen;
+    cursor.state = 'running';
+    log('debug', 'sync.page', {
+      projectId: page.projectId,
+      page: cursor.pagesDone,
+      clips: page.clips.length,
+      seen: cursor.totalSeen,
+    });
+    // LIVENESS HEARTBEAT. An MV3 service worker can be evicted at any await, and a
+    // crawl that dies that way leaves its persisted cursor saying `running` for
+    // ever. Every surface then shows a frozen "Syncing" with a Stop button that
+    // cannot work, because `syncController` — the only thing cancel can signal —
+    // went with the worker. A timestamp written on every committed page lets any
+    // later read distinguish "a crawl is genuinely in flight" from "a cursor was
+    // orphaned by an eviction", without needing a timer that would itself not
+    // survive eviction.
+    cursor.heartbeatAt = Date.now();
+    const workspaceIndex = workspaces.findIndex((row) => row.projectId === page.projectId);
+    if (workspaceIndex >= 0) {
+      workspaces[workspaceIndex] = outcome;
     }
-  };
-
-  /**
-   * Choose the walk.
-   *
-   * Fresh `both`: hand the whole two-pass problem to the lib, which computes
-   * the symmetric difference. Resumed `both`: a mid-walk two-pass generator
-   * cannot skip ahead (it always starts at pass A), so the remaining half is
-   * walked directly and the diff is derived from the persisted pass-A id set.
-   * Single-pass modes walk their own `hide_disliked` value.
-   */
-  const walk = () => {
-    if (mode === 'both') {
-      if (cursor.pass && cursor.nextPage > 0) {
-        const passMode = cursor.pass === 'hideDisliked=false' ? 'include' : 'exclude';
-        log('info', 'sync.resumed_pass', { pass: passMode, fromPage: cursor.nextPage });
-        return SunoAPIClient.iterateFeed({
-          disliked: passMode,
-          startPage: cursor.nextPage,
-          maxPages,
-          signal,
-        });
-      }
-      return SunoAPIClient.iterateFeed({ disliked: 'both', maxPages, signal });
-    }
-    return SunoAPIClient.iterateFeed({
-      disliked: mode,
-      startPage: cursor.nextPage,
-      maxPages,
-      signal,
+    await commitPage(page.clips, page.verdict);
+    await DB.syncState.set('feed', cursor);
+    await broadcast({
+      type: 'SYNC_PROGRESS',
+      page: cursor.pagesDone,
+      pagesDone: cursor.pagesDone,
+      seen: cursor.totalSeen,
+      added,
+      etaMs: estimateSyncEta(
+        startedAt,
+        cursor.pagesDone,
+        cursor.pagesDone,
+        expectedTotal > 0 ? Math.max(1, Math.ceil(expectedTotal / feedLimit)) : maxPages
+      ),
+      state: 'running',
+      workspace: page.projectId,
+      workspacesDone: projectsDone.length,
+      expectedTotal,
+      /* The unique count, under both names, so a progress reader cannot end up
+       * with a different figure from the final reply for the same field. */
+      totalSeen: cursor.totalSeen,
+      uniqueSeen: cursor.totalSeen,
+      completed: false,
+      /* A run in progress is by definition not a finished library, so
+       * `truncated === !completed` holds here as it does on every other reply.
+       * It used to be absent, which made the flag's meaning depend on the type of
+       * the message rather than on the run's state. */
+      truncated: true,
     });
   };
 
+  /**
+   * Persist the cursor with everything learned so far. Called after every
+   * workspace so the plan's progress index is never behind the library.
+   * @returns {Promise<void>}
+   */
+  const persist = async () => {
+    cursor.workspaces = workspaces.slice();
+    cursor.dislikedWorkspaces = dislikedWorkspaces.slice();
+    cursor.projectsDone = projectsDone.slice();
+    cursor.dislikedProjectsDone = dislikedWorkspaces
+      .filter((row) => row.completed)
+      .map((row) => row.projectId);
+    cursor.examined = examined;
+    cursor.totalSeen = uniqueSeenTotal();
+    cursor.uniqueSeen = cursor.totalSeen;
+    await DB.syncState.set('feed', cursor);
+  };
+
+  /**
+   * Walk one plan entry and fold its outcome into the run.
+   *
+   * @param {object} project
+   * @param {string} disliked
+   * @param {boolean} oracleFatal whether a shortfall here may fail the run
+   * @param {object[]} rows where the outcome lands
+   * @param {string|null} oracleAdvisory why the oracle is not fatal here
+   * @param {{dislikeSink?:Set<string>,uniqueSink?:Set<string>,
+   *          countsForOracle?:boolean}} [sinks] where this walk's ids go, and
+   *        whether they feed the run's tallies
+   * @returns {Promise<object>} the workspace outcome row
+   */
+  const crawlInto = async (project, disliked, oracleFatal, rows, oracleAdvisory, sinks) => {
+    const config = sinks && typeof sinks === 'object' ? sinks : {};
+    const dislikeSink = config.dislikeSink instanceof Set ? config.dislikeSink : null;
+    /* DEFAULT SINK IS THE RUN'S: phase 1 de-duplicates the whole library, so its
+     * ids belong to `totalSeen`. Phase 2 passes `dislikedIds` for both sinks — the
+     * 'True' walk's unique ids ARE the disliked set, so that is one accumulation
+     * done once, not two copies of the same set. */
+    const uniqueSink = config.uniqueSink instanceof Set ? config.uniqueSink : uniqueIds;
+    const countsForOracle = config.countsForOracle !== false;
+    /* WHICH COUNT DESCRIBES THIS WALK: phase 1 is compared against the plan's
+     * oracle, so it publishes the project's own `clip_count`; phase 2 walks a
+     * DIFFERENT row set (the disliked rows), so no count describes it and it
+     * publishes none. This is the parameter that keeps a `disliked:'only'` row
+     * from ever showing "missing 260 of 275". */
+    const expectedForWalk = countsForOracle
+      && Number.isFinite(project.clipCount)
+      && project.clipCount >= 0
+      ? project.clipCount
+      : null;
+    const examinedBefore = examined;
+    const outcome = await crawlWorkspace({
+      project,
+      disliked,
+      expected: expectedForWalk,
+      oracleFatal,
+      oracleAdvisory,
+      maxPages,
+      limit: feedLimit,
+      includeTrashed,
+      signal,
+      uniqueSink,
+      onPage: async (row, page) => {
+        if (dislikeSink) {
+          for (const clip of page.clips) {
+            const id = clip && clip.id !== undefined && clip.id !== null ? String(clip.id) : '';
+            if (id) dislikeSink.add(id);
+          }
+          pagesSinceDislikeFlush += 1;
+          if (pagesSinceDislikeFlush >= DISLIKED_FLUSH_EVERY_PAGES) {
+            pagesSinceDislikeFlush = 0;
+            try {
+              await DB.meta.set(META_KEYS.FEED_DISLIKED_IDS, Array.from(dislikeSink));
+            } catch (flushErr) {
+              log('warn', 'sync.id_set_flush_failed', { error: describeError(flushErr) });
+            }
+          }
+        }
+        await afterPage(row, {
+          projectId: page.projectId,
+          page: page.page,
+          clips: page.clips,
+          verdict: disliked === DISLIKED_ONLY_FILTER,
+        }, countsForOracle);
+      },
+      onSummary: (summary, projectId) => {
+        // The ONLY place a cursor for a workspace is available: the client keeps
+        // `nextCursor` to itself until the walk's summary.
+        if (summary.nextCursor !== undefined) cursor.cursors[projectId] = summary.nextCursor;
+      },
+    });
+    /* Reconcile against the client's own per-walk total rather than the sum of
+     * the pages we happened to see, so the run figure is exactly what the oracle
+     * is compared with. Phase 2 reconciles nothing: its total describes a row set
+     * the oracle does not cover.
+     *
+     * `crawlWorkspace` guarantees `outcome.totalSeen` is never LOWER than the rows
+     * its pages committed — an abandoned walk reports the pages it accepted rather
+     * than the `0` an unread summary batch used to imply — so `examined` can never
+     * end a run below the rows actually persisted. It is not floored again here:
+     * the client's figure may legitimately be SMALLER than the raw page rows when
+     * one clip repeats inside a single workspace, and that smaller number is the
+     * one the summed `clip_count` oracle is defined against. */
+    if (countsForOracle) examined = examinedBefore + (Number.isFinite(outcome.totalSeen) ? outcome.totalSeen : 0);
+    if (!outcome.completed && !firstError) firstError = outcome.error;
+    dropWorkspaceRow(rows, project.id);
+    rows.push(outcome);
+    return outcome;
+  };
+
   try {
-    const iterator = walk();
-    for await (const batch of iterator) {
+    /* ---- phase 1: every project, one walk each ----------------------- */
+    /* From here on the crawl is indexing, which is the only phase that changes
+     * the clip count — the UI needs to say so, because until this point the
+     * library legitimately holds nothing new. */
+    await reportSyncPhase('crawling', {
+      note: 'crawling your library' + (plan.length ? ' — ' + plan.length + ' workspaces' : ''),
+    }, runCtx());
+    /* The loop runs over the WHOLE plan every time, not from
+     * `nextProjectIndex`, and `projectsDone` is the only thing that gates a
+     * workspace. A workspace that did not COMPLETE is deliberately left out of
+     * that list, so a resumed run returns to it — an `index` cursor alone would
+     * step over the workspace that failed on the previous run and never retry
+     * it. `nextProjectIndex` is still persisted, as the plan's progress
+     * pointer for diagnostics. */
+    for (let index = 0; index < plan.length; index += 1) {
       if (signal.aborted) break;
+      const project = plan[index];
+      if (projectsDone.indexOf(project.id) >= 0) continue;
+      cursor.nextProjectIndex = index;
+      /* `oracleFatal` is the run-level scoping decision ANDed with "this project
+       * reported a count", so a plan entry with `clipCount: null` cannot be
+       * checked and says so on its own row instead of silently passing.
+       *
+       * THE ROW SENTENCE IS DELIBERATELY SHORT and the run-level `advisory` is
+       * the long one: this runs for every workspace, and the full paragraph (which
+       * names the exact filter values) is repeated once per row in a payload that
+       * is broadcast to every Suno tab. The row says why IT was not checked; the
+       * reply says what the filters were. */
+      const rowAdvisory = oracleApplied ? null : (Number.isFinite(project.clipCount)
+        ? `clip_count for ${project.id} may include rows this walk's filters hide`
+        : `${project.id} reported no clip_count, so this walk cannot be checked at all`);
+      const outcome = await crawlInto(project, libraryFilter, oracleApplied, workspaces, rowAdvisory, {
+        countsForOracle: true,
+      });
+      if (outcome.completed) projectsDone.push(project.id);
+      nextProjectIndex = index + 1;
+      cursor.nextProjectIndex = nextProjectIndex;
+      await persist();
+    }
 
-      if (batch.type === 'dislikedIds') {
-        dislikedIds = batch.dislikedIds instanceof Set ? batch.dislikedIds : new Set(batch.dislikedIds || []);
-        cursor.dislikedApproximate = batch.truncated === true;
-        cursor.dislikedCount = dislikedIds.size;
-        await DB.meta.set(META_KEYS.FEED_DISLIKED_IDS, Array.from(dislikedIds));
-        await DB.journal.append({ batchId: 'sync', phase: 'dislike-diff', detail: { count: dislikedIds.size } });
-        log('info', 'sync.dislike_diff', { count: dislikedIds.size, truncated: batch.truncated === true });
-        continue;
-      }
-
-      if (batch.type === 'summary') {
-        truncated = batch.truncated === true;
-        lastError = batch.error ? describeError(batch.error).message : null;
-        cursor.truncated = truncated;
-        continue;
-      }
-
-      // A page.
-      cursor.pass = batch.pass || cursor.pass;
-      cursor.nextPage = Number.isFinite(batch.page) ? batch.page + 1 : cursor.nextPage + 1;
-      cursor.pagesDone = (cursor.pagesDone || 0) + 1;
-      cursor.totalSeen = (cursor.totalSeen || 0) + (batch.clips ? batch.clips.length : 0);
-      cursor.lastError = null;
-      cursor.state = 'running';
-
-      const pageClips = Array.isArray(batch.clips) ? batch.clips : [];
-      if (mode === 'both') {
-        for (const clip of pageClips) {
-          const id = String(clip.id);
-          if (cursor.pass === 'hideDisliked=true') baseIds.add(id);
-          seenIds.add(id);
+    /* ---- phase 2 (`dislikedMode:'both'`): the disliked id set -------- */
+    /* WHY A SECOND WALK INSTEAD OF A SYMMETRIC DIFFERENCE: there is no per-clip
+     * dislike field on Suno, which is the entire reason the previous build walked
+     * the library twice and subtracted the two id sets. `/api/feed/v3` takes
+     * `filters.disliked` as a SERVER-SIDE tri-state filter, so one walk of
+     * `'True'` IS the disliked set, exactly. Nothing is inferred, so nothing can
+     * be wrong when two passes see different rows — which is what made the
+     * difference wrong in the first place. */
+    if (mode === 'both' && !signal.aborted) {
+      /* Resume the id set: the partial set is flushed to `meta` every
+       * `DISM...EVERY_PAGES` pages precisely so an eviction cannot lose it. */
+      const alreadyDone = new Set(resumable && Array.isArray(stored.dislikedProjectsDone)
+        ? stored.dislikedProjectsDone
+        : []);
+      if (resumable && alreadyDone.size) {
+        try {
+          const remembered = await DB.meta.get(META_KEYS.FEED_DISLIKED_IDS, []);
+          if (Array.isArray(remembered)) for (const id of remembered) dislikedIds.add(String(id));
+        } catch (dislikeResumeErr) {
+          log('warn', 'sync.dislike_set_resume_failed', { error: describeError(dislikeResumeErr) });
         }
       }
-
-      await commitPage(pageClips);
-      await flushIdSets(batch.page || 0);
-      await DB.syncState.set('feed', cursor);
-      await broadcast({
-        type: 'SYNC_PROGRESS',
-        page: cursor.nextPage,
-        pagesDone: cursor.pagesDone,
-        seen: cursor.totalSeen,
-        added,
-        etaMs: estimateSyncEta(startedAt, cursor.pagesDone, cursor.pagesDone, maxPages),
-        state: 'running',
-      });
+      for (const project of plan) {
+        if (signal.aborted) break;
+        if (alreadyDone.has(project.id)) {
+          dropWorkspaceRow(dislikedWorkspaces, project.id);
+          dislikedWorkspaces.push({
+            projectId: project.id,
+            name: project.name,
+            completed: true,
+            pagesDone: 0,
+            totalSeen: 0,
+            expected: null,
+            missing: null,
+            oracleApplied: false,
+            advisory: 'carried forward from an earlier run: this walk was not repeated',
+            stopReason: 'resumed',
+            walkStopReason: 'resumed',
+            error: null,
+            disliked: DISLIKED_ONLY_FILTER,
+            shortfallLikelyFilters: false,
+            pagesFull: 0,
+            lastPageSize: 0,
+            lastPageFull: false,
+            cursorAlias: null,
+          });
+          continue;
+        }
+        /* NO ORACLE, AND NO EFFECT ON THE RUN'S TALLIES:
+         *   - `oracleFatal:false` because a `'True'` walk returns only the
+         *     DISLIKED clips in this project, a subset of its `clip_count`.
+         *     Comparing them would declare every project permanently short.
+         *   - `countsForOracle:false` because `expectedTotal` is the SUM of the
+         *     LIBRARY walks' counts; phase 2's rows would inflate `examined`
+         *     past it and `totalSeen` into a figure that describes nothing.
+         *   - `uniqueSink:dislikedIds` because the 'True' walk's unique ids ARE
+         *     the disliked set: one accumulation, feeding `dislikedCount` and the
+         *     `is_disliked` stamping, and nothing else. */
+        await crawlInto(project, DISLIKED_ONLY_FILTER, false, dislikedWorkspaces,
+          'a disliked-only walk covers a subset of this project, so its length is never compared against clip_count', {
+            dislikeSink: dislikedIds,
+            uniqueSink: dislikedIds,
+            countsForOracle: false,
+          });
+        await persist();
+      }
+      /* The set is exact only when EVERY project's `'True'` walk finished — a
+       * row that is merely absent counts as unfinished, or a cancelled phase 2
+       * would report the partial set as exact. Otherwise it is a partial set and
+       * is REPORTED as approximate, never as a count. */
+      cursor.dislikedCount = dislikedIds.size;
+      cursor.dislikedApproximate = dislikedWorkspaces.length !== plan.length
+        || dislikedWorkspaces.some((row) => !row.completed);
+      if (cursor.dislikedApproximate) {
+        log('warn', 'sync.dislike_set_partial', { count: dislikedIds.size });
+      }
+    } else if (mode !== 'both') {
+      /* A single `'Any'` / `'False'` walk cannot classify rows it never
+       * requested, so the count stays UNKNOWN (null) rather than being reported
+       * as 0 — which is exactly what the vanished `dislikedIds` envelope used to
+       * turn into. Any previously measured set is carried forward untouched. */
+      let rememberedIds = [];
+      try {
+        const remembered = await DB.meta.get(META_KEYS.FEED_DISLIKED_IDS, []);
+        rememberedIds = Array.isArray(remembered) ? remembered.map(String) : [];
+      } catch (dislikeLoadErr) {
+        log('warn', 'sync.dislike_set_load_failed', { error: describeError(dislikeLoadErr) });
+      }
+      cursor.dislikedCount = rememberedIds.length > 0 ? rememberedIds.length : null;
+      cursor.dislikedApproximate = rememberedIds.length === 0;
     }
 
-    if (mode === 'both' && !dislikedIds) {
-      // A resumed run finished the second pass but never computed the diff.
-      // Derive it from the persisted base set; if that set was never flushed the
-      // result is incomplete, and we say so rather than pretend otherwise.
-      const persistedBase = new Set(await DB.meta.get(META_KEYS.FEED_BASE_IDS, []));
-      const derived = new Set();
-      for (const id of seenIds) if (!persistedBase.has(id)) derived.add(id);
-      dislikedIds = derived;
-      cursor.dislikedApproximate = baseIds.size === 0 || persistedBase.size === 0;
-      cursor.dislikedCount = derived.size;
-      if (derived.size) await DB.meta.set(META_KEYS.FEED_DISLIKED_IDS, Array.from(derived));
+    if (dislikedIds.size) {
+      try {
+        await DB.meta.set(META_KEYS.FEED_DISLIKED_IDS, Array.from(dislikedIds));
+      } catch (dislikePersistErr) {
+        log('warn', 'sync.dislike_set_persist_failed', { error: describeError(dislikePersistErr) });
+      }
+      await DB.journal.append({ batchId: 'sync', phase: 'dislike-set', detail: { count: dislikedIds.size } });
     }
 
-    if (buffering && !truncated && !overflowed) {
+    /* ---- the completeness verdict, BEFORE the rebuild is committed ---- */
+    /* WHY THE ORDER: a forced rebuild's `bulkReplace` may only run on a COMPLETE
+     * crawl — replacing the library with a truncated one would delete the clips
+     * the crawl failed to reach. So the verdict is computed first and the buffer
+     * is committed against it. */
+    /* `examined` counts rows EXAMINED across workspaces, repeats included, because
+     * the oracle is the SUM of per-project `clip_count`s, which counts a clip
+     * living in two projects twice. Comparing the run's UNIQUE count against that
+     * sum would report a permanent shortfall on every account that shares a clip
+     * between projects — the same "looks broken forever" class of bug as the one
+     * this crawl exists to fix. So the arithmetic is `examined`, while what the
+     * user is shown is `totalSeen` (unique) and `missing` stays the examined-based
+     * difference, which is why the two must be emitted under separate names. */
+    const everyWorkspaceCompleted = workspaces.length === plan.length
+      && workspaces.every((row) => row.completed);
+    const everyDislikedCompleted = mode !== 'both'
+      || (dislikedWorkspaces.length === plan.length && dislikedWorkspaces.every((row) => row.completed));
+    /* A SHORTFALL IS A FAILURE WHETHER OR NOT THE ORACLE IS COMPARABLE.
+     *
+     * `oracleApplied` decides the WORDING of a shortfall, not whether one can be
+     * ignored. On the default filtered settings it is false on every sync, which
+     * used to mean a crawl that indexed 10-20% of the library reported
+     * `completed:true` — the reported symptom, reproduced exactly. The filter
+     * accounting really can explain a handful of rows; it cannot explain losing
+     * thousands, and a build that cannot tell those apart has no business calling
+     * either of them "Up to date".
+     *
+     * `everyWorkspaceShort` is the aggregate question the verdict needs: EVERY
+     * workspace that reported a count came up short. That is different from ONE
+     * workspace dying mid-walk (which `failed.length` covers, and which is a
+     * different failure with a different fix) and different again from a run-level
+     * arithmetic mismatch. A workspace with no count at all cannot be "short", so
+     * it is excluded from the ratio rather than counted as a pass.
+     *
+     * `endedOnTerminalCursor` is the OTHER half of `suspected_truncation`: every
+     * walk reported a genuine end of feed — a cursor field that was present and
+     * null (`'complete'`), or was missing entirely (`'cursor_missing'`) — rather
+     * than a failed page, a stuck cursor or a page cap. It reads `walkStopReason`,
+     * NOT `stopReason`: the shortfall logic rewrites `stopReason` to
+     * `'expected_total'`, so by this point `stopReason` says "short" on every row
+     * and cannot distinguish "the feed ended" from "this walk broke". "Everyone
+     * said there was no more, and there demonstrably was more" is a specific and
+     * very diagnosable failure, and it deserves its own `stopReason` rather than
+     * being filed under the generic `expected_total`. */
+    const comparableRows = workspaces.filter((row) => Number.isFinite(row.expected) && row.expected > 0);
+    const shortRows = comparableRows.filter((row) => row.totalSeen < row.expected);
+    const everyWorkspaceShort = comparableRows.length > 0 && shortRows.length === comparableRows.length;
+    const endedOnTerminalCursor = workspaces.length > 0
+      && workspaces.every((row) => row.walkStopReason === 'complete' || row.walkStopReason === 'cursor_missing');
+    const anyCursorMissing = workspaces.some((row) => row.walkStopReason === 'cursor_missing');
+    /* True when every short row's gap is small enough to be the filter
+     * accounting. Published so the UI can hedge ("trashed/disliked clips, or
+     * truncation") instead of asserting a cause the data cannot support. */
+    const shortfallLikelyFilters = everyWorkspaceShort && shortRows.every((row) => row.shortfallLikelyFilters === true);
+    const totalsMet = expectedTotal > 0 ? examined >= expectedTotal : true;
+    /* The run-level clause is now UNCONDITIONAL: `!totalsMet` fails the run even
+     * when `oracleApplied` is false. The filter caveat survives in `advisory` and
+     * in `shortfallLikelyFilters` instead of in the verdict. */
+    const oracleBlocksCompletion = !totalsMet;
+    const completed = everyWorkspaceCompleted
+      && everyDislikedCompleted
+      && !oracleBlocksCompletion
+      && projectList.complete
+      && !signal.aborted;
+
+    let stopReason = 'complete';
+    let error = null;
+    const failed = workspaces.filter((row) => !row.completed);
+    const failedDisliked = dislikedWorkspaces.filter((row) => !row.completed);
+    if (!completed) {
+      /* A cancellation is checked FIRST, and it always wins: a cancel that also
+       * broke the project-list walk must not be reported as a library fault,
+       * because "you cancelled this" and "your index is short" are different
+       * sentences with different remedies. */
+      if (signal.aborted) {
+        stopReason = 'aborted';
+        error = 'cancelled by the user';
+      } else if (everyWorkspaceShort && endedOnTerminalCursor) {
+        /* THE TRUNCATION SHAPE. Checked BEFORE `failed.length` on purpose: every
+         * short workspace now carries `stopReason:'expected_total'` (that is how a
+         * shortfall became fatal at all), so reading the first failed row here
+         * would flatten this back into the generic `expected_total` and lose the
+         * only information that points at the cause. */
+        stopReason = 'suspected_truncation';
+        const cursorMiss = anyCursorMissing
+          ? ` ${shortRows.length} workspace(s) also reported a missing cursor field, so the feed shape itself is not understood.`
+          : '';
+        error = `every workspace ended on the feed's own end-of-feed signal and every one of them is `
+          + `short of its clip_count: ${examined} of ${expectedTotal} clips examined across `
+          + `${comparableRows.length} comparable workspace(s). That is the signature of a TRUNCATED `
+          + `feed, not of a smaller library.${cursorMiss} Run PROBE_FEED to see the real page size and `
+          + `cursor field, then try a lower feedPageLimit (currently ${feedLimit}) and sync again.`;
+        /* Persisted at `error` level unless the gap is small enough to be the
+         * filter accounting: an error you cannot see is the defect that just
+         * shipped, and a truncation verdict that only exists in memory is how the
+         * reported symptom stayed invisible. A small, filter-shaped gap is
+         * `warn`, because that one is expected on a default-mode sync and an
+         * `error` line for it every run would train everyone to ignore them. */
+        log(shortfallLikelyFilters ? 'warn' : 'error', 'sync.suspected_truncation', {
+          examined,
+          expectedTotal,
+          workspaces: comparableRows.length,
+          shortfallLikelyFilters,
+          feedPageLimit: feedLimit,
+        });
+      } else if (anyCursorMissing) {
+        /* The parser found no cursor field at all. Not "the library ended" — the
+         * walk stopped where it could not read the next page. */
+        const missed = workspaces.find((row) => row.walkStopReason === 'cursor_missing');
+        stopReason = 'cursor_missing';
+        error = `workspace ${missed ? missed.projectId : '(unknown)'} stopped: the feed response carried no `
+          + 'cursor field this client recognises, so the walk could not be continued and the library '
+          + 'cannot be proven indexed. Run PROBE_FEED to see what the envelope actually calls it';
+      } else if (failed.length) {
+        stopReason = failed[0].stopReason || 'page_failed';
+        error = `workspace ${failed[0].projectId} (${failed[0].name}) stopped: ${failed[0].stopReason}`
+          + (failed[0].error ? ` — ${failed[0].error}` : '');
+      } else if (!projectList.complete) {
+        /* A DIFFERENT `expected_total` THAN THE CLIP ORACLE'S, and it is NOT
+         * affected by the walk's filters: `/api/project/me` is asked with
+         * `show_trashed:'false'` too, but its `num_total_results` is the number of
+         * PROJECTS that same walk was paged against, so the two are comparable and
+         * a short project list genuinely does mean unseen libraries. It stays
+         * fatal. */
+        stopReason = 'expected_total';
+        error = `the project list is incomplete (${projectList.stopReason}): `
+          + `${plan.length} of `
+          + `${projectList.expectedProjects === null ? 'an unknown number of' : projectList.expectedProjects} `
+          + 'projects are known, so the whole library cannot be proven indexed';
+      } else if (oracleBlocksCompletion) {
+        stopReason = 'expected_total';
+        error = `the crawl examined ${examined} clips of an expected ${expectedTotal}`
+          + (shortfallLikelyFilters
+            ? '. This may be trashed or disliked clips the walk\'s filters hide, or a truncated feed — '
+              + `try a lower feedPageLimit (currently ${feedLimit}) and sync again`
+            : '. That is far larger than the trashed/disliked rows these filters hide — run PROBE_FEED '
+              + 'and sync again');
+      } else if (!everyDislikedCompleted) {
+        stopReason = 'expected_total';
+        error = 'the disliked-set walk did not finish, so the library is not fully indexed';
+      } else {
+        stopReason = failedDisliked.length ? (failedDisliked[0].stopReason || 'page_failed') : 'page_failed';
+        error = 'the crawl did not reach a clean end';
+      }
+    }
+
+    if (buffering && completed && !overflowed) {
       const rows = await SunoAPIClient.hydrate(buffered, { membershipsAll, addedAtMs, signal });
       const result = await DB.clips.bulkReplace(Array.from(rows.values()));
       added = result.written;
@@ -4846,7 +7797,7 @@ async function runSync(opts) {
       cursor.buffered = buffered.length;
       buffered.length = 0;
     } else if (buffering) {
-      // Truncated or overflowed: additive writes only. The previous library is
+      // Incomplete or overflowed: additive writes only. The previous library is
       // left intact and the UI is told the result is incomplete.
       cursor.buffered = buffered.length;
       if (buffered.length) {
@@ -4856,9 +7807,69 @@ async function runSync(opts) {
       buffering = false;
     }
 
-    cursor.state = signal.aborted ? 'cancelled' : 'idle';
-    cursor.truncated = truncated === true;
-    cursor.lastError = signal.aborted ? 'cancelled by the user' : lastError;
+    /* WHY NOT `idle`: `idle` is what the popup renders as "Up to date", and the
+     * exact failure this crawl was rebuilt for was a walk that died on page 20,
+     * set `lastError`, and still reported `idle`. A crawl that reached the end of
+     * its loop and still fell short is a different thing from a crawl that broke,
+     * and both are different from a clean one:
+     *
+     *   'idle'       -> completed:true. Everything the server said it had.
+     *   'incomplete' -> the run reached its verdict and the library on disk is
+     *                   short of the oracle: a workspace failed, a walk stopped
+     *                   early, or the totals did not add up. NOT "Up to date".
+     *   'error'      -> the run itself broke before it could reach a verdict.
+     *   'cancelled'  -> the user asked it to stop.
+     *
+     * `truncated` stays `!completed` (the client's own definition, and the
+     * compatibility flag every surface already reads). `lastError` is CLEARED at
+     * exactly one place — here, where the verdict is known — and never on a page
+     * that happened to succeed. */
+    cursor.completed = completed;
+    cursor.truncated = !completed;
+    cursor.stopReason = stopReason;
+    cursor.lastError = completed ? null : (error || firstError || 'the library is incomplete');
+    cursor.state = signal.aborted ? 'cancelled' : (completed ? 'idle' : 'incomplete');
+    /* `missing` IS `expectedTotal - examined`, always, from the same `examined`
+     * the oracle compares. It is written even when `oracleApplied` is false — the
+     * arithmetic is still the best estimate available, and `oracleApplied` is what
+     * tells a reader it is a lower bound rather than a checked shortfall — and it
+     * is written even when it is `0`, because `0` is a real answer that must not
+     * be re-derived from a differently-defined `totalSeen`. */
+    cursor.missing = Math.max(0, expectedTotal - examined);
+    cursor.examined = examined;
+    cursor.totalSeen = uniqueSeenTotal();
+    cursor.uniqueSeen = cursor.totalSeen;
+    cursor.oracleApplied = oracleApplied;
+    cursor.oracleAdvisory = oracleAdvisory;
+    /* The truncation verdict, published as DATA as well as being worded in
+     * `error`. `shortfallLikelyFilters` is what lets a UI say "this may be
+     * trashed/disliked clips, or truncation — try a lower page limit" instead of
+     * asserting a cause it cannot support; `everyWorkspaceShort` and
+     * `endedOnTerminalCursor` are the two facts the run-level verdict was derived
+     * from, kept so a reader can re-derive it rather than trust the wording. */
+    cursor.shortfallLikelyFilters = shortfallLikelyFilters;
+    cursor.everyWorkspaceShort = everyWorkspaceShort;
+    cursor.endedOnTerminalCursor = endedOnTerminalCursor;
+    /* THE FULL-PAGE SIGNAL, aggregated over the run. `pagesFull` counts pages that
+     * came back with exactly the `limit` asked for; `lastPageFull` says whether the
+     * final page was one of them. A run that ENDS ON A FULL PAGE has been told by
+     * the server that there is no more, while having just been handed a page it
+     * could not empty — which is the shape of the reported bug. It is published
+     * and NEVER acted on: the server's own cursor is the authority on where the
+     * library ends, and overriding it with a heuristic is how a build ends up
+     * looping on a library that is genuinely finished. */
+    cursor.pagesFull = workspaces.reduce((sum, row) => sum + (Number.isFinite(row.pagesFull) ? row.pagesFull : 0), 0);
+    cursor.lastPageSize = workspaces.reduce(
+      (max, row) => (Number.isFinite(row.lastPageSize) ? Math.max(max, row.lastPageSize) : max),
+      0
+    );
+    cursor.lastPageFull = workspaces.length > 0 && workspaces.every((row) => row.lastPageFull === true);
+    cursor.anyWorkspaceEndedFull = workspaces.some((row) => row.lastPageFull === true);
+    cursor.feedPageLimit = feedLimit;
+    cursor.nextProjectIndex = nextProjectIndex;
+    cursor.workspaces = workspaces.slice();
+    cursor.dislikedWorkspaces = dislikedWorkspaces.slice();
+    cursor.projectsDone = projectsDone.slice();
     cursor.finishedAt = Date.now();
     cursor.durationMs = cursor.finishedAt - startedAt;
     cursor.overflowed = overflowed;
@@ -4867,37 +7878,133 @@ async function runSync(opts) {
     const total = await DB.clips.count();
     await DB.journal.append({
       batchId: 'sync',
-      phase: signal.aborted ? 'cancelled' : 'done',
-      detail: { pagesDone: cursor.pagesDone, seen: cursor.totalSeen, truncated },
+      phase: signal.aborted ? 'cancelled' : (completed ? 'done' : 'incomplete'),
+      detail: {
+        pagesDone: cursor.pagesDone,
+        seen: cursor.totalSeen,
+        examined,
+        expectedTotal,
+        missing: cursor.missing,
+        oracleApplied,
+        shortfallLikelyFilters,
+        stopReason,
+      },
     });
 
     await broadcast({
       type: 'SYNC_DONE',
       total,
-      truncated: truncated === true,
-      projects: projects.length,
+      projects: plan.length,
       durationMs: cursor.durationMs,
+      /* The whole contract, built by the one builder every reply uses — so this
+       * payload, the abort path below, both `SYNC_ERROR` paths, `GET_BOOT.sync`
+       * and `SYNC_STATUS` cannot drift apart in their key set or in what a name
+       * means. `completed` is authoritative and `truncated` is derived from it. */
+      ...syncContractView(cursor),
+      projectList: cursor.projectList,
+      projectFeed: cursor.projectFeed,
+      dislikedCount: cursor.dislikedCount,
+      dislikedApproximate: cursor.dislikedApproximate === true,
     });
 
     log('info', 'sync.finished', {
-      pagesDone: cursor.pagesDone, seen: cursor.totalSeen, total, truncated, overflowed,
+      pagesDone: cursor.pagesDone,
+      seen: cursor.totalSeen,
+      examined,
+      total,
+      expectedTotal,
+      missing: cursor.missing,
+      oracleApplied,
+      completed,
+      stopReason,
+      overflowed,
+      workspaces: workspaces.length,
     });
   } catch (err) {
     const info = describeError(err);
+    /* The completeness contract is written on the failure path too, because
+     * `SYNC_ERROR` is the reply a UI gets when the crawl broke and it must not be
+     * the one reply that cannot say how much of the library is present. Both this
+     * path and the one in `startSync` go through `syncContractView`, so neither
+     * can be the reply that forgot `truncated` or `state`. */
+    const missingNow = Math.max(0, expectedTotal - examined);
     if (isAbortLike(err)) {
+      cursor.completed = false;
+      cursor.truncated = true;
+      cursor.stopReason = syncWatchdogFired ? 'watchdog_timeout' : 'aborted';
       cursor.state = 'cancelled';
+      cursor.lastError = syncWatchdogFired ? 'cancelled by the watchdog' : 'cancelled by the user';
+      cursor.missing = missingNow;
+      cursor.examined = examined;
+      cursor.totalSeen = uniqueSeenTotal();
+      cursor.uniqueSeen = cursor.totalSeen;
+      cursor.oracleApplied = oracleApplied;
+      cursor.oracleAdvisory = oracleAdvisory;
+      cursor.workspaces = workspaces.slice();
+      cursor.dislikedWorkspaces = dislikedWorkspaces.slice();
+      cursor.projectsDone = projectsDone.slice();
+      cursor.finishedAt = Date.now();
+      cursor.durationMs = cursor.finishedAt - startedAt;
       await DB.syncState.set('feed', cursor);
-      await broadcast({ type: 'SYNC_DONE', total: await DB.clips.count(), truncated: cursor.truncated === true, projects: projects.length, durationMs: Date.now() - startedAt });
+      /* An abort is still a `SYNC_DONE`: the reply that reaches a UI when the user
+       * pressed cancel has to say the same things every other reply says. It used
+       * to omit `projectList`/`projectFeed`/`dislikedCount`/`dislikedApproximate`
+       * and `uniqueSeen`/`examined`/`oracleApplied`, so the surfaces that render
+       * the cancellation lost the project list they were already holding and had
+       * to re-derive a `missing` from mismatched numbers. */
+      await broadcast({
+        type: 'SYNC_DONE',
+        total: await DB.clips.count(),
+        projects: plan.length,
+        durationMs: cursor.durationMs,
+        ...syncContractView(cursor),
+        projectList: cursor.projectList,
+        projectFeed: cursor.projectFeed,
+        dislikedCount: cursor.dislikedCount,
+        dislikedApproximate: cursor.dislikedApproximate === true,
+      });
       return;
     }
+    cursor.completed = false;
+    cursor.truncated = true;
+    cursor.stopReason = 'page_failed';
     cursor.state = 'error';
-    cursor.lastError = info.message;
+    cursor.missing = missingNow;
+    cursor.examined = examined;
+    cursor.totalSeen = uniqueSeenTotal();
+    cursor.uniqueSeen = cursor.totalSeen;
+    cursor.oracleApplied = oracleApplied;
+    cursor.oracleAdvisory = oracleAdvisory;
+    /* The failing error is ADDED to whatever the walk had already learned; it
+     * never replaces a workspace's own reason and it is never dropped. */
+    cursor.lastError = cursor.lastError ? `${cursor.lastError}; then: ${info.message}` : info.message;
+    cursor.workspaces = workspaces.slice();
+    cursor.dislikedWorkspaces = dislikedWorkspaces.slice();
     await DB.syncState.set('feed', cursor);
     await DB.journal.append({ batchId: 'sync', phase: 'error', detail: { code: info.code } });
     log('error', 'sync.failed', { error: info });
-    await broadcast({ type: 'SYNC_ERROR', error: info.message });
+    /* `error` IS `cursor.lastError` — the ACCUMULATED message, which carries every
+     * earlier failure of this run before this one. Broadcasting `info.message`
+     * instead published the TAIL of the failure list: the run died on page 3 of
+     * workspace 12 after three workspaces had already failed, and the reply named
+     * only the last of them, so the one line the user reads was the least useful
+     * one. The accumulated string is built one line above and persisted, so it is
+     * the same text `GET_BOOT.sync` will show afterwards. */
+    await broadcast({
+      type: 'SYNC_ERROR',
+      ...syncContractView(cursor),
+      projectList: cursor.projectList,
+      projectFeed: cursor.projectFeed,
+      dislikedCount: cursor.dislikedCount,
+      dislikedApproximate: cursor.dislikedApproximate === true,
+    });
   } finally {
+    clearWatchdog();
     syncController = null;
+    // Cleared here, not at abort time: until the crawl has actually unwound the
+    // run is still real, and a press in that window must still be answered with
+    // `abortAvailable:true` rather than as a no-op.
+    syncCancelRequested = false;
   }
 }
 
@@ -4918,15 +8025,913 @@ function estimateSyncEta(startedAt, done, totalKnown, totalEstimate) {
 }
 
 /**
+ * How long a crawl may go without committing a page before it is presumed dead.
+ *
+ * Generous on purpose: a page can be held for a long rate-limit backoff
+ * (`Retry-After`) or one of the feed retries, and calling a live crawl dead
+ * would be the same over-confident report as the bugs this fixes. Ninety
+ * seconds is far longer than a healthy page takes and far shorter than the
+ * "frozen forever" the user was looking at.
+ */
+const SYNC_STALE_MS = 90000;
+/**
+ * Hard wall-clock ceiling for an entire crawl. A run that exceeds this is
+ * presumed stalled (network hang, evicted worker with no heartbeat), and the
+ * watchdog aborts it so the surfaces stop showing a frozen "Syncing".
+ * This is a ceiling on the whole run, not on a single page.
+ */
+const SYNC_WALL_CLOCK_MS = 45 * 60 * 1000;
+
+/**
+ * Is the persisted `running` cursor backed by a live crawl?
+ *
+ * There are two independent sources of truth and they disagree after an
+ * eviction: `syncController` is in-memory and dies with the worker, while the
+ * cursor row is durable and survives it. Before this existed the UI believed
+ * the cursor (so it showed a permanent "Syncing") and the cancel button believed
+ * the controller (so it reported "no library sync is running"), and neither could
+ * reconcile the two.
+ *
+ * @param {object|null} cursor the stored `syncState.feed` row
+ * @returns {{live:boolean, stale:boolean, heartbeatAt:number, ageMs:number|null,
+ *   reason:string|null}}
+ */
+function syncLiveness(cursor) {
+  const row = cursor && typeof cursor === 'object' ? cursor : null;
+  const claimsRunning = !!row && row.state === 'running';
+  const at = row ? Number(row.heartbeatAt) : NaN;
+  const ageMs = Number.isFinite(at) && at > 0 ? Math.max(0, Date.now() - at) : null;
+  if (!claimsRunning) {
+    return { live: false, stale: false, heartbeatAt: Number.isFinite(at) ? at : 0, ageMs, reason: null };
+  }
+  // No heartbeat at all means the row predates this field, or the worker died
+  // before its first page landed. Either way it cannot be shown as live.
+  if (ageMs === null) {
+    return { live: false, stale: true, heartbeatAt: 0, ageMs: null, reason: 'the crawl never reported a page' };
+  }
+  if (ageMs > SYNC_STALE_MS) {
+    return {
+      live: false,
+      stale: true,
+      heartbeatAt: at,
+      ageMs,
+      reason: 'no page was committed for ' + Math.round(ageMs / 1000) + 's, so the crawl is not running any more',
+    };
+  }
+  return { live: true, stale: false, heartbeatAt: at, ageMs, reason: null };
+}
+
+/**
+ * Turn an orphaned `running` cursor into an honest `interrupted` one.
+ *
+ * Called from every read of the sync state, so the recovery happens the moment
+ * anything looks — no timer, no user action. Idempotent.
+ *
+ * @param {object|null} row the stored cursor row
+ * @param {{live:boolean, stale:boolean, heartbeatAt:number, ageMs:number|null, reason:string|null}} live
+ * @returns {Promise<object|null>} the row as it should now be reported
+ */
+async function reconcileStaleCursor(row, live) {
+  if (!live || !live.stale) return row || null;
+  const current = row || {};
+  if (current.state === 'interrupted') return current;
+  log('warn', 'sync.crawl_orphaned', {
+    ageMs: live.ageMs,
+    heartbeatAt: live.heartbeatAt,
+    reason: live.reason,
+  });
+  const healed = Object.assign({}, current, {
+    state: 'interrupted',
+    stopReason: 'interrupted',
+    // The walk did not finish, and it did not finish because of anything the
+    // feed said — it stopped because the worker went away. Saying so is the
+    // difference between a user who retries and a user who waits forever.
+    error: 'the extension worker was stopped mid-crawl'
+      + (live.ageMs !== null ? ' (no page for ' + Math.round(live.ageMs / 1000) + 's)' : '')
+      + ' — press Sync to resume; indexed clips are kept',
+    completed: false,
+    truncated: true,
+    heartbeatAt: live.heartbeatAt,
+  });
+  try {
+    await DB.syncState.set('feed', healed);
+  } catch (healErr) {
+    log('warn', 'sync.heal_failed', { message: describeError(healErr).message });
+    return healed;
+  }
+  return healed;
+}
+
+/**
+ * Announce which PHASE of the crawl is running, and how far into it we are.
+ *
+ * WHY THIS EXISTS. `pagesDone` only ever counted `/api/feed/v3` pages, but a sync
+ * does three other things first, and on a 5,500-clip library they dominate the
+ * wall clock:
+ *
+ *   planning   page `/api/project/me`            (up to 100 pages)
+ *   mapping    page `/api/project/feed`          (~180 pages at 30 rows/page)
+ *   crawling   page `/api/feed/v3` per workspace (the only phase that indexes)
+ *   committing flush the buffer
+ *
+ * During planning and mapping ZERO clips are indexed, so the progress line read
+ * "starting · clips seen —" with a live-looking bar for minutes, and pressing
+ * Stop during it produced "0 clips indexed in 4s" — which reads as a failure when
+ * the crawl was in fact working correctly. The phase is what tells the user which
+ * of the four things is happening.
+ *
+ * @param {string} phase
+ * @param {{pagesDone?:number, items?:number, joined?:number, maxPages?:number,
+ *   note?:string}} [detail]
+ * @param {{cursor:object, added:number, projectsDone:number[]}} ctx the run's own
+ *   locals. They are passed IN rather than closed over: this function lives at
+ *   module scope, and the first version referenced `cursor`/`added`/`projectsDone`
+ *   as if they were module bindings. They are not — they are locals of `runSync` —
+ *   so every call threw `ReferenceError: cursor is not defined` and the crawl died
+ *   before its first request.
+ */
+async function reportSyncPhase(phase, detail, ctx) {
+  const run = ctx || {};
+  const cur = run.cursor && typeof run.cursor === 'object' ? run.cursor : null;
+  const info = detail || {};
+  const addedNow = Number.isFinite(run.added) ? run.added : 0;
+  const doneNow = Array.isArray(run.projectsDone) ? run.projectsDone.length : 0;
+  if (cur) {
+    cur.phase = phase;
+    if (info.pagesDone !== undefined) cur.phasePagesDone = info.pagesDone;
+    if (info.joined !== undefined) cur.phaseJoined = info.joined;
+    if (info.items !== undefined) cur.phaseItems = info.items;
+    cur.heartbeatAt = Date.now();
+    try {
+      await DB.syncState.set('feed', cur);
+    } catch (phaseErr) {
+      log('warn', 'sync.phase_persist_failed', { phase, message: describeError(phaseErr).message });
+    }
+  }
+   log('info', 'sync.phase', {
+     phase,
+     pagesDone: Number.isFinite(info.pagesDone) ? info.pagesDone : 0,
+     joined: Number.isFinite(info.joined) ? info.joined : 0,
+     items: Number.isFinite(info.items) ? info.items : 0,
+     note: info.note || null,
+   });
+   await broadcast({
+     type: 'SYNC_PROGRESS',
+     phase,
+     phasePagesDone: Number.isFinite(info.pagesDone) ? info.pagesDone : 0,
+    phaseJoined: Number.isFinite(info.joined) ? info.joined : 0,
+    phaseItems: Number.isFinite(info.items) ? info.items : 0,
+    note: info.note || null,
+    page: cur ? cur.pagesDone : 0,
+    pagesDone: cur ? cur.pagesDone : 0,
+    seen: cur ? cur.totalSeen : 0,
+    added: addedNow,
+    etaMs: null,
+    state: 'running',
+    workspace: null,
+    workspacesDone: doneNow,
+    total: cur ? cur.expectedTotal : 0,
+  });
+}
+
+/**
  * Cancel the crawl.
- * @returns {Promise<{ok:boolean}>}
+ *
+ * The reply is a contract the three UIs read, and it previously carried only
+ * `{ok:true}`, so every surface logged `was running: undefined` and none could
+ * tell a real cancel from a no-op press:
+ *
+ *   running         a controller was attached and alive when this was pressed
+ *   cancelRequested an abort has actually been signalled
+ *   abortAvailable  there is still a controller to signal (false once the run has
+ *                   already ended), so a second press can say "already stopping"
+ *                   instead of repeating the first press's line
+ *
+ * Aborting is cooperative: it only takes effect where the crawl awaits. A run
+ * parked in a rate-limit backoff or a page retry will not observe it until the
+ * current wait ends, so the UIs also need a bounded wait — that is why the
+ * reply is honest about what was signalled rather than promising a stop.
+ *
+ * @returns {Promise<{ok:boolean, running:boolean, cancelRequested:boolean,
+ *   abortAvailable:boolean}>}
  */
 async function cancelSync() {
-  if (syncController) {
-    syncController.abort();
-    log('info', 'sync.cancel_requested', {});
+  const stored = await DB.syncState.get('feed', null).catch(() => null);
+  const live = syncLiveness(stored);
+
+  // An orphaned cursor: the worker that owned the crawl is gone, so there is
+  // nothing to abort, but the UI still shows "Syncing" and a Stop button that
+  // appeared to do nothing. Clearing the claim is the whole point of the press.
+  if (!syncController && stored && stored.state === 'running') {
+    const healed = live.stale
+      ? await reconcileStaleCursor(stored, live)
+      : Object.assign({}, stored, { state: 'cancelled', completed: false, truncated: true, stopReason: 'aborted' });
+    if (!live.stale) {
+      try {
+        await DB.syncState.set('feed', healed);
+      } catch (markErr) {
+        log('warn', 'sync.cancel_mark_failed', { message: describeError(markErr).message });
+      }
+    }
+    log('info', 'sync.cancel_orphaned', { stale: live.stale, ageMs: live.ageMs });
+    void broadcast({
+      type: 'SYNC_CANCELLED',
+      state: 'cancelled',
+      running: false,
+      cancelRequested: false,
+      orphanedCursorCleared: true,
+      stale: live.stale,
+      heartbeatAt: Date.now(),
+    });
+    // Nothing was running, so `running` is false — but the press DID clear
+    // something, which is what the UI needs to hear in order to stop claiming a
+    // sync is in flight.
+    return {
+      ok: true,
+      running: false,
+      cancelRequested: false,
+      abortAvailable: false,
+      orphanedCursorCleared: true,
+      stale: live.stale,
+    };
   }
-  return { ok: true };
+
+  if (!syncController) {
+    log('info', 'sync.cancel_noop', { storedState: stored && stored.state });
+    void broadcast({
+      type: 'SYNC_CANCELLED',
+      state: 'cancelled',
+      running: false,
+      cancelRequested: false,
+      orphanedCursorCleared: false,
+      stale: false,
+      heartbeatAt: Date.now(),
+    });
+    return {
+      ok: true,
+      running: false,
+      cancelRequested: false,
+      abortAvailable: false,
+      orphanedCursorCleared: false,
+      stale: false,
+    };
+  }
+  const alreadyRequested = syncCancelRequested;
+  syncController.abort();
+  syncCancelRequested = true;
+  log('info', 'sync.cancel_requested', { alreadyRequested: alreadyRequested });
+  void broadcast({
+    type: 'SYNC_CANCEL_REQUESTED',
+    state: 'cancelling',
+    running: true,
+    cancelRequested: true,
+    alreadyRequested,
+    heartbeatAt: Date.now(),
+  });
+  // The cursor is the only durable record that survives an evicted worker, so a
+  // cancel that lands during a backoff is recorded there too. `state` stays
+  // `running` until the crawl actually unwinds, because claiming `cancelled`
+  // before it stops would be the same over-confident report as the two bugs
+  // this reply exists to fix.
+  try {
+    await DB.syncState.set('feed', Object.assign({}, (await DB.syncState.get('feed', null)), {
+      cancelRequested: true,
+      cancelRequestedAt: Date.now(),
+    }));
+  } catch (markErr) {
+    log('warn', 'sync.cancel_mark_failed', { message: markErr && markErr.message ? String(markErr.message) : 'unknown' });
+  }
+  return { ok: true, running: true, cancelRequested: true, abortAvailable: true, orphanedCursorCleared: false, stale: false };
+}
+
+/* -------------------------------------------------------------------------
+ * 13b. THE FEED PROBE — one real page, reported as a SHAPE
+ *
+ * It exists because two load-bearing facts about `/api/feed/v3` are UNVERIFIED
+ * against a live response, and a crawl that gets either wrong is silently
+ * truncated:
+ *
+ *   H-A  WHAT A PAGE ACTUALLY HOLDS. 100 is the shipped client's documented
+ *        maximum plus two third-party extensions' claim. If the server caps at
+ *        20, every "full page" inference and every page-count estimate in this
+ *        build is wrong by 5x.
+ *   H-B  WHAT THE CURSOR FIELD IS CALLED. The bundle says `next_cursor`; a
+ *        bundle is not a response. Before `readNextCursor` learned to tolerate
+ *        eight spellings and to distinguish "absent" from "null", a differently
+ *        named cursor made page 1 look like the end of the library — which is
+ *        the reported symptom exactly (a crawl that stops at 10-20% and says
+ *        COMPLETE).
+ *
+ * One request answers both, and the answer is a handful of key names, `typeof`s
+ * and counts.
+ *
+ * WHAT IT DELIBERATELY DOES NOT DO: return any clip content. No titles, prompts,
+ * lyrics, tags, descriptions or media URLs, and no token of any kind. A reply
+ * that leaked one row of a user's library into a diagnostics panel would be a far
+ * worse bug than the one this probes. Everything below is derived from KEY NAMES,
+ * TYPES, COUNTS, and a 12-character prefix of a cursor.
+ * ---------------------------------------------------------------------- */
+
+/** How much of a cursor value the probe may echo. 12 characters is enough to tell
+ *  two opaque tokens apart and far too little to be one. */
+const PROBE_CURSOR_SAMPLE_CHARS = 12;
+
+/** Per-clip scalar fields worth reporting, because they identify WHICH generation
+ *  of the API answered without being user content. */
+const PROBE_CLIP_SCALARS = Object.freeze(['major_model_version', 'is_liked', 'is_trashed']);
+
+/**
+ * The last probe's reply, in memory.
+ *
+ * IN MEMORY ON PURPOSE. It is a measurement, not state: nothing reads it to decide
+ * anything, it carries no clip content, and persisting it would mean a shape
+ * reading outliving the build that produced it. It is here so `GET_DIAGNOSTICS` can
+ * report the measurement after the fact without the caller having to keep the
+ * `PROBE_FEED` reply. A worker eviction drops it, which is the correct lifetime for
+ * "what did the last request look like".
+ * @type {object|null}
+ */
+let lastFeedProbe = null;
+
+/**
+ * The filter object the probe sends, mirroring `SunoAPI#iterateFeed`'s own
+ * construction exactly.
+ *
+ * WHY THE MIRROR IS NOT OPTIONAL: a probe that sends different filters measures a
+ * different request, and a different request can come back with a different page
+ * size or a different envelope. `iterateFeed` builds this from
+ * `getWorkspaceDefaultClipBrowserFilters` overlaid on the base filter, pruning
+ * anything left at its default; reproducing that here — with this comment naming
+ * it as the thing to keep in step — costs four lines instead of a silent
+ * divergence.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.includeTrashed=false]
+ * @param {'Any'|'True'|'False'} [opts.dislikedWire='False']
+ * @param {string|null} [opts.workspaceId] omit the key entirely for a whole-library
+ *   probe, matching `scope:'all'` in the walk
+ * @returns {Record<string, unknown>} the `filters` body field
+ */
+function feedProbeFilters(opts = {}) {
+  const includeTrashed = opts.includeTrashed === true;
+  const dislikedWire = opts.dislikedWire === 'Any' || opts.dislikedWire === 'True' || opts.dislikedWire === 'False'
+    ? opts.dislikedWire
+    : 'False';
+  const filters = {
+    trashed: includeTrashed ? 'Any' : 'False',
+    disliked: dislikedWire,
+    fromStudioProject: { presence: 'False' },
+    stem: { presence: 'False' },
+    stemComplement: 'False',
+    sort: { sortBy: 'created_at', sortDirection: 'desc' },
+  };
+  if (opts.workspaceId !== null && opts.workspaceId !== undefined) {
+    filters.workspace = { presence: 'Only', workspaceId: String(opts.workspaceId) };
+  }
+  return filters;
+}
+
+/**
+ * How many clips a feed page carried, WITHOUT reading a single one of them.
+ *
+ * @param {unknown} data the parsed envelope
+ * @returns {number} the length of whichever list field the envelope uses; 0 when
+ *   the envelope carries no recognisable list, which is itself the answer
+ */
+function countFeedClips(data) {
+  if (Array.isArray(data)) return data.length;
+  if (!data || typeof data !== 'object') return 0;
+  const body = /** @type {Record<string, any>} */ (data);
+  for (const key of ['clips', 'songs', 'items', 'results']) {
+    if (Array.isArray(body[key])) return body[key].length;
+  }
+  return 0;
+}
+
+/**
+ * The FIRST clip of a page, for shape purposes only: the caller extracts key names
+ * from it and nothing else. `items` entries are unwrapped the way the walk unwraps
+ * them, because a wrapper row has none of the keys a reader is looking for.
+ *
+ * @param {unknown} data
+ * @returns {Record<string, unknown>|null}
+ */
+function firstFeedClip(data) {
+  const list = Array.isArray(data)
+    ? data
+    : (data && typeof data === 'object'
+      ? (() => {
+        const body = /** @type {Record<string, any>} */ (data);
+        for (const key of ['clips', 'songs', 'items', 'results']) {
+          if (Array.isArray(body[key])) return body[key];
+        }
+        return null;
+      })()
+      : null);
+  if (!Array.isArray(list)) return null;
+  for (const entry of list) {
+    if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+      if (entry.clip && typeof entry.clip === 'object') return /** @type {Record<string, unknown>} */ (entry.clip);
+      return /** @type {Record<string, unknown>} */ (entry);
+    }
+  }
+  return null;
+}
+
+/**
+ * `{key, type}` for every top-level field of the envelope.
+ *
+ * KEY NAMES ONLY. A top-level value could be anything — including a clip list, a
+ * prompt, a signed URL — so each value is reduced to `typeof` before it leaves this
+ * function. This is the check that answers "is the clips array even called
+ * `clips`?", which is the same class of assumption the cursor reader got wrong.
+ *
+ * @param {unknown} data
+ * @returns {Array<{key:string, type:string}>}
+ */
+function describeEnvelopeKeys(data) {
+  if (data === null || data === undefined || typeof data !== 'object') return [];
+  const body = /** @type {Record<string, any>} */ (data);
+  const out = [];
+  for (const key of Object.keys(body)) {
+    let type;
+    try {
+      type = Array.isArray(body[key]) ? 'array' : typeof body[key];
+    } catch (keyErr) {
+      // A throwing getter must not take the probe down; the field is reported as
+      // unreadable, which is itself the diagnosis.
+      log('warn', 'probe.envelope_key_unreadable', { key, error: describeError(keyErr) });
+      type = 'unreadable';
+    }
+    out.push({ key, type });
+  }
+  return out;
+}
+
+/**
+ * A per-name census of every cursor spelling: present? what type? how long? and a
+ * 12-character prefix for a string.
+ *
+ * EVERY NAME IS CHECKED INDEPENDENTLY, which is the whole point. The walk stops at
+ * the FIRST usable alias, so a reply describing only the winner cannot answer "was
+ * there another field that also carried a cursor?" — and a `next_cursor:null`
+ * sitting beside a live `continuation` is precisely the case where that question
+ * decides whether the library really ended. A 12-character prefix identifies which
+ * token is in play and cannot be replayed as one.
+ *
+ * @param {unknown} data
+ * @param {ReadonlyArray<string>} names the spellings, in probe order
+ * @returns {Record<string, {present:boolean, type:string|null, length:number|null,
+ *   sample:string|null}>}
+ */
+function describeCursorFields(data, names) {
+  const out = {};
+  const body = data && typeof data === 'object' ? /** @type {Record<string, any>} */ (data) : null;
+  for (const name of Array.isArray(names) ? names : []) {
+    const present = !!body && Object.prototype.hasOwnProperty.call(body, name);
+    const value = present ? body[name] : undefined;
+    const type = present ? (Array.isArray(value) ? 'array' : typeof value) : null;
+    let length = null;
+    let sample = null;
+    if (present) {
+      if (typeof value === 'string') {
+        length = value.length;
+        sample = value.slice(0, PROBE_CURSOR_SAMPLE_CHARS);
+      } else if (Array.isArray(value)) {
+        length = value.length;
+      } else if (value && typeof value === 'object') {
+        length = Object.keys(value).length;
+      }
+    }
+    out[name] = { present, type, length, sample };
+  }
+  return out;
+}
+
+/**
+ * Scalar summaries of the fields that say WHICH generation of the API answered,
+ * without being user content.
+ *
+ * `major_model_version` is a model identifier; booleans and numbers are safe to
+ * echo. Nothing else is echoed at all — every other value collapses to its `type`,
+ * so this function cannot become the place a title leaks even if the field set
+ * changes under it.
+ *
+ * @param {Record<string, unknown>|null} clip
+ * @returns {Record<string, {present:boolean, type:string|null, value:unknown}>}
+ */
+function describeClipScalars(clip) {
+  const out = {};
+  for (const key of PROBE_CLIP_SCALARS) {
+    const present = !!clip && Object.prototype.hasOwnProperty.call(clip, key);
+    const value = present ? clip[key] : undefined;
+    let shown = null;
+    if (present) {
+      if (typeof value === 'boolean' || typeof value === 'number') shown = value;
+      else if (key === 'major_model_version' && typeof value === 'string') shown = value.slice(0, 24);
+    }
+    out[key] = {
+      present,
+      type: present ? (Array.isArray(value) ? 'array' : typeof value) : null,
+      value: shown,
+    };
+  }
+  return out;
+}
+
+/**
+ * Probe the feed route: ONE request, reported as a SHAPE.
+ *
+ * WHY IT EXISTS: the terminal signal of a library crawl is unverified. `next_cursor`
+ * and a page size of 100 are both read out of a bundle rather than out of a
+ * response, and when either is wrong the crawl truncates and reports COMPLETE.
+ * This route turns "I think" into a measurement on the user's own account, with no
+ * rebuild and no second sync: `{limit:100}` and `{limit:20}` settle H-A directly,
+ * and `cursorFields` settles H-B.
+ *
+ * WHAT IT RETURNS: key names, `typeof`s, counts, a 12-character cursor prefix, and
+ * three scalar per-clip flags. NEVER a clip title, prompt, lyric, tag, description
+ * or media URL, and never a token — not the bearer this request carried, not a
+ * `set-cookie`, not a response header. A caller should read `requested`, `url`,
+ * `status` and `clipCount` and believe the rest.
+ *
+ * UNVERIFIED, BY DESIGN: nothing this reports about the server is a claim this
+ * file can make — that is the point of the route. What IS enforced is the shape
+ * discipline of the reply itself, which is why every field is built by a pure
+ * function over key names, types and counts rather than by filtering a clip.
+ *
+ * @param {object} [payload]
+ * @param {number} [payload.limit] page size to ask for; clamped to
+ *   [1, `SunoAPI.LIMITS.feedPageLimit`] and defaulted to `settings.feedPageLimit`,
+ *   so a user can compare 100 against 20 without changing a stored setting
+ * @param {string} [payload.workspaceId='default'] the workspace to ask about
+ * @param {boolean} [payload.includeTrashed=false]
+ * @param {string} [payload.dislikedMode] one of the `DISLIKED_FILTER_BY_MODE` keys;
+ *   defaults to `'exclude'` so the probe measures the request the default crawl
+ *   makes
+ * @param {unknown} [payload.cursor] the cursor to ask from; omitted or `null`
+ *   means PAGE 1. See the note inside — this is the field that makes the probe able
+ *   to see the page that actually failed.
+ * @param {'Any'|'True'|'False'} [payload.dislikedWire] the tri-state filter to
+ *   send, bypassing `dislikedMode`. It grants no capability `dislikedMode` does not
+ *   already grant — it is the same three values under two different names — and it
+ *   exists because the automatic probe has to reproduce a walk's filter from a
+ *   walk-time value, not from a settings key.
+ * @param {chrome.runtime.MessageSender} [sender] accepted for route-signature
+ *   uniformity. This probe deliberately reads NO tab state and NO page data: it
+ *   talks to the API with the worker's own token, and its safety property is that
+ *   it has nothing at all to say about the sender.
+ * @returns {Promise<object>} the shape report; `{ok:false, code, error}` on failure
+ */
+async function probeFeed(payload, sender) {
+  void sender;
+  const input = payload && typeof payload === 'object' ? payload : {};
+  const limits = SunoAPI && SunoAPI.LIMITS ? SunoAPI.LIMITS : null;
+  if (!SunoAPIClient || typeof SunoAPIClient.fetchFeedPageRaw !== 'function' || !limits) {
+    /* Nothing to measure with. A failure with the same shape discipline rather
+     * than a half-filled success, so a caller can branch on `ok` without first
+     * checking which fields exist. */
+    const noClient = {
+      ok: false,
+      code: 'no_client',
+      error: 'lib/api.js did not register, so there is no client to probe the feed with',
+    };
+    lastFeedProbe = Object.assign({ at: Date.now() }, noClient);
+    return noClient;
+  }
+  /* `feedPageLimit` is resolved here so the reply reports the SETTING beside the
+   * value actually requested, and a caller can tell "asked for 20" from "asked
+   * for 20 because the setting is 20". */
+  const settingLimit = resolveFeedPageLimit(settingsCache.feedPageLimit, DEFAULT_SETTINGS.feedPageLimit);
+  const askedLimit = input.limit === undefined || input.limit === null
+    ? settingLimit
+    : resolveFeedPageLimit(input.limit, settingLimit);
+  const workspaceId = typeof input.workspaceId === 'string' && input.workspaceId.trim()
+    ? input.workspaceId.trim().slice(0, 200)
+    : 'default';
+  const includeTrashed = input.includeTrashed === true;
+  const requestedMode = String(input.dislikedMode || '');
+  const mode = Object.prototype.hasOwnProperty.call(DISLIKED_FILTER_BY_MODE, requestedMode)
+    ? requestedMode
+    : 'exclude';
+  const filters = feedProbeFilters({
+    includeTrashed,
+    dislikedWire: input.dislikedWire === 'Any' || input.dislikedWire === 'True' || input.dislikedWire === 'False'
+      ? input.dislikedWire
+      : dislikedWireValue(DISLIKED_FILTER_BY_MODE[mode]),
+    workspaceId,
+  });
+
+  /* WHICH PAGE TO ASK FOR.
+   *
+   * WHY THIS IS NOT STILL HARD-CODED `null`: `cursor:null` is page 1, and page 1
+   * of a feed that paginates at all ALWAYS carries a cursor. So the probe as it
+   * stood could not reproduce the failure it exists to diagnose — it measured the
+   * one page that demonstrably works. The reported defect (`stopReason:
+   * 'cursor_missing'`, the walk stopping on its FINAL page, mid-walk cursors read
+   * fine on pages 1-4) is a statement about a page this probe never asked for.
+   *
+   * The token itself is passed through untouched to `fetchFeedPageRaw`
+   * (`opts.cursor`), and is NOT echoed in the reply — see `describeRequestedCursor`.
+   */
+  const cursor = input.cursor === undefined ? null : input.cursor;
+
+  let raw;
+  try {
+    raw = await SunoAPIClient.fetchFeedPageRaw({
+      cursor,
+      limit: askedLimit,
+      filters,
+      // A probe retries once and no more: if the measurement fails, the answer is
+      // "it failed", and hammering a route to produce an error page helps nobody.
+      retries: 1,
+    });
+  } catch (probeErr) {
+    /* `fetchFeedPageRaw` never throws for an HTTP or a transport failure, so
+     * reaching here means the CLIENT ITSELF failed — a route table without the
+     * feed route, or a client shaped unlike this build expects. Logged with
+     * context (never swallowed) and returned in the shape every other failure
+     * uses. */
+    const info = describeError(probeErr);
+    log('warn', 'probe.feed_threw', { error: info });
+    const failed = { ok: false, code: info.code || 'probe_failed', error: redactText(info.message) };
+    lastFeedProbe = Object.assign({ at: Date.now() }, failed);
+    return failed;
+  }
+  return finishFeedProbe(raw, { limits, settingLimit, askedLimit, filters });
+}
+
+/**
+ * The cursor a probe was aimed at, as a description rather than as the value.
+ *
+ * WHY THIS EXISTS NOW AND NOT BEFORE: `finishFeedProbe` published
+ * `requested: raw.requested` verbatim, which is harmless ONLY while
+ * `probeFeed` always sent `cursor:null`. A probe that can be aimed at a real page
+ * carries a real token, and `lastFeedProbe` is handed to any diagnostics UI and
+ * mirrored into the durable log buffer — so publishing it would have leaked a
+ * live pagination token into two places that outlive the worker. Same discipline
+ * as `describeCursorFields`: type, length, and 12 characters.
+ *
+ * @param {unknown} value
+ * @returns {{supplied:boolean, type:string|null, length:number|null, sample:string|null}}
+ */
+function describeRequestedCursor(value) {
+  if (value === null || value === undefined) {
+    return { supplied: false, type: value === null ? 'null' : null, length: null, sample: null };
+  }
+  const type = Array.isArray(value) ? 'array' : typeof value;
+  let length = null;
+  let sample = null;
+  if (typeof value === 'string') {
+    length = value.length;
+    sample = value.slice(0, PROBE_CURSOR_SAMPLE_CHARS);
+  } else if (Array.isArray(value)) {
+    length = value.length;
+  } else if (typeof value === 'object') {
+    length = Object.keys(value).length;
+  }
+  return { supplied: true, type, length, sample };
+}
+
+/**
+ * Turn one `fetchFeedPageRaw` result into the reply, and cache it for
+ * `GET_DIAGNOSTICS`.
+ *
+ * Split out of `probeFeed` so the reply's SHAPE can be read, and audited, in one
+ * place — it is the one function in this build whose entire contract is "contains
+ * no clip content", and a single constructor is the only way that is checkable.
+ *
+ * @param {object} raw the client's raw result
+ * @param {{limits:object, settingLimit:number, askedLimit:number, filters:object}} ctx
+ * @returns {object} the reply, also stored in `lastFeedProbe`
+ */
+function finishFeedProbe(raw, ctx) {
+  const envelope = raw && raw.data;
+  const clip = firstFeedClip(envelope);
+  const ok = !!(raw && raw.ok);
+  const names = Array.isArray(ctx.limits.feedCursorFields) ? ctx.limits.feedCursorFields : [];
+  /* `matchedAlias` comes from the WALK'S OWN READER (`SunoAPI.readCursorField`), so
+   * it answers "which spelling would the crawl have followed?" rather than "which
+   * spelling did the probe think of first". A second copy of the alias list in the
+   * reporter is exactly how the two would drift. */
+  const matched = SunoAPI.readCursorField(envelope);
+  const reply = {
+    ok,
+    url: typeof raw.url === 'string' ? raw.url : null,
+    method: 'POST',
+    status: Number.isFinite(raw.status) ? raw.status : 0,
+    /* Which verified host answered. Both base URLs are deployed, and "the primary
+     * failed over" is part of any honest account of a probe result. */
+    via: typeof raw.via === 'string' ? raw.via : null,
+    /* What was asked for, with the cursor DESCRIBED rather than reproduced — see
+     * `describeRequestedCursor`. `limit` and `filters` are unchanged and still
+     * verbatim; `filters` is a fixed vocabulary this file wrote itself, and the
+     * reply already publishes it above as `filters`. */
+    requested: raw.requested && typeof raw.requested === 'object'
+      ? {
+        cursor: describeRequestedCursor(raw.requested.cursor),
+        limit: raw.requested.limit,
+        filters: raw.requested.filters,
+      }
+      : null,
+    /* The SETTING and the value actually requested, side by side. */
+    feedPageLimit: ctx.settingLimit,
+    requestedLimit: ctx.askedLimit,
+    filters: ctx.filters,
+    /* THE ANSWER TO H-A: how many clips came back for the `limit` asked for. A
+     * number, never the clips. `clipCount < requestedLimit` on page 1 is the
+     * server's real cap. */
+    clipCount: countFeedClips(envelope),
+    topLevelKeys: describeEnvelopeKeys(envelope),
+    /* THE ANSWER TO H-B: every spelling, independently. */
+    cursorFields: describeCursorFields(envelope, names),
+    matchedAlias: matched.alias,
+    cursorState: matched.state,
+    cursorAliasesPresent: matched.present,
+    /* Key NAMES of one clip — the most diagnostic field in the reply and the
+     * cheapest. It shows which generation of the API answered, which is why a walk
+     * can fail on a field it ASSUMED rather than on a field that is absent. */
+    sampleClipKeys: clip ? Object.keys(clip) : [],
+    firstClipCounts: describeClipScalars(clip),
+    attempts: Number.isFinite(raw.attempts) ? raw.attempts : 0,
+    elapsedMs: Number.isFinite(raw.elapsedMs) ? raw.elapsedMs : 0,
+    error: null,
+  };
+  if (!ok) {
+    /* The same discipline on the failure path: the status and the SHAPE are the
+     * whole diagnosis of a probe that failed — a 422 body says which body field the
+     * server rejected — and neither is clip content. `raw.error` is reduced to its
+     * redacted MESSAGE: its `body` is the server's response and its `reason` may
+     * quote it, so neither is forwarded. */
+    const info = describeError(raw.error);
+    reply.code = info.code || 'probe_failed';
+    reply.error = redactText(info.message || `the probe request failed with HTTP ${reply.status}`);
+    log('info', 'probe.feed_failed', {
+      status: reply.status,
+      code: reply.code,
+      clipCount: reply.clipCount,
+      topLevelKeys: reply.topLevelKeys.length,
+    });
+  } else {
+    log('info', 'probe.feed', {
+      status: reply.status,
+      clipCount: reply.clipCount,
+      requestedLimit: reply.requestedLimit,
+      /* The H-A finding, in one comparison a reader cannot misread. */
+      pageCameBackShort: reply.clipCount < ctx.askedLimit,
+      matchedAlias: reply.matchedAlias,
+      cursorState: reply.cursorState,
+      topLevelKeys: reply.topLevelKeys.length,
+    });
+  }
+  lastFeedProbe = Object.assign({ at: Date.now() }, reply);
+  return reply;
+}
+
+/* --------------------------------------------------------------------------
+ * THE AUTOMATIC CURSOR-LESS PROBE
+ *
+ * WHY IT EXISTS. A walk that stops on a page carrying no cursor field is stopped
+ * by an UNVERIFIED fact — the name of that field — and the user is left holding
+ * "it could not read the feed's paging field" with no way to act on it. The
+ * measurement that would settle it (`topLevelKeys` / `cursorFields` /
+ * `matchedAlias` on that exact page) used to require opening the options page,
+ * hitting PROBE_FEED, and hoping page 1 resembled the page that failed — which it
+ * does not, since page 1 is the one page that always carries a cursor. So the
+ * probe now fires itself, aimed at the cursor the failing request was sent with,
+ * and the next occurrence of this bug explains itself without anybody writing
+ * code.
+ *
+ * WHAT IT IS NOT. It does not change a verdict, a stop reason, a count, or a
+ * `completed` flag, it does not write to the database or to `syncState`, and it
+ * does not touch the cursor reader's alias list. A discovered spelling is
+ * RECORDED AS A DIAGNOSTIC and a human adds it to `CURSOR_FIELD_ALIASES` in
+ * lib/api.js: a parser that edits its own alias table is not reviewable, and this
+ * is a security-adjacent parser over a live authenticated response.
+ * ---------------------------------------------------------------------- */
+
+/** The client's own error codes for "this page carried no cursor field". Both
+ *  zero-clip and clip-bearing pages qualify; `empty_page_with_cursor` does not
+ *  (that one had a readable cursor), and neither does an abort, a page failure or
+ *  a page cap — so a cancelled or capped walk never spends a probe. */
+const CURSOR_LESS_STOP_CODES = Object.freeze(['cursor_missing', 'empty_page_no_cursor']);
+
+/** Per-run one-shot. Reset by `startSync`; see `AUTO_FEED_PROBE_STATE`. */
+const AUTO_FEED_PROBE = { runFired: false, inFlight: false, lastAt: 0 };
+
+/**
+ * How long an automatic probe waits before firing again ACROSS runs.
+ *
+ * The per-run latch stops one crawl from probing sixty times. This stops a user
+ * who presses Sync sixty times from doing it — one measurement per ten minutes is
+ * enough to catch a shape change, and this is the user's own rate limit on the
+ * user's own account.
+ */
+const AUTO_FEED_PROBE_COOLDOWN_MS = 10 * 60 * 1000;
+
+/**
+ * Fire at most one probe per sync run, aimed at the page the walk could not read.
+ *
+ * FIRED, NOT AWAITED. The crawl must not wait on a diagnostic request, so this
+ * returns immediately and the promise is settled on its own. Everything the probe
+ * produces is a log line plus `lastFeedProbe`; nothing here is on the path to a
+ * verdict, which is exactly why it is safe to leave unattended.
+ *
+ * THE THIRD LATCH IS NOT PARANOIA. `runFired` bounds one run, the cooldown bounds
+ * repeated runs, and `inFlight` bounds the worker: a long run can reach its
+ * first cursor-less page while a previous run's probe is still outstanding, and
+ * two measurements of the same envelope is one too many.
+ *
+ * @param {{workspaceId:string, cursor:unknown, limit:number, includeTrashed:boolean,
+ *   dislikedWire:string, stopReason:string|null, endOfFeedEvidence:string|null,
+ *   evidence:object|null, signal:AbortSignal|null}} ctx
+ * @returns {void}
+ */
+function maybeAutoProbeFeed(ctx) {
+  const at = Date.now();
+  if (AUTO_FEED_PROBE.runFired) {
+    log('info', 'probe.feed_auto_skipped', { why: 'already_fired_this_run' });
+    return;
+  }
+  if (AUTO_FEED_PROBE.inFlight) {
+    log('info', 'probe.feed_auto_skipped', { why: 'one_in_flight' });
+    return;
+  }
+  const sinceLast = at - AUTO_FEED_PROBE.lastAt;
+  if (AUTO_FEED_PROBE.lastAt > 0 && sinceLast < AUTO_FEED_PROBE_COOLDOWN_MS) {
+    /* A skip is still said out loud: a reader looking for the measurement and
+     * finding nothing needs to know it was suppressed on purpose rather than lost. */
+    log('warn', 'probe.feed_auto_skipped', {
+      why: 'cooldown',
+      retryInMs: AUTO_FEED_PROBE_COOLDOWN_MS - sinceLast,
+    });
+    return;
+  }
+  AUTO_FEED_PROBE.runFired = true;
+  AUTO_FEED_PROBE.inFlight = true;
+  AUTO_FEED_PROBE.lastAt = at;
+  /* A null cursor here means the walk failed on page 1, which is a real and
+   * distinct situation (the envelope is unreadable from the very start) and still
+   * worth one measurement. It is flagged below so nobody reads the result as a
+   * measurement of the failing page when it is a measurement of page 1. */
+  const aimedAtFirstPage = ctx.cursor === null || ctx.cursor === undefined;
+  log('error', 'probe.feed_auto_fired', {
+    /* WHY `error` AND NOT `info`: `flushDiagnostics` drops everything below
+     * `error` unless `settings.debug` is on, so an `info` line here would leave no
+     * durable trace of the one event whose whole purpose is to survive until
+     * somebody reads it. The run genuinely failed, so the level is honest too. */
+    workspaceId: ctx.workspaceId,
+    stopReason: ctx.stopReason,
+    endOfFeedEvidence: ctx.endOfFeedEvidence,
+    aimedAtFirstPage,
+    requestedLimit: ctx.limit,
+    /* The client's own measurement of the failing page, beside the probe's. This
+     * is the pair that settles it: what the walk saw, next to what the probe saw
+     * when asked for the same page. */
+    walkSawTopLevelKeys: ctx.evidence && Array.isArray(ctx.evidence.topLevelKeys)
+      ? ctx.evidence.topLevelKeys
+      : null,
+    walkSawVia: ctx.evidence && ctx.evidence.via ? ctx.evidence.via : null,
+    walkSawSignals: ctx.evidence && ctx.evidence.signals ? ctx.evidence.signals : null,
+  });
+  void probeFeed({
+    cursor: ctx.cursor,
+    limit: ctx.limit,
+    workspaceId: ctx.workspaceId,
+    includeTrashed: ctx.includeTrashed,
+    dislikedWire: ctx.dislikedWire,
+    /* `probeFeed` takes a sender it deliberately ignores; there is no tab and no
+     * page here, which is the whole safety property of that route. */
+  }, null).then((reply) => {
+    AUTO_FEED_PROBE.inFlight = false;
+    /* `finishFeedProbe` has already cached this as `lastFeedProbe` (and logged
+     * `probe.feed`); this line exists so the DURABLE buffer carries the finding
+     * itself, not only the fact that a probe ran. The whole payload is key names,
+     * types, counts and cursor samples — `finishFeedProbe` is the single function
+     * that guarantees it contains no clip content. */
+    log('error', 'probe.feed_auto_result', {
+      ok: reply && reply.ok === true,
+      status: reply ? reply.status : 0,
+      via: reply ? reply.via : null,
+      clipCount: reply ? reply.clipCount : 0,
+      requestedLimit: reply ? reply.requestedLimit : null,
+      /* THE ANSWER, IF THERE IS ONE. `cursorFields` reports every known spelling
+       * independently; a name showing `present:true` with a length beside it is
+       * the spelling `CURSOR_FIELD_ALIASES` is missing, and `matchedAlias` is what
+       * the walk's own reader would have followed had it been in the list. */
+      matchedAlias: reply ? reply.matchedAlias : null,
+      cursorState: reply ? reply.cursorState : null,
+      cursorFields: reply ? reply.cursorFields : null,
+      topLevelKeys: reply ? reply.topLevelKeys : null,
+      sampleClipKeys: reply ? reply.sampleClipKeys : null,
+      error: reply ? reply.error : null,
+    });
+  }).catch((probeErr) => {
+    AUTO_FEED_PROBE.inFlight = false;
+    /* `probeFeed` returns failures rather than throwing, so reaching here means
+     * the probe machinery itself broke. Logged, never swallowed. */
+    log('error', 'probe.feed_auto_threw', { error: describeError(probeErr) });
+  });
 }
 
 /* ==========================================================================
@@ -5330,13 +9335,20 @@ const ROUTES = {
   GET_BOOT: {
     handler: async () => {
       const settings = await loadSettings();
-      const [cursor, dbStats, byState, quotaCached, lastBatch] = await Promise.all([
+      const [storedCursor, dbStats, byState, quotaCached, lastBatch] = await Promise.all([
         DB.syncState.get('feed', null),
         DB.stats(),
         DB.downloads.countByState(),
         readCachedQuota(),
         DB.meta.get(META_KEYS.LAST_BATCH_SUMMARY, null),
       ]);
+      /* Same self-healing as `SYNC_STATUS`. Opening the popup after a worker
+       * eviction used to show a permanent "Syncing" with a Stop button that
+       * reported "no library sync is running" — the durable row claimed a run
+       * that the (now absent) controller no longer owned. Reconciling on read
+       * means the first paint after an eviction is already truthful. */
+      const live = syncLiveness(storedCursor);
+      const cursor = live.stale ? await reconcileStaleCursor(storedCursor, live) : storedCursor;
       return {
         ok: true,
         version: chrome.runtime.getManifest().version,
@@ -5354,20 +9366,56 @@ const ROUTES = {
           schemaVersion: dbStats.schemaVersion,
         },
         sync: cursor
-          ? {
-            state: cursor.state || 'idle',
-            pagesDone: cursor.pagesDone || 0,
-            nextPage: cursor.nextPage || 0,
-            totalSeen: cursor.totalSeen || 0,
-            // The single most important field in this reply: a truncated crawl
-            // means the library on disk is incomplete and every surface must
-            // say so loudly.
-            truncated: cursor.truncated === true,
-            dislikedCount: cursor.dislikedCount,
-            dislikedApproximate: cursor.dislikedApproximate === true,
-            lastError: cursor.lastError || null,
-            durationMs: cursor.durationMs || null,
-          }
+          ? Object.assign(
+            /* THE COMPLETENESS CONTRACT, from the same builder as `SYNC_DONE`,
+             * `SYNC_ERROR` and `SYNC_STATUS`, so the key set and the MEANING of
+             * each name are identical on all four:
+             *   completed      authoritative; `truncated === !completed`
+             *   stopReason     the walk's own vocabulary where it named one, else
+             *                  the worker-level reason
+             *   error          redacted text; NEVER dropped on the failure path
+             *   expectedTotal  sum of every project's `clip_count`
+             *   totalSeen      UNIQUE clips indexed (also published as
+             *                  `uniqueSeen`)
+             *   examined       rows examined, repeats included — what
+             *                  `missing` is computed from
+             *   missing        expectedTotal - examined, floored at 0.
+             *                  AUTHORITATIVE when it is a number, `0` included
+             *   oracleApplied  was `missing` CHECKED, or merely reported?
+             *   advisory       why it was only reported (never an error)
+             *   workspaces     one row per project:
+             *                  {projectId,name,completed,pagesDone,totalSeen,
+             *                   expected,missing,oracleApplied,advisory,
+             *                   stopReason,error}
+             * `state` is `idle` ONLY when the crawl completed; `incomplete` means
+             * it finished its loop and the library on disk is still short of the
+             * oracle; `error` means the run broke; `cancelled` means the user
+             * stopped it. A UI must never collapse the last three into
+             * "Up to date".
+             *
+             * `nextPage` IS GONE FROM HERE, and that is the point: it is read by
+             * nothing (a cursor walk resumes at workspace granularity), it is
+             * explicitly nulled in the stored row because `syncState.set` merges,
+             * and publishing `cursor.nextPage || 0` advertised a resume position
+             * that could only ever be `0`. `pass` had the same problem and is gone
+             * from `SYNC_STATUS.cursor` for the same reason. */
+            syncContractView(cursor),
+            {
+              projects: Array.isArray(cursor.projectIds) ? cursor.projectIds.length : 0,
+              projectList: cursor.projectList || null,
+              projectFeed: cursor.projectFeed || null,
+              dislikedCount: cursor.dislikedCount,
+              dislikedApproximate: cursor.dislikedApproximate === true,
+              // The pre-contract spelling, kept so a UI that reads `lastError`
+              // instead of `error` still gets the accumulated message.
+              lastError: cursor.lastError || null,
+              durationMs: cursor.durationMs || null,
+              /* Liveness, so a surface can tell "in flight" from "orphaned by a
+               * worker eviction" without recomputing a timestamp itself. */
+              interrupted: live.stale === true,
+              heartbeatAt: live.heartbeatAt,
+            }
+          )
           : null,
         download: {
           running: !!batchController,
@@ -5383,6 +9431,17 @@ const ROUTES = {
           lyrics: !!SunoLyrics,
           offscreen: !!(chrome.offscreen && chrome.offscreen.hasDocument),
           missingLibs: MISSING_LIBS,
+          // Main-world capability, stated as capability rather than as outcome:
+          // the content script uses these to drive the page, and a build that
+          // cannot inject cannot patch `MediaSource` or read the auth tap.
+          mainWorld: {
+            ops: MAIN_WORLD_OP_NAMES,
+            scripting: !!(chrome.scripting && chrome.scripting.executeScript),
+          },
+          // The last mint that came back empty, so the "Not signed in" line the
+          // user sees is never a dead end. `GET_BOOT` is polled on mount, which
+          // makes it the surface most likely to have the answer.
+          lastAuthFailure,
         },
       };
     },
@@ -5409,7 +9468,16 @@ const ROUTES = {
    *   drm:object|null,                SunoDRM.stats()
    *   audioWarnings:string[],         non-fatal Web Audio degradations
    *   missingLibs:string[],           global names that failed to register
-   *   rateLimiter:object|null}>}
+   *   rateLimiter:object|null,
+   *   mainWorldOps:string[],          the exact ops `RUN_MAIN_WORLD` accepts
+   *   feedProbe:object|null,          the last `PROBE_FEED` shape report, so the
+   *                                    feed page size and cursor field name can be
+   *                                    read here without opening that route.
+   *                                    Null until a probe has run; NEVER contains
+   *                                    clip content or token material
+   *   lastAuthFailure:object|null}>}  the account of the last failed mint, or
+   *                                    null when no mint has failed. NEVER
+   *                                    contains token material.
    */
   GET_DIAGNOSTICS: {
     handler: async () => ({
@@ -5423,16 +9491,68 @@ const ROUTES = {
       rateLimiter: SunoAPIClient && SunoAPIClient.rateLimiter
         ? SunoAPIClient.rateLimiter.stats()
         : null,
+      /* The feed-shape measurement, so "is the page size really 100?" and "what is
+       * the cursor field called?" are answerable from the diagnostics surface
+       * rather than only from the console. Cached in memory by `probeFeed`; null
+       * means no probe has run in this worker, which is a different statement from
+       * "the probe found nothing". */
+      feedProbe: lastFeedProbe,
+      // The whole point of this pair: "not signed in" must be answerable from
+      // one reply. `mainWorldOps` says which probes exist, and
+      // `lastAuthFailure` says which one was reached last time and what each
+      // step answered — no guessing, and no credential in either.
+      mainWorldOps: MAIN_WORLD_OP_NAMES,
+      lastAuthFailure,
     }),
   },
 
   /* ---- auth ------------------------------------------------------- */
+
+  /**
+   * The one route that injects into a page's MAIN world.
+   *
+   * UI: called by `content/content.js` (`mainWorldOp()`) for `hls-patch`,
+   * `hls-restore` and `probe`, and for `auth-tap` on mount so the tap is in place
+   * before the first mint needs it. There is no extension-page UI for this route:
+   * an extension page has no `sender.tab`, so it is refused with `no_tab` — which
+   * is correct, because the worker drives its own tabs through `injectMainWorldOp`.
+   *
+   * @param {{op:string, timeoutMs?:number}} [payload] `timeoutMs` is read only
+   *   by `clerk-token`, and is coerced and clamped before it reaches the page
+   * @param {chrome.runtime.MessageSender} sender
+   * @returns {Promise<{ok:true, op:string, result:object}|{ok:false, code:string, error:string}>}
+   */
+  RUN_MAIN_WORLD: {
+    handler: async (payload, sender) => runMainWorldOp(payload || {}, sender),
+  },
+
+  /**
+   * Hand the worker a JWT the content script's auth tap captured.
+   *
+   * ONE CALLER: `content/content.js` (§21, on mount) sends
+   * `{token, expiresAt: 0}` from an eager `auth-read`, so the worker holds a
+   * token BEFORE it needs one instead of minting on the critical path.
+   * `expiresAt: 0` means "unknown expiry", which is the truth: the tap has seen
+   * a bearer header, not a verified JWT `exp` claim, and `writeSessionToken`
+   * re-derives real expiry from the token it stores.
+   *
+   * REMOVED FROM THIS HANDLER: the `payload.requestId` branch. It called
+   * `resolveTokenRelay(...)`, which was DELETED along with the rest of the
+   * content-script token relay (`SUNO_TOKEN_REQUEST` / `tokenRelayWaiters`).
+   * Leaving it was not merely dead code — `resolveTokenRelay` was not defined
+   * ANYWHERE in this file, so ANY caller sending a `requestId` would have hit
+   * a `ReferenceError` and the handler would have died BEFORE storing the token
+   * or broadcasting anything. The one real caller sends no `requestId`, which is
+   * exactly why the latent crash never surfaced as a symptom.
+   *
+   * @param {{token:string, expiresAt?:number}} payload
+   * @returns {Promise<{ok:true, expiresAt:number|null}|{ok:false, error:string, code:string}>}
+   */
   SET_TOKEN: {
     handler: async (payload) => {
       const token = typeof payload.token === 'string' ? payload.token : '';
       if (token.length > 20) {
         await writeSessionToken(token, payload.expiresAt);
-        if (payload.requestId) resolveTokenRelay(payload.requestId, token);
         await broadcast({ type: 'TOKEN_CHANGED', expiresAt: (authCache && authCache.exp) || null });
         return { ok: true, expiresAt: authCache ? authCache.exp : null };
       }
@@ -5457,12 +9577,74 @@ const ROUTES = {
 
   SYNC_STATUS: {
     handler: async () => {
-      const cursor = await DB.syncState.get('feed', null);
+      const stored = await DB.syncState.get('feed', null);
+      /* SELF-HEALING. `running` in the row and a live `syncController` are two
+       * independent truths, and after a worker eviction they disagree: the row
+       * still claims a run, the controller is gone. Reconciling here means the
+       * very next poll — and the panel polls on every open — turns the frozen
+       * "Syncing" into an honest "interrupted", without waiting for the user to
+       * press anything. */
+      const live = syncLiveness(stored);
+      const cursor = live.stale ? await reconcileStaleCursor(stored, live) : stored;
+      const runningNow = !!syncController || (live.live && !live.stale);
+      /* `nextPage` and `pass` are STRIPPED from the row on the way out by
+       * `cursorForWire`: they are page-era fields this crawl never writes
+       * (`freshCursor` nulls them only so `syncState.set`'s merge cannot resurrect
+       * a legacy value) and neither is read by anything. A `cursor.nextPage` on
+       * this reply is a number that cannot mean anything. */
+      if (!cursor) {
+        /* NO ROW IS NOT A RUN, AND IT IS NOT A FAILED ONE. This is the reply a
+         * brand-new install gets — the panel polls `SYNC_STATUS` on every open —
+         * so every count and BOTH VERDICT FLAGS are `null`: "not measured" and
+         * "no verdict" rather than `0`/`truncated:true`. Emitting
+         * `truncated:true` here would satisfy `truncated === !completed` by
+         * making every surface paint a fresh install as an incomplete library,
+         * which is precisely what the placeholder is there to prevent. Every
+         * reader folds `null` into absent (popup/popup.js `pick`,
+         * side_panel.js `pick`), so this shape reads as the placeholder it is. */
+         return {
+           ok: true,
+           running: runningNow,
+           interrupted: false,
+           heartbeatAt: 0,
+           cancelRequested: syncCancelRequested === true,
+           cancelling: syncCancelRequested === true,
+           cursor: null,
+          completed: null,
+          truncated: null,
+          stopReason: null,
+          error: null,
+          expectedTotal: null,
+          totalSeen: null,
+          uniqueSeen: null,
+          examined: null,
+          missing: null,
+          oracleApplied: null,
+          advisory: null,
+          workspaces: [],
+          state: null,
+          pagesDone: 0,
+          total: await DB.clips.count(),
+        };
+      }
       return {
         ok: true,
-        running: !!syncController,
-        cursor,
-        truncated: !!(cursor && cursor.truncated === true),
+        running: runningNow,
+        interrupted: live.stale === true,
+        heartbeatAt: live.heartbeatAt,
+        cancelRequested: syncCancelRequested === true || (cursor && cursor.cancelRequested === true),
+        cancelling: syncCancelRequested === true || (cursor && cursor.cancelRequested === true),
+        /* The whole cursor goes back, so `completed` / `truncated` / `stopReason` /
+         * `error` / `expectedTotal` / `missing` / `advisory` / `workspaces` are
+         * present one level down exactly as `GET_BOOT.sync` presents them flat —
+         * `cursorForWire` is what publishes `advisory` there, under the SAME name
+         * the flat copy uses, so this claim is now true of every contract key. The
+         * contract is also mirrored here at the top level, because this reply is
+         * polled by the dock and a poller should not have to know where in the
+         * object to look — and it comes from `syncContractView`, so the flat copy
+         * and `GET_BOOT.sync` are the same numbers produced by the same code. */
+        cursor: cursorForWire(cursor),
+        ...syncContractView(cursor),
         total: await DB.clips.count(),
       };
     },
@@ -5470,6 +9652,37 @@ const ROUTES = {
 
   SYNC_CANCEL: {
     handler: () => cancelSync(),
+  },
+
+  /**
+   * `PROBE_FEED`: ONE real `POST /api/feed/v3`, reported as a SHAPE.
+   *
+   * WHY IT IS A ROUTE AND NOT A BUILD FLAG: the two facts a library crawl depends
+   * on — the real page size, and the real name of the cursor field — are read out
+   * of a shipped bundle and have never been checked against a live response. When
+   * either is wrong the crawl truncates and reports COMPLETE, which is the worst
+   * failure mode an extension has. This route measures both on the user's own
+   * account, on demand, without a rebuild and without a full sync: send
+   * `{limit:100}` and then `{limit:20}` and compare `clipCount`, and read
+   * `cursorFields` / `matchedAlias` for the field the walk would follow.
+   *
+   * It REPLACES no clip content and NO token. Every field is a key name, a
+   * `typeof`, a count, or a 12-character cursor prefix — see `probeFeed`.
+   *
+   * ONE REQUEST, no side effects beyond that request: it does not write to the
+   * database, does not touch `syncState`, and does not spend download quota.
+   *
+   * UI: the corresponding control belongs in the OPTIONS surface's diagnostics
+   * panel. Nothing in this build sends this message on its own; the result is also
+   * readable from `GET_DIAGNOSTICS` as `feedProbe`.
+   *
+   * @param {{limit?:number, workspaceId?:string, includeTrashed?:boolean,
+   *   dislikedMode?:string}} [payload]
+   * @param {chrome.runtime.MessageSender} sender
+   * @returns {Promise<object>} the shape report, or `{ok:false, code, error}`
+   */
+  PROBE_FEED: {
+    handler: (payload, sender) => probeFeed(payload || {}, sender),
   },
 
   /* ---- query ------------------------------------------------------ */
@@ -6100,10 +10313,20 @@ async function bootstrap() {
   try {
     const cursor = await DB.syncState.get('feed', null);
     if (cursor && cursor.state === 'running') {
-      log('info', 'sync.interrupted_state_noted', { nextPage: cursor.nextPage });
+      /* `nextPage` is gone: `/api/feed/v3` pages by cursor, so what an evicted
+       * worker leaves behind is a PROJECT PLAN plus the list of workspaces it
+       * finished, not a page ordinal. */
+      log('info', 'sync.interrupted_state_noted', {
+        projects: Array.isArray(cursor.projectIds) ? cursor.projectIds.length : 0,
+        projectsDone: Array.isArray(cursor.projectsDone) ? cursor.projectsDone.length : 0,
+        nextProjectIndex: cursor.nextProjectIndex || 0,
+        pagesDone: cursor.pagesDone || 0,
+        expectedTotal: cursor.expectedTotal || 0,
+      });
       // Deliberately NOT auto-resumed: a crawl can be hundreds of requests and
       // silently restarting one on every worker wake would hammer the API.
-      // SYNC_START with force:false picks up from the stored cursor.
+      // SYNC_START with force:false picks up from the stored cursor, at
+      // workspace granularity.
     }
   } catch (cursorErr) {
     log('warn', 'bootstrap.cursor_read_failed', { error: describeError(cursorErr) });

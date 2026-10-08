@@ -125,6 +125,183 @@ body {
   font-size: 11.5px;
 }
 
+/* A DEAD CONTEXT IS NOT A FAILURE OF WHATEVER THE USER ASKED FOR. It gets its
+   own treatment, in the accent rather than the warning or error colour: the
+   extension was reloaded, this document cannot talk to the worker at all, and
+   the one thing that fixes it is a reload. Painting it in `.sp-alert` made a
+   plain Search look like a broken search. */
+.sp-dead {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+  margin: 0 0 8px;
+  padding: 8px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--sm-accent);
+  background: color-mix(in srgb, var(--sm-accent) 12%, var(--sm-panel));
+  font-size: 11.5px;
+}
+.sp-dead-title { font-weight: 700; color: var(--sm-accent); }
+
+/* --------------------------------------------------------------- toolbar */
+/* Flex-wrap, not a row that scrolls: the panel is ~320-400px wide and four or
+   five pill buttons have to become two tidy lines, never a clipped one. */
+.sp-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 0 0 8px;
+}
+
+.sp-btn {
+  appearance: none;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  min-height: 27px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--sm-border-2);
+  background: var(--sm-panel);
+  color: var(--sm-text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.sp-btn:hover:not(:disabled) { border-color: var(--sm-purple); background: var(--sm-panel-2); }
+.sp-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.sp-btn.is-primary { background: var(--sm-purple); border-color: var(--sm-purple); color: #fff; }
+.sp-btn.is-primary:hover:not(:disabled) { background: var(--sm-purple-2); border-color: var(--sm-purple-2); }
+.sp-btn.is-stop { border-color: var(--sm-bad); color: var(--sm-bad); }
+.sp-btn.is-stop:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--sm-bad) 16%, var(--sm-panel));
+}
+.sp-btn.is-quiet { min-height: 24px; padding: 3px 9px; font-size: 11px; }
+
+/* -------------------------------------------------------------- progress */
+/* Plain elements, NOT live regions: a `DL_PROGRESS` push lands per file, so a
+   live region here would read the whole batch aloud. Every state change below
+   announces once through `announce()` instead. */
+.sp-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--sm-border);
+  background: var(--sm-panel);
+}
+.sp-progress.is-bad { border-color: var(--sm-bad); }
+
+.sp-progress-label {
+  margin: 0;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--sm-muted);
+}
+
+.sp-progress-text {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--sm-text);
+  overflow-wrap: anywhere;
+}
+.sp-progress-text .sp-quiet { color: var(--sm-muted); }
+
+.sp-track {
+  height: 4px;
+  border-radius: 999px;
+  background: var(--sm-panel-2);
+  overflow: hidden;
+}
+.sp-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--sm-purple);
+  transition: width 220ms ease;
+}
+.sp-fill.is-ok { background: var(--sm-ok); }
+.sp-fill.is-bad { background: var(--sm-bad); }
+
+/* ------------------------------------------------------------- selection */
+/* The dock writes the selection to the worker, so the panel's ticks are the
+   same selection the popup and the dock act on — hence `GET_SELECTION` on open
+   and `SET_SELECTION` on every change, not a private set. */
+.sp-selbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin: 0 0 8px;
+  font-size: 11.5px;
+  color: var(--sm-muted);
+}
+.sp-pickall { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.sp-selcount { font-variant-numeric: tabular-nums; }
+.sp-clear {
+  appearance: none;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--sm-border);
+  background: transparent;
+  color: var(--sm-muted);
+  cursor: pointer;
+}
+.sp-clear:hover { border-color: var(--sm-border-2); color: var(--sm-text); }
+
+/* Native checkbox, restyled from scratch so it cannot inherit anything — the
+   same geometry `content/content.css` gives `.sm-check`, so a tick looks the
+   same in the dock and in this panel. */
+.sp-check {
+  appearance: none;
+  -webkit-appearance: none;
+  margin: 0;
+  width: 15px;
+  height: 15px;
+  min-width: 15px;
+  border-radius: 4px;
+  border: 1.5px solid var(--sm-border-2);
+  background: var(--sm-panel-2);
+  cursor: pointer;
+  position: relative;
+  flex: none;
+}
+.sp-check:checked { background: var(--sm-purple); border-color: var(--sm-purple); }
+.sp-check:checked::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(43deg);
+}
+/* Select-all is TRI-STATE, not two buttons: "some of this page is ticked" has
+   to be visible, or the next click silently replaces the user's own selection. */
+.sp-check:indeterminate { background: var(--sm-purple-2); border-color: var(--sm-purple-2); }
+.sp-check:indeterminate::after {
+  content: "";
+  position: absolute;
+  left: 2.5px;
+  top: 5.5px;
+  width: 7px;
+  height: 0;
+  border-top: 2px solid #fff;
+  transform: none;
+}
+.sp-check:disabled { opacity: 0.45; cursor: not-allowed; }
+.sp-row > .sp-check { margin-top: 1px; }
+
 /* ---------------------------------------------------------------- search */
 .sp-controls {
   display: flex;
@@ -197,6 +374,16 @@ body {
   background: var(--sm-panel);
 }
 .sp-row:hover { background: var(--sm-panel-2); }
+/* Selected rows carry the dock's `.sm-result.on` tint, so a tick is legible
+   from the row itself and not only from the checkbox. Written after
+   `.sp-row:hover` because the two selectors have equal specificity. */
+.sp-row.is-sel {
+  background: color-mix(in srgb, var(--sm-purple) 14%, var(--sm-panel));
+  border-color: color-mix(in srgb, var(--sm-purple) 45%, transparent);
+}
+.sp-row.is-sel:hover {
+  background: color-mix(in srgb, var(--sm-purple) 20%, var(--sm-panel));
+}
 
 .sp-body { flex: 1 1 auto; min-width: 0; }
 
@@ -248,6 +435,29 @@ body {
 }
 .sp-meta span { overflow-wrap: anywhere; }
 .sp-sep { opacity: 0.5; }
+
+/* The three meta values that had no rule at all and so rendered as unstyled
+   text. Only the workspace NAMES something rather than a number, so it takes
+   the small chip the facets already use; the date and the duration stay plain
+   muted text with tabular figures, which is what keeps a column of them
+   aligned once the meta line wraps in a narrow panel. */
+.sp-workspace {
+  max-width: 100%;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--sm-border);
+  background: var(--sm-panel-2);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  color: var(--sm-muted);
+  overflow: hidden;
+  overflow-wrap: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sp-date,
+.sp-duration { font-variant-numeric: tabular-nums; }
 
 .sp-note {
   margin-top: 2px;
@@ -341,6 +551,35 @@ body {
 
 <div id="sp-error" class="sp-alert" role="alert" hidden></div>
 
+<div id="sp-dead" class="sp-dead" role="alert" hidden>
+  <span class="sp-dead-title">The extension was reloaded</span>
+  <span>This panel lost its connection to the background worker, so it cannot read
+    your library or start anything until it is reloaded. Reload the panel, or close
+    it and open it again. Clips already indexed are not affected.</span>
+  <button id="sp-dead-reload" class="sp-btn is-quiet" type="button">Reload panel</button>
+</div>
+
+<div class="sp-actions">
+  <button id="sp-sync" class="sp-btn is-primary" type="button">Sync</button>
+  <button id="sp-sync-stop" class="sp-btn is-stop" type="button" hidden>Stop sync</button>
+  <button id="sp-dl-sel" class="sp-btn" type="button" disabled>Download selected</button>
+  <button id="sp-dl-all" class="sp-btn" type="button" disabled>Download all</button>
+  <button id="sp-dl-stop" class="sp-btn is-stop" type="button" hidden>Stop downloads</button>
+  <button id="sp-dl-retry" class="sp-btn is-quiet" type="button" hidden>Retry failed</button>
+</div>
+
+<div id="sp-syncbox" class="sp-progress" hidden>
+  <p class="sp-progress-label">Library sync</p>
+  <p id="sp-sync-line" class="sp-progress-text"></p>
+  <div class="sp-track"><div id="sp-sync-fill" class="sp-fill"></div></div>
+</div>
+
+<div id="sp-dlbox" class="sp-progress" hidden>
+  <p class="sp-progress-label">Downloads</p>
+  <p id="sp-dl-line" class="sp-progress-text"></p>
+  <div class="sp-track"><div id="sp-dl-fill" class="sp-fill"></div></div>
+</div>
+
 <div class="sp-controls">
   <label class="sp-live" for="sp-search">Search clips by title, style, prompt or model</label>
   <input id="sp-search" class="sp-search" type="search" autocomplete="off" spellcheck="false"
@@ -356,11 +595,20 @@ body {
     <option value="duration">Longest</option>
   </select>
 </div>
-<p id="sp-search-h" class="sp-live">Results are paged 50 at a time from the local index; searching does not re-read storage.</p>
+<p id="sp-search-h" class="sp-live">Results are paged 50 at a time from the local index. Searching reads that index only, so it cannot find a clip until a sync indexes it.</p>
 
 <ul id="sp-facets" class="sp-facets" aria-label="Library totals"></ul>
 
 <p id="sp-status" class="sp-count" role="status" aria-live="polite">&nbsp;</p>
+
+<div id="sp-selbar" class="sp-selbar" hidden>
+  <label class="sp-pickall">
+    <input id="sp-sel-all" class="sp-check" type="checkbox">
+    <span>Select the clips shown</span>
+  </label>
+  <span id="sp-sel-count" class="sp-selcount">0 selected</span>
+  <button id="sp-sel-clear" class="sp-clear" type="button" hidden>Clear selection</button>
+</div>
 
 <ul id="sp-list" class="sp-list" aria-label="Clips"></ul>
 

@@ -77,7 +77,7 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
   },
-  "version": "6.1.0",
-  "version_name": "6.1.0 - MP3/OGG ship via vendored encoders; clamp lifted, mp3Bitrate/oggQuality added, U+FFFF load-blocker fixed",
+  "version": "6.2.0",
+  "version_name": "6.2.0 - Library crawl rebuilt on the real POST /api/feed/v3 cursor API, per-workspace, with a scoped clip_count oracle: incomplete syncs can no longer report Up to date, and complete ones can no longer report Incomplete",
   "minimum_chrome_version": "116"
 }

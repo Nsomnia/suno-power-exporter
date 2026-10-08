@@ -6,7 +6,7 @@
  * manifest.json runs content scripts at `document_start`, where `document.body`
  * is still null. The old file called `document.body.appendChild(dock)` at the top
  * level of its init IIFE, threw a TypeError, and took the entire script down with
- * it: no dock, no row checkboxes, no Clerk-token relay, on any page. Everything
+ * it: no dock, no row checkboxes, no session-token status, on any page. Everything
  * below therefore obeys one rule — NO DOM ACCESS ANYWHERE THAT ASSUMES BODY
  * EXISTS until `mount()` runs (see `boot()` at the very bottom).
  *
@@ -48,7 +48,46 @@
    * 0. constants
    * ================================================================== */
 
-  const DEBUG = false;
+  /**
+   * Diagnostics for THIS file, gated on the worker's own `settings.debug` — the
+   * same switch `background/background.js` gates its ring buffer on
+   * (`flushDiagnostics`), so one setting turns diagnostics on for both halves of
+   * the extension and a user reporting a fault only has to find one place.
+   *
+   * WHY IT IS NOT A CONSTANT: it was `const DEBUG = false`, which made every
+   * `dbg()` in this file a no-op at every runtime — including the push handler's
+   * `catch` and every `fail()`. A diagnostic that cannot fire is not a
+   * diagnostic; it is the "nothing is swallowed silently" rule in
+   * `fail()` written down and then hard-wired off.
+   *
+   * The DEFAULT stays off, deliberately: a content script shares the page's
+   * console, so a dock that logged by default would spray Suno's own debugging
+   * with another extension's internals. The cost of not hard-coding it is that
+   * diagnostics stay silent until the `GET_SETTINGS` read in `loadSettings()`
+   * lands — mount-time faults before that point have no diagnostic sink, which is
+   * stated there rather than hidden.
+   */
+  let debugOn = false;
+
+  /**
+   * Transport-failure codes, as opposed to the worker's own application codes
+   * (`ERROR`, `hls_disabled`, …), which pass through `normalizeReply` untouched
+   * and keep rendering as before.
+   *
+   * `DEAD_CODE` — the extension context of THIS already-mounted content script
+   * has been invalidated by a reload or an update. Terminal: nothing this file
+   * can do will make the next send work, and the only fix is a real page reload.
+   *
+   * `NO_RECEIVER` — nothing answered: the worker is asleep, still installing, or
+   * has no listener for this route in this version. Transient by nature, so it is
+   * reported like any other transport failure and the next send may well succeed.
+   *
+   * Collapsing these into the single `RUNTIME` code that was here before is what
+   * let a dead context reach the user as an ordinary failure string attributed to
+   * whatever control they pressed.
+   */
+  const DEAD_CODE = 'CONTEXT_DEAD';
+  const NO_RECEIVER = 'NO_RECEIVER';
 
   const HOST_ID = 'suno-master-host';
   const MARK_ATTR = 'data-sm';            // marks OUR nodes only
@@ -214,9 +253,15 @@
   }
 
   function dbg() {
-    if (!DEBUG) return;
+    if (!debugOn) return;
     try { console.log.apply(console, ['[SunoMaster/dock]'].concat([].slice.call(arguments))); }
-    catch (e) { if (DEBUG) return; }
+    catch (e) {
+      // A console that refuses the write (a page that has replaced it, an embedder
+      // that locks it down) must not turn a diagnostic into a fault of its own.
+      // Logging is already impossible here, so the throw cannot be reported
+      // anywhere else either.
+      void e;
+    }
   }
 
   // Every catch in this file funnels here, so nothing is swallowed silently (j).
@@ -224,6 +269,14 @@
     const o = opts || {};
     const msg = (err && (err.message || err.error)) || String(err || 'unknown error');
     dbg('failed:', scope, msg, err);
+    // A dead extension context is NOT this scope's failure. `send()` has already
+    // replaced the dock with the "reload the page" notice, and the text Chrome
+    // supplies for it ("Extension context invalidated") names the transport, not
+    // the feature the user pressed — which is how a session-token read ended up
+    // reporting itself against a filter control. Nothing is lost: the raw string
+    // goes to the diagnostic line above, and the notice above it says the same
+    // thing in words the user can act on.
+    if (err && err.code === DEAD_CODE) return msg;
     if (o.silent) return msg;
     if (state.mounted && ui.errorStrip) {
       showError(scope + ': ' + msg);
@@ -252,9 +305,44 @@
     facets: null,
     projects: [],
     sync: {
-      running: false, page: 0, pagesDone: 0, seen: 0, added: 0, etaMs: 0,
+      // No `page`: the crawl is cursor-based (`/api/feed/v3`) and has no page
+      // number, so the field would only ever hold a stale or invented value.
+      // Progress reads `pagesDone` against `maxPages`, plus `totalSeen`.
+      running: false, pagesDone: 0, seen: 0, added: 0, etaMs: 0,
+      /**
+       * The stored cursor claimed `running` but no controller owns it — an MV3
+       * worker eviction. Distinct from `running`, because the two need different
+       * copy and different affordances: a running crawl can be stopped, an
+       * orphaned one can only be cleared and resumed.
+       */
+      orphaned: false,
+      /**
+       * Which phase the worker's crawl is in, plus that phase's own counters.
+       * Read from `SYNC_PROGRESS` AND from `SYNC_STATUS`/`GET_BOOT` so this dock,
+       * the popup and the side panel all render the same phase from the same
+       * source instead of each keeping its own idea of what the crawl is doing.
+       */
+      phase: '', phasePages: 0, phaseJoined: 0,
       state: 'idle', truncated: false, total: 0, lastDurationMs: 0, lastProjects: 0,
-      maxPages: 0, lastError: '', truncateDismissed: false
+      maxPages: 0, lastError: '', truncateDismissed: false,
+      // The completeness contract (SYNC_DONE / SYNC_STATUS.cursor /
+      // GET_BOOT.sync all carry it). EVERY one is optional: a worker that
+      // predates the contract leaves them null and the dock renders exactly as
+      // it did before. `completed` is the field that replaces reading
+      // `state === 'done'` as proof of success.
+      completed: null,
+      stopReason: '',
+      /** The exact text this dock wrote to the error strip, so only that can be retracted. */
+      lastErrorText: '',
+      expectedTotal: null,
+      totalSeen: null,
+      missing: null,
+      /**
+       * `false` means crawl filters ran, so the counts above are a LOWER BOUND
+       * rather than a shortfall. `null` is "the worker did not say".
+       */
+      oracleApplied: null,
+      workspaces: []
     },
     batch: {
       running: false, batchId: null, done: 0, total: 0, ok: 0, failed: 0, skipped: 0,
@@ -262,10 +350,10 @@
       remaining: 0, stoppedReason: '', lastPayload: null
     },
     results: { items: [], total: 0, offset: 0, limit: RESULT_PAGE_SIZE, hasMore: false },
-    // `state.token` holds ONLY a raw JWT handed over by the page relay. The worker
-    // never returns a JWT — `GET_BOOT.token` / `GET_TOKEN_STATUS.token` are the
-    // tokenStatus() OBJECT — so worker-side presence is tracked separately.
-    token: null,
+    // The credential never lives in this file. The worker reads it by observing
+    // the `Authorization: Bearer …` header on Suno's own requests from the page's
+    // MAIN world, and reports only presence/expiry in `tokenStatus()`; there is no
+    // local copy to keep in sync, so there is no `state.token` field to go stale.
     tokenExpiresAt: 0,
     tokenHas: false,
     tokenBad: false,
@@ -352,34 +440,89 @@
     return res;
   }
 
+/**
+   * Classify a transport failure from Chrome's own text.
+   *
+   * WHY THE TEXT IS THE AUTHORITY: when an extension is reloaded or updated,
+   * Chrome tears down the isolated world of every content script that is ALREADY
+   * mounted, so `sendMessage` fails with "Extension context invalidated" for the
+   * rest of that page's life — while the dock's DOM, its timers and the page
+   * itself keep working perfectly. Every later call fails identically, so this is
+   * a terminal state for the script, not a retryable one, and it has to be told
+   * apart from a worker that simply is not listening yet.
+   *
+   * The strings are matched rather than sniffed for because Chrome is the only
+   * thing producing them, and the alternative — deciding from the shape of the
+   * reply — cannot work: both failures arrive as `{ok:false, error, code}`.
+   *
+   * @param {string} text `chrome.runtime.lastError.message`, or a thrown message
+   * @returns {string} `DEAD_CODE`, `NO_RECEIVER`, or `'RUNTIME'` for the rest
+   */
+  function transportCode(text) {
+    const t = String(text || '');
+    if (/context invalidated|Extension context/i.test(t)) return DEAD_CODE;
+    if (/receiving end does not exist|could not establish connection/i.test(t)) return NO_RECEIVER;
+    return 'RUNTIME';
+  }
+
+  /**
+   * This content script can no longer reach the extension.
+   *
+   * Deliberately idempotent and deliberately cheap: `send()` calls it for every
+   * failing message, and after the dock has been replaced every further button
+   * press would otherwise re-enter it.
+   *
+   * @param {string} type the route that failed, for the diagnostic line
+   * @param {string} text Chrome's own message, kept verbatim in the log
+   * @returns {Promise<void>}
+   */
+  async function handleDeadContext(type, text) {
+    if (contextDead) return;
+    contextDead = true;
+    dbg('extension context is gone; the dock is going down. last send:', type, '—', text);
+    await showReloadNotice();
+  }
+
   function send(type, payload) {
     return new Promise((resolve) => {
       let done = false;
       const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      // A dead context is terminal for THIS script, so it is escalated from the one
+      // place every reply passes through — before the caller gets a chance to paint
+      // Chrome's transport string against whatever control the user happened to
+      // press. `showReloadNotice` tears the dock down synchronously, so by the time
+      // a consumer resumes on the microtask queue there is nothing left to paint.
+      const failTransport = (text) => {
+        const code = transportCode(text);
+        finish({ ok: false, error: text, code: code });
+        if (code === DEAD_CODE) void handleDeadContext(type, text);
+      };
       try {
         chrome.runtime.sendMessage({ type: type, payload: payload || {} }, (res) => {
           const last = chrome.runtime.lastError;
           if (last) {
-            finish({
-              ok: false,
-              error: last.message || 'runtime error',
-              code: 'RUNTIME'
-            });
+            failTransport(last.message || 'runtime error');
             return;
           }
           finish(normalizeReply(res, type));
         });
       } catch (e) {
-        finish({ ok: false, error: (e && e.message) || 'sendMessage threw', code: 'THROW' });
+        failTransport((e && e.message) || 'sendMessage threw');
       }
     });
   }
 
   // Anything the SW refuses must become VISIBLE: every caller that can return
   // early on !res.ok routes through here so no failure is swallowed silently.
+  // `code` travels with the message because `fail()` needs to recognise the dead
+  // context case; an application error from the worker is NOT downgraded by it.
   function bail(res, scope) {
     if (!res || !res.ok) {
-      fail(scope, { message: (res && res.error) || 'no response', error: (res && res.error) || 'no response' });
+      fail(scope, {
+        message: (res && res.error) || 'no response',
+        error: (res && res.error) || 'no response',
+        code: (res && res.code) || ''
+      });
       return true;
     }
     return false;
@@ -564,9 +707,10 @@
       chrome.storage.local.set({
         [STORAGE_KEY]: {
           filters: state.filters,
-          // The page cap is kept too, so the value the user (or the truncation
-          // banner's "bigger cap" action) chose is still there on the next visit
-          // instead of silently reverting to the worker's default.
+          // The page cap is kept too, so the value the user (or the incompleteness
+          // banner's "bigger cap" action, which only appears when the cap is what
+          // stopped the walk) chose is still there on the next visit instead of
+          // silently reverting to the worker's default.
           syncMaxPages: state.syncMaxPages || ''
         }
       }, () => {
@@ -812,15 +956,33 @@
     });
     ui.syncState = h('div', { class: 'sm-sync-state', text: 'idle' });
     ui.syncBar = h('div', { class: 'sm-bar' }, [h('div', { class: 'sm-bar-fill' })]);
-    ui.truncWarn = h('div', { class: 'sm-warn' }, [
-      h('b', { text: 'Library INCOMPLETE — page cap hit. ' }),
+    // The headline names the OUTCOME, not a guess about the cause. The previous
+    // build hard-coded "page cap hit", which was false for the failure that
+    // mattered — a request that failed on page 21 — and sent the user to the cap
+    // setting for a cap they had never reached.
+    ui.truncTitle = h('b', { text: 'Library INCOMPLETE — the last sync stopped early. ' });
+    ui.truncWarn = h('div', {
+      class: 'sm-warn',
+      role: 'alert',
+      'aria-live': 'polite'
+    }, [
+      ui.truncTitle,
       h('span', { class: 'sm-trunc-detail', text: '' }),
-      // Children go in the THIRD argument. The previous version passed a `children`
-      // prop, which `h()` has no case for: it fell through to
-      // `setAttribute('children', …)`, so these two buttons were never in the DOM at
-      // all and the truncation banner had no way out of it.
+      // Children go in the THIRD argument. The previous version passed a
+      // `children` prop, which `h()` has no case for: it fell through to
+      // `setAttribute('children', …)`, so these buttons were never in the DOM at
+      // all and the banner had no way out of it.
       h('div', { class: 'sm-warn-actions' }, [
-        btn('Re-sync with a bigger cap', () => {
+        // Two buttons, and WHICH ONE IS OFFERED depends on the stop reason.
+        // "Re-sync with a bigger cap" is only true advice for `max_pages`;
+        // after a failed request it is actively misleading, so the genuinely
+        // useful action — plain Retry — is shown instead. Both are wired at
+        // build time and only revealed by `renderSync()`.
+        ui.truncRetryBtn = btn('Retry sync', () => {
+          state.sync.truncateDismissed = false;
+          startSync();
+        }, 'warn'),
+        ui.truncCapBtn = btn('Re-sync with a bigger cap', () => {
           // The cap that is actually in force is the worker's (`cursor.maxPages`);
           // fall back to whatever is typed, then to a sane default. The typed value
           // must be written to the input AND the mirrored state, because the send
@@ -847,8 +1009,8 @@
       h('div', { class: 'sm-row' }, [
         h('label', { class: 'sm-inline' }, [ui.syncForce, document.createTextNode(' force full re-sync')])
       ]),
-      field('Disliked pass', 'Sent to SYNC_START as dislikedMode. Suno exposes NO per-clip dislike field: "exclude" = one pass with hide_disliked=true, "only" = one pass with hide_disliked=false, "both passes" = two passes plus an id-set diff (roughly DOUBLES sync time, and is the only mode that computes your disliked set).', ui.syncDisliked),
-      field('Page cap', 'Max pages per feed. Hitting it truncates the library — you will be warned. Left empty the worker uses settings.syncMaxPages.', ui.syncMaxPages),
+      field('Disliked pass', 'Sent to SYNC_START as dislikedMode. Suno exposes no per-clip dislike field, but the feed itself does: the crawl asks /api/feed/v3 for one tri-state "disliked" filter and records is_disliked on every clip it stores. So "exclude" and "only" are each ONE walk and cost the same as a normal sync. Only "both passes" walks the feed twice — once hiding dislikes and once over the disliked rows only — and that is the only mode that pays double, plus the only one that tells you your disliked set.', ui.syncDisliked),
+      field('Page cap', 'Max pages per feed — a SAFETY limit, not a target. It is the only reason the banner will offer "Re-sync with a bigger cap"; every other stop (a failed request, an empty page, a repeated cursor, fewer clips than Suno reports) is fixed by syncing again, not by raising this. Left empty the worker uses settings.syncMaxPages.', ui.syncMaxPages),
       h('div', { class: 'sm-row' }, [
         btn('Start sync', () => startSync(), 'primary'),
         btn('Cancel', () => cancelSync(), 'ghost'),
@@ -896,7 +1058,7 @@
 
     const reactionsSec = section('Reactions', [
       field('Liked', 'clip.is_liked — YOUR OWN like state. Never inferred from upvote_count.', ui.likedSel),
-      field('Disliked', 'No clip field exists. The SW diffs /api/feed/v2 with hide_disliked=true vs false. Costs ~2x sync time.', ui.dislikedSel),
+      field('Disliked', 'No per-clip dislike field exists to read, so the sync asks the feed instead: /api/feed/v3 takes a server-side tri-state "disliked" filter, and every clip the crawl stores keeps its is_disliked value from that response. Defaults to "exclude disliked"; only the sync setting "both passes" costs an extra walk.', ui.dislikedSel),
       h('div', { class: 'sm-help', text: 'Defaults to "exclude disliked". Select "only" only when you specifically want the dislikes.' })
     ], true);
 
@@ -1232,17 +1394,18 @@
         h('div', { class: 'sm-help', text: 'LRC / cover art / JSON are SIDECARS written next to the audio file, not variants. They are toggled here because the variant list only holds real audio formats.' })
       ]),
       h('div', { class: 'sm-field' }, [
-        h('label', { class: 'sm-label' }, [document.createTextNode('Session token'), qmark('The SW mints the Clerk token in the MAIN world; this panel only reports status.')]),
+        h('label', { class: 'sm-label' }, [document.createTextNode('Session token'), qmark('The service worker reads the token out of the page itself, by observing the Authorization header Suno already sends. This panel only reports status and never holds a token.')]),
         ui.tokenInfo,
         h('div', { class: 'sm-row' }, [
           btn('Refresh token', () => refreshToken()),
-          btn('Read from page (fallback)', () => requestPageToken())
-        ])
+          btn('Ask worker to re-read session', () => requestPageToken())
+        ]),
+        h('div', { class: 'sm-help', text: 'Both buttons ask the service worker for the same thing. "Refresh token" also re-checks the token for expiry and tells you to re-sign-in if Suno rejects it; "Ask worker to re-read session" is the blunt version of the same request, for when the status line looks stale. Neither one reads anything out of the page directly — the service worker taps the page’s Authorization header for that, and a token it has not seen yet cannot be conjured by clicking here.' })
       ]),
       h('div', { class: 'sm-field' }, [
         h('label', { class: 'sm-label' }, [
           document.createTextNode('Experimental: HLS capture'),
-          qmark('Off by default. Temporarily sets window.MediaSource = undefined in the page MAIN world so the player falls back to a plain fetch, then collects the #EXT-X-MAP init segment + media segments. Restored in a finally.')
+          qmark('Off by default. The service worker runs a MAIN-world operation that sets window.MediaSource = undefined in the page, so the player falls back to a plain fetch; this dock then collects the #EXT-X-MAP init segment + media segments. The page is restored in a finally, and a failed restore is reported rather than hidden.')
         ]),
         h('div', { class: 'sm-warn sm-warn-inline' }, [
           h('span', { text: 'This manipulates the page and is the kind of behaviour that trips abuse heuristics. Use the API paths unless you need the stream itself.' })
@@ -1277,7 +1440,10 @@
     ]));
     ui.hlsBlock.appendChild(h('div', { class: 'sm-row' }, [ui.hlsBtn]));
     ui.hlsBlock.appendChild(ui.hlsStatus);
-    setHlsStatus('armed — the page is patched only while a capture runs, and always restored');
+    // Nothing is patched yet — this is the idle, armed state. Say exactly that, and
+    // do not promise the restore here: the restore is only real once the worker
+    // confirms it, and `runHlsCapture` is where a failed one gets reported.
+    setHlsStatus('idle — nothing is patched yet. The page is only touched while a capture runs, and the restore is reported if it fails.');
   }
 
   function renderLadder() {
@@ -1797,7 +1963,7 @@
     selectionTimer = setTimeout(() => {
       selectionTimer = 0;
       send('SET_SELECTION', { ids: Array.from(state.selection) }).then((res) => {
-        if (!res.ok) fail('SET_SELECTION', { message: res.error });
+        if (!res.ok) fail('SET_SELECTION', { message: res.error, code: res.code });
       });
     }, 300);
   }
@@ -1816,16 +1982,379 @@
    * 14. sync
    * ================================================================== */
 
-  async function startSync(force) {
-    const maxPages = num(ui.syncMaxPages ? ui.syncMaxPages.value : null);
-    state.sync.running = true;
+  /**
+   * `stopReason` -> plain English. THE SHARED MAP — byte-identical copies live
+   * in popup/popup.js and side_panel.js. Values are whole clauses so the dock,
+   * the banner and the error strip can all reuse them unaltered.
+   */
+  const SYNC_REASON_PHRASE = {
+    complete: 'the crawl finished cleanly',
+    suspected_truncation: 'the feed stopped early — your library is only partly indexed',
+    cursor_missing: 'it could not read the feed\'s paging field, so it could not continue',
+    page_failed: 'it stopped on a failed request',
+    empty_page: 'the feed returned an empty page',
+    stuck_cursor: 'the pagination cursor repeated',
+    no_new_ids: 'a page returned no new clips',
+    max_pages: 'it hit your page cap',
+    expected_total: 'it found fewer clips than Suno reports',
+    aborted: 'it stopped because you cancelled',
+    interrupted: 'the extension worker was stopped mid-crawl — press Sync to resume'
+  };
+
+  /** Used when the walk stopped and the worker named no reason. */
+  const SYNC_REASON_FALLBACK = 'it stopped early for a reason the worker did not report';
+
+  /**
+   * @param {unknown} stopReason
+   * @returns {string} a plain-English phrase; never '' and never `undefined`
+   */
+  function syncReasonPhrase(stopReason) {
+    const key = typeof stopReason === 'string' ? stopReason.trim() : '';
+    return SYNC_REASON_PHRASE[key] || SYNC_REASON_FALLBACK;
+  }
+
+  /** @param {string} text @returns {string} */
+  function sentence(text) {
+    const s = String(text || '');
+    return s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+  }
+
+  /**
+   * Thousands separators without `Intl`, so "5,500" is spelled identically in
+   * all three surfaces.
+   *
+   * @param {unknown} value
+   * @returns {string} '' when not a finite number
+   */
+  function group(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '';
+    const rounded = Math.round(num);
+    const sign = rounded < 0 ? '-' : '';
+    const digits = String(Math.abs(rounded));
+    return sign + digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  /**
+   * The first candidate that is a real, positive count; null when none is.
+   *
+   * @returns {number|null}
+   */
+  function firstPositive() {
+    for (let i = 0; i < arguments.length; i++) {
+      const n = Number(arguments[i]);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return null;
+  }
+
+  /**
+   * Read the completeness contract out of any reply, flat or cursor-wrapped.
+   * `SYNC_DONE` puts the fields at the top level, `SYNC_STATUS.cursor` puts them
+   * one level down, and a worker that predates the contract sends none of them —
+   * so every field is optional and a missing one yields null, never a throw and
+   * never the string "undefined".
+   *
+   * @param {object|null|undefined} reply
+   * @returns {object|null}
+   */
+  function readSyncFacts(reply) {
+    if (!reply || typeof reply !== 'object') return null;
+    const cursor = (reply.cursor && typeof reply.cursor === 'object') ? reply.cursor : null;
+    // Present-but-`null` means "unknown", the same as absent: folding it in
+    // would make `Number(null) === 0` render "Suno reports ~0".
+    const pick = (key) => {
+      if (reply[key] !== undefined && reply[key] !== null) return reply[key];
+      const nested = cursor ? cursor[key] : undefined;
+      return (nested !== undefined && nested !== null) ? nested : undefined;
+    };
+    /**
+     * Whether the key is present AT ALL, `0` included — the only correct test for
+     * "the worker told us". Needed because folding `null` into absent (right for
+     * `expectedTotal`, whose `0` is a sentinel) is what makes a naive `> 0` test
+     * discard a legitimate `0`.
+     *
+     * @param {string} key
+     * @returns {boolean}
+     */
+    const has = (key) => {
+      if (reply[key] !== undefined) return true;
+      return !!(cursor && cursor[key] !== undefined);
+    };
+
+    const completed = pick('completed');
+    const truncated = pick('truncated');
+    const stopReason = pick('stopReason');
+    const error = pick('error');
+    const expected = Number(pick('expectedTotal'));
+    // ABSENT and `0` are different facts and must not collapse; see the identical
+    // note in `popup/popup.js`. `pick()` passes `0` through, so `has()` plus a
+    // numeric coercion is the whole test.
+    const missing = has('missing') && Number.isFinite(Number(pick('missing')))
+      ? Number(pick('missing')) : null;
+    // `totalSeen` is the contract name, but the STORED CURSOR counts the unique
+    // clips it walked under `uniqueSeen` (and `GET_BOOT.sync` publishes that
+    // name), so reading `totalSeen` alone yields 0 — and "Suno reports 0 of
+    // ~5,500" over a 5,500-clip library is worse than showing no count. The first
+    // POSITIVE of the two names wins; "no positive count" is reported as unknown.
+    const totalSeen = firstPositive(pick('totalSeen'), pick('uniqueSeen'));
+    // `expectedTotal === 0` is the worker's "Suno reported no count" sentinel.
+    const expectedTotal = Number.isFinite(expected) && expected > 0 ? expected : null;
+
+    return {
+      // Did this reply say ANYTHING about completeness?
+      hasContract: completed !== undefined || truncated !== undefined ||
+        stopReason !== undefined || error !== undefined || expectedTotal !== null ||
+        missing !== null || totalSeen !== null,
+      completed: typeof completed === 'boolean' ? completed : null,
+      truncated: typeof truncated === 'boolean' ? truncated : null,
+      stopReason: typeof stopReason === 'string' ? stopReason.trim() : '',
+      // `lastError` is the pre-contract spelling of `error`.
+      error: (error || pick('lastError')) ? String(error || pick('lastError')) : '',
+      expectedTotal: expectedTotal,
+      totalSeen: totalSeen,
+      // `missing` is AUTHORITATIVE whenever the key is present as a number, `0`
+      // included: the worker measures it against rows EXAMINED while publishing
+      // `totalSeen` as the UNIQUE count, so `5502 / 5501` with `missing:0` is a
+      // complete library. Re-deriving here made the dock print "1 clip is
+      // missing" over a finished crawl — a banner hidden by `completed === true`
+      // beside a status line reading INCOMPLETE. Deriving is the legacy-reply
+      // fallback, for a key that is entirely absent.
+      missing: missing !== null ? missing
+        : (expectedTotal !== null && totalSeen !== null ? expectedTotal - totalSeen : null),
+      // `oracleApplied === false` means crawl filters ran, so the counts are a
+      // LOWER BOUND, not a shortfall. Optional: absent is unknown.
+      oracleApplied: pick('oracleApplied') === false ? false : (pick('oracleApplied') === true ? true : null),
+      // Mechanical evidence that a walk HAPPENED; the placeholder test needs it,
+      // because `pagesDone:20` is proof of a real crawl even with no verdict.
+      pagesDone: Number(pick('pagesDone')) || 0,
+      total: Number(pick('total')) || 0
+    };
+  }
+
+  /**
+   * Write the contract onto `state.sync`, field by field, never with a blanket
+   * assignment: a `SYNC_STATUS` poll that carries only `pagesDone` must not wipe
+   * `expectedTotal` learned from `SYNC_DONE`. This is the "a later poll does not
+   * erase the evidence" guarantee.
+   *
+   * @param {object|null|undefined} reply any sync reply
+   * @returns {object|null} the facts that were read, or null
+   */
+  function applySyncFacts(reply) {
+    const f = readSyncFacts(reply);
+    if (!f) return null;
+    // A PLACEHOLDER reply is not evidence about a walk. `SYNC_STATUS` returns one
+    // before the first walk ever finishes — `completed:false` with no reason, no
+    // error and every count at zero — and storing it would put this dock into
+    // the INCOMPLETE state before the user had clicked anything.
+    if (isPlaceholderSyncFacts(f)) return null;
+    if (f.completed !== null) state.sync.completed = f.completed;
+    if (f.truncated !== null) state.sync.truncated = f.truncated;
+    state.sync.stopReason = f.stopReason || state.sync.stopReason || '';
+    state.sync.lastError = f.error || '';
+    if (f.expectedTotal !== null) state.sync.expectedTotal = f.expectedTotal;
+    if (f.totalSeen !== null) state.sync.totalSeen = f.totalSeen;
+    // `missing` is only overwritten by a reply that actually knows about the two
+    // numbers behind it, so a status poll carrying neither cannot blank the
+    // "5,100 missing" that `SYNC_DONE` established.
+    if (f.missing !== null || f.expectedTotal !== null || f.totalSeen !== null) state.sync.missing = f.missing;
+    // `0` is a real answer here too ("crawl filters ran, so these counts are a
+    // lower bound"), so it must survive: the guard tests for `null`, not truth.
+    if (f.oracleApplied !== null) state.sync.oracleApplied = f.oracleApplied;
+    if (Array.isArray(reply.workspaces)) state.sync.workspaces = reply.workspaces;
+    else if (Array.isArray(reply.cursor && reply.cursor.workspaces)) state.sync.workspaces = reply.cursor.workspaces;
+    return f;
+  }
+
+  /**
+   * @param {boolean} [exact] drop the "~"
+   * @returns {string} '' when Suno's own count is unknown
+   */
+  function countsPhrase(exact) {
+    const s = state.sync;
+    if (s.expectedTotal === null || s.expectedTotal === undefined) return '';
+    var expected = (exact ? '' : '~') + group(s.expectedTotal);
+    var text = (s.totalSeen === null || s.totalSeen === undefined)
+      ? expected : group(s.totalSeen) + ' of ' + expected;
+    // `oracleApplied === false`: crawl filters ran, so Suno's count is a LOWER
+    // BOUND on what the walk could reach, not a target it fell short of. Absent on
+    // a legacy reply, and then nothing is added.
+    return s.oracleApplied === false ? text + ' — a lower bound, filters applied' : text;
+  }
+
+  /**
+   * TRUE while no walk has finished at all.
+   *
+   * `SYNC_STATUS` answers `completed:false, stopReason:null, error:null,
+   * expectedTotal:0, totalSeen:0, missing:0` before the first walk completes, and
+   * that is evidence that nothing ran, not evidence that something failed. The
+   * dock polls `SYNC_STATUS` on mount, so without this the banner would greet a
+   * fresh install with "Library INCOMPLETE". An explicit `truncated:true` is not a
+   * placeholder, and neither is a record that walked a page or indexed a clip.
+   *
+   * @returns {boolean}
+   */
+  function isPlaceholderSyncState() {
+    const s = state.sync;
+    return isPlaceholderSyncFacts({
+      completed: s.completed, stopReason: s.stopReason, error: s.lastError,
+      truncated: s.truncated, pagesDone: s.pagesDone, total: s.total,
+      totalSeen: s.totalSeen, expectedTotal: s.expectedTotal, missing: s.missing
+    });
+  }
+
+  /**
+   * The same test on freshly read facts. `expectedTotal:0` is the worker's "Suno
+   * reported no count" sentinel, so it counts as empty here.
+   *
+   * @param {object|null} f
+   * @returns {boolean}
+   */
+  function isPlaceholderSyncFacts(f) {
+    if (!f) return false;
+    // `truncated:true` is NOT a placeholder: that one really is a short walk,
+    // and it is the only signal an older worker sends.
+    return !f.completed && !f.stopReason && !f.error && f.truncated !== true &&
+      !(f.pagesDone > 0) && !(f.total > 0) &&
+      !(f.totalSeen > 0) && !(f.expectedTotal > 0) && !(f.missing > 0);
+  }
+
+  /**
+   * The three-way decision, shared by the status line, the banner and the error
+   * strip so the dock cannot say "done" over an incomplete index.
+   *
+   * THE RULE, AND IT IS THE WORKER'S CALL TO MAKE: when `completed` is present as
+   * a BOOLEAN it is the verdict, and `missing` is NOT read to overturn it. The
+   * worker computes `oracleApplied` (whether the walk was unfiltered, so that
+   * `project.clip_count` measures the set the walk measured) and already ANDed it
+   * into its own verdict, so a filtered walk's shortfall reaches us as ADVISORY:
+   * `completed:true, stopReason:'complete', oracleApplied:false, missing:100`.
+   * Re-deriving failure from `missing` on top of that re-created the permanent
+   * "INCOMPLETE" this dock used to print over crawls the worker had called clean
+   * — and it was wrong on every sync in this build, because `includeTrashed` is
+   * hard-coded false in `background/background.js` and so `oracleApplied` never
+   * is true here. The rule is stated once, here, and `syncIsIncomplete` below
+   * obeys it.
+   *
+   * The legacy heuristics are kept, and only for state with NO `completed` key:
+   * such a worker predates the oracle, so the counts are the only evidence there
+   * is and they are correct for it.
+   *
+   * `truncated` remains the compatibility stand-in for `completed` and a bare
+   * `stopReason: 'complete'` is believed, since it is the same statement.
+   *
+   * @returns {{kind:string, reason:string, error:string, counts:string,
+   *   missing:number|null, stopReason:string}}
+   */
+  function syncVerdict() {
+    const s = state.sync;
+    // Nothing has ever finished walking the feed. That is a third state, not a
+    // verdict: `completed:false` from a pre-walk poll is not a failed walk, and
+    // rendering it as one put "INCOMPLETE" on a brand-new install.
+    if (isPlaceholderSyncState()) {
+      return { kind: 'none', reason: '', error: '', counts: '', missing: null, stopReason: '' };
+    }
+    let completed = s.completed;
+    if (completed === null && typeof s.truncated === 'boolean') completed = s.truncated === false;
+    if (completed === null && s.stopReason) completed = s.stopReason === 'complete';
+    /* Whether the worker actually STATED a verdict, which is what the rule turns
+     * on and which is deliberately NOT `completed === null`: a legacy reply that
+     * carries `truncated:false` folds into a `true` on the two lines above, so the
+     * fold cannot tell a reply with a verdict from a reply without one.
+     * `applySyncFacts` writes `completed` only when the reply stated it, so
+     * `null` here still means "this worker has never said". */
+    const stated = typeof s.completed === 'boolean';
+    const rawMissing = (typeof s.missing === 'number' && s.missing > 0) ? s.missing : null;
+    /* `oracleApplied === false` says the worker did NOT check that number: the
+     * walk was filtered, so the gap may be rows the filters removed on purpose
+     * rather than rows the crawl missed. It still ships, in `countsPhrase`, with
+     * the lower-bound caveat the worker asks for in `advisory`; what it must not
+     * do is decide the verdict or be stated as "N clips are missing". `null` (a
+     * legacy reply said nothing about the oracle) is not `false`. */
+    const unchecked = s.oracleApplied === false;
+    let kind;
+    if (!stated) {
+      // NO `completed` KEY AT ALL — a worker that predates the contract, and with
+      // it the oracle. Only an explicit error, an explicit `truncated` or a
+      // positive count makes it incomplete.
+      kind = (s.lastError || s.truncated === true || rawMissing !== null)
+        ? 'incomplete' : 'complete';
+    } else {
+      // `completed` is present, so it IS the verdict. `missing` is deliberately
+      // not read here — see the rule above.
+      kind = (completed === true && !s.lastError) ? 'complete' : 'incomplete';
+    }
+    return {
+      kind: kind,
+      reason: syncReasonPhrase(s.stopReason),
+      error: s.lastError || '',
+      // Exact for a checked complete walk ("5,500 of 5,500"); "~" is kept both for
+      // an incomplete one and for a FILTERED one that finished, where
+      // `expectedTotal` is Suno's unfiltered count over a filtered numerator and
+      // is therefore approximate whatever the verdict says.
+      counts: countsPhrase(kind === 'complete' && !unchecked),
+      missing: unchecked ? null : rawMissing,
+      stopReason: s.stopReason || ''
+    };
+  }
+
+  /**
+   * The banner's gate. `completed === false` is authoritative, `truncated` is
+   * accepted for a worker that predates it, and a reply that says nothing about
+   * completeness changes nothing. It obeys the same rule as `syncVerdict` above —
+   * in particular `completed === true` is final, and `missing` decides nothing
+   * once `completed` has spoken.
+   *
+   * @returns {boolean}
+   */
+  function syncIsIncomplete() {
+    const s = state.sync;
+    if (isPlaceholderSyncState()) return false;
+    if (s.completed === false) return true;
+    if (s.completed === true) return false;
+    // ---- legacy replies only (no `completed` key). These predate the oracle,
+    // so the counts are the only evidence there is.
+    if (s.truncated === true) return true;
+    if (s.stopReason && s.stopReason !== 'complete') return true;
+    if (typeof s.expectedTotal === 'number' && typeof s.missing === 'number' && s.missing > 0) return true;
+    return false;
+  }
+
+  /**
+   * Clear everything the PREVIOUS run established, so a walk in progress cannot be
+   * read through the last one's result.
+   *
+   * Shared by `startSync()` and the `SYNC_STARTED` push on purpose: a crawl
+   * started from the popup or the side panel arrives here as exactly the same
+   * fact, and a second copy of this reset is a second place for it to drift —
+   * which is how the popup, this dock and the side panel came to disagree about
+   * whether a library was complete. `running` and `maxPages` stay with the
+   * callers, which are the ones that know them.
+   */
+  function resetSyncRun() {
     state.sync.truncated = false;
     state.sync.truncateDismissed = false;
-    state.sync.page = 0;
     state.sync.pagesDone = 0;
     state.sync.seen = 0;
     state.sync.added = 0;
     state.sync.lastError = '';
+    // The PREVIOUS run's verdict is cleared too. Leaving `completed:true` behind
+    // would let a new run that dies before its first push still render as
+    // complete — the exact "says done, is not done" failure being fixed here.
+    state.sync.completed = null;
+    state.sync.stopReason = '';
+    state.sync.expectedTotal = null;
+    state.sync.totalSeen = null;
+    state.sync.missing = null;
+    state.sync.workspaces = [];
+    state.sync.lastErrorText = '';
+  }
+
+  async function startSync(force) {
+    const maxPages = num(ui.syncMaxPages ? ui.syncMaxPages.value : null);
+    state.sync.running = true;
+    resetSyncRun();
     if (maxPages !== null && maxPages > 0) state.sync.maxPages = Math.floor(maxPages);
     renderSync();
 
@@ -1834,9 +2363,9 @@
     // tri-state values are the same vocabulary the filter panel uses, so they are
     // mapped explicitly here instead of being forwarded verbatim (which is how
     // 'any' and 'only' used to be dropped on the floor):
-    //   exclude -> 'exclude'  one pass, hide_disliked=true  (no dislikes indexed)
-    //   only    -> 'include'  one pass, hide_disliked=false (indexes dislikes)
-    //   any     -> 'both'     two passes + id-set diff, so nothing is skipped
+    //   exclude -> 'exclude'  ONE walk, feed filtered to hide dislikes
+    //   only    -> 'include'  ONE walk, feed filtered to the disliked rows only
+    //   any     -> 'both'     TWO walks, and the only mode that pays double
     const choice = (ui.syncDisliked && ui.syncDisliked.value ? ui.syncDisliked.value : state.filters.disliked);
     const dislikedMode = choice === 'only' ? 'include' : (choice === 'exclude' ? 'exclude' : 'both');
 
@@ -1861,21 +2390,84 @@
   async function cancelSync() {
     const res = await send('SYNC_CANCEL');
     if (bail(res, 'SYNC_CANCEL')) return;
-    state.sync.running = false;
+    // The worker's reply is a contract: `running` (was a controller attached),
+    // `cancelRequested` (an abort was signalled), `abortAvailable` (there is
+    // still something to signal). It used to carry only `{ok:true}`, so this
+    // handler set `cancelling` unconditionally — including when no sync was
+    // running — and then never left that state, leaving the dock stuck on
+    // "Cancelling…" with no exit.
+    if (res.running === false && res.orphanedCursorCleared === true) {
+      state.sync.running = false;
+      state.sync.state = 'interrupted';
+      state.sync.orphaned = false;
+      toast(res.stale === true
+        ? 'Cleared a crawl the extension worker had abandoned. Indexed clips were kept.'
+        : 'Cleared the stale sync state. Indexed clips were kept.');
+      const after = await send('SYNC_STATUS');
+      if (after && after.ok && after.cursor) applySyncCursor(after.cursor);
+      renderSync();
+      return;
+    }
+    if (res.running === false) {
+      toast('No sync is running.');
+      renderSync();
+      return;
+    }
+    state.sync.running = true;
     state.sync.state = 'cancelling';
+    renderSync();
+
+    // Aborting is cooperative, so the crawl observes the signal only where it
+    // awaits; a rate-limit backoff can hold a page open. Poll for a bounded time
+    // and then re-read authoritative state rather than waiting indefinitely.
+    const deadline = Date.now() + 20000;
+    let settled = false;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 500));
+      const status = await send('SYNC_STATUS');
+      if (status && status.ok && status.running !== true) {
+        settled = true;
+        break;
+      }
+    }
+    const final = await send('SYNC_STATUS');
+    if (final && final.ok && final.cursor) applySyncCursor(final.cursor);
+    state.sync.running = false;
+    if (settled) {
+      state.sync.state = 'cancelled';
+      toast('Sync stopped. Nothing is broken.');
+    } else {
+      state.sync.state = 'stopping';
+      toast('Still stopping — the worker is waiting on a rate limit and will stop at the next page boundary.');
+    }
     renderSync();
   }
 
   async function pollSyncStatus() {
     const res = await send('SYNC_STATUS');
     if (bail(res, 'SYNC_STATUS')) return;
-    applySyncCursor(res.cursor);
-    // `running` and `total` are genuinely TOP level; everything else lives under
-    // `cursor`. The previous version read `res.page` / `res.pagesDone` / `res.seen`
-    // / `res.added` / `res.etaMs` / `res.state`, every one of which is `undefined`,
+    applySyncCursor(res.cursor);    // `running` and `total` are genuinely TOP level; everything else lives under
+    // `cursor`. The previous version read `res.pagesDone` / `res.seen` /
+    // `res.added` / `res.etaMs` / `res.state`, every one of which is `undefined`,
     // and `applySyncProgress` is entirely `typeof … === 'number'` guards, so "Check
     // status" silently updated nothing at all.
     state.sync.running = res.running === true;
+    /* A stored `state:'running'` with no live controller is an ORPHANED cursor —
+     * an MV3 worker eviction, not a crawl. `SYNC_STATUS` reconciles it and sets
+     * `interrupted`; taking `running` from the reply rather than from the row is
+     * what stops the dock showing a frozen "Syncing" with a Stop button that
+     * truthfully says nothing is running. */
+    if (res.interrupted === true) {
+      state.sync.orphaned = true;
+      state.sync.running = false;
+    } else if (res.running === true) {
+      state.sync.orphaned = false;
+    }
+    if (res.interrupted === true) {
+      toast('The extension worker was stopped mid-crawl. Indexed clips were kept — press Sync to resume.');
+      renderSync();
+      return;
+    }
     if (res.running !== true) {
       const cursorState = res.cursor && res.cursor.state ? String(res.cursor.state) : '';
       if (cursorState) state.sync.state = cursorState;
@@ -1884,7 +2476,45 @@
     }
     if (typeof res.truncated === 'boolean') state.sync.truncated = res.truncated;
     if (typeof res.total === 'number') state.sync.total = res.total;
+    // `completed` / `stopReason` / `expectedTotal` / `missing` / `workspaces` are
+    // stored by `applySyncCursor` above, field by field, so this poll cannot wipe
+    // them. Optional here too: a worker that predates the contract sends none of
+    // them and the dock simply keeps whatever it already knew.
     renderSync();
+    scheduleSyncPoll();
+  }
+
+  /**
+   * One poller for the dock, and it runs ONLY while a crawl is in flight.
+   *
+   * WHY: three surfaces render this crawl — the toolbar popup, this dock and the
+   * side panel — and each used to keep its own idea of "is a sync running, and how
+   * far along". They disagreed: the popup said "Syncing" while the dock said idle
+   * and Stop said nothing was running. The worker's `SYNC_STATUS` is the only
+   * authority, so every surface polls it and derives everything from that reply.
+   * Idle-gated, so a crawl that is not running costs nothing.
+   */
+  let syncPollTimer = 0;
+  const SYNC_POLL_MS = 1500;
+
+  function scheduleSyncPoll() {
+    if (syncPollTimer) return;
+    if (!state.sync.running) return;
+    syncPollTimer = setInterval(() => {
+      // The push is the fast path; the poll is the correction. Both write the same
+      // fields from the same worker reply, so neither can leave the dock stale.
+      if (!state.sync.running) {
+        stopSyncPoll();
+        return;
+      }
+      pollSyncStatus().catch((pollErr) => dbg('sync poll failed:', pollErr && pollErr.message));
+    }, SYNC_POLL_MS);
+  }
+
+  function stopSyncPoll() {
+    if (!syncPollTimer) return;
+    clearInterval(syncPollTimer);
+    syncPollTimer = 0;
   }
 
   /**
@@ -1893,9 +2523,16 @@
    * `SYNC_STATUS` returns `{ok, running, cursor, truncated, total}`, where the
    * cursor is the record `runSync` writes to `syncState.feed`. Its field names are
    * the crawl's, not the push's, so they are mapped here explicitly:
-   * `nextPage -> page`, `pagesDone -> pagesDone`, `totalSeen -> seen`, `state -> state`.
+   * `pagesDone -> pagesDone`, `totalSeen -> seen`, `state -> state`.
    * The cursor carries no `added` and no ETA (those only exist in the live
    * `SYNC_PROGRESS` push), so those are simply left untouched rather than invented.
+   *
+   * There is deliberately NO page number here. The crawl is cursor-based and
+   * `nextPage` is permanently `null` — the worker advances an opaque feed cursor —
+   * so the old `page: cursor.nextPage` mapping fed `null` into `applySyncProgress`,
+   * whose `typeof p.page === 'number'` guard dropped it, and the dock's "page N"
+   * indicator could only ever update from the live push. Progress is read from
+   * `pagesDone`/`totalSeen` instead; see `renderSync`.
    *
    * @param {object|null} cursor
    * @returns {boolean} whether a usable cursor was mapped
@@ -1903,9 +2540,12 @@
   function applySyncCursor(cursor) {
     if (!cursor || typeof cursor !== 'object') return false;
     applySyncProgress({
-      page: cursor.nextPage,
       pagesDone: cursor.pagesDone,
-      seen: cursor.totalSeen,
+      // `seen` accepts either name: the contract says `totalSeen`, the stored row
+      // counts unique clips under `uniqueSeen`. Reading only `totalSeen` left the
+      // dock saying "0 seen" beside "400 indexed" — which is what the user was
+      // shown when the whole library was indexed.
+      seen: firstPositive(cursor.totalSeen, cursor.uniqueSeen) || 0,
       state: cursor.state
     });
     if (typeof cursor.maxPages === 'number' && cursor.maxPages > 0) {
@@ -1913,18 +2553,38 @@
       // what the banner's "bigger cap" action doubles.
       state.sync.maxPages = cursor.maxPages;
     }
-    if (cursor.truncated === true) state.sync.truncated = true;
-    state.sync.lastError = cursor.lastError ? String(cursor.lastError) : '';
+    // The completeness fields, stored FIELD BY FIELD. Assigning the whole cursor
+    // here would be the bug the old code had: a later poll that carried only
+    // `pagesDone` would drop `expectedTotal`, and "400 indexed · Suno reports
+    // ~5,500" — the single most useful string this dock can show — would vanish
+    // on the next status check.
+    applySyncFacts(cursor);
+    // The phase, read from the SAME reply the rest of the cursor comes from, so
+    // the dock and the popup cannot disagree about what the crawl is doing. The
+    // crawl pages `/api/project/me` and `/api/project/feed` (~180 pages) before it
+    // indexes anything, and without this the dock said "starting" throughout.
+    if (typeof cursor.phase === 'string' && cursor.phase) state.sync.phase = cursor.phase;
+    if (Number.isFinite(Number(cursor.phasePagesDone))) state.sync.phasePages = Number(cursor.phasePagesDone);
+    if (Number.isFinite(Number(cursor.phaseJoined))) state.sync.phaseJoined = Number(cursor.phaseJoined);
     return true;
   }
 
+  /**
+   * Fold a live `SYNC_PROGRESS` push. There is NO page field: the crawl is
+   * cursor-based, so a "page N" reading would be a fabrication. What a progress
+   * push genuinely carries is pages done, clips seen, clips added and an ETA.
+   *
+   * @param {object|null} p
+   */
   function applySyncProgress(p) {
     if (!p) return;
-    if (typeof p.page === 'number') state.sync.page = p.page;
     if (typeof p.pagesDone === 'number') state.sync.pagesDone = p.pagesDone;
     if (typeof p.seen === 'number') state.sync.seen = p.seen;
     if (typeof p.added === 'number') state.sync.added = p.added;
     if (typeof p.etaMs === 'number') state.sync.etaMs = p.etaMs;
+    if (typeof p.phase === 'string' && p.phase) state.sync.phase = p.phase;
+    if (Number.isFinite(Number(p.phasePagesDone))) state.sync.phasePages = Number(p.phasePagesDone);
+    if (Number.isFinite(Number(p.phaseJoined))) state.sync.phaseJoined = Number(p.phaseJoined);
     if (p.state) {
       state.sync.state = String(p.state);
       if (p.state !== 'running') state.sync.running = false;
@@ -1943,64 +2603,224 @@
   function renderSync() {
     if (!ui.syncState) return;
     const s = state.sync;
+    const verdict = syncVerdict();
     const parts = [s.running ? 'running' : (s.state || 'idle')];
-    if (s.page) parts.push('page ' + s.page + (s.maxPages ? '/' + s.maxPages : ''));
-    if (s.pagesDone) parts.push(s.pagesDone + ' pages done');
-    parts.push(s.seen + ' seen');
+    // WHICH PHASE, first, because it is the fact that explains the numbers below.
+    // A sync pages `/api/project/me` and then `/api/project/feed` (~180 pages at
+    // 30 rows) before it indexes a single clip, so "0 pages done · 0 seen" for
+    // minutes was the dock correctly reporting a crawl that had not reached the
+    // indexing phase yet — while looking, to the user, like a hung extension.
+    if (s.running && s.phase) {
+      if (s.phase === 'planning') parts.push('listing your workspaces');
+      else if (s.phase === 'mapping') {
+        parts.push('mapping clips to workspaces'
+          + (s.phasePages ? ' · ' + s.phasePages + ' pages' : '')
+          + (s.phaseJoined ? ' · ' + s.phaseJoined + ' joined' : '')
+          + ' · no clips indexed yet');
+      } else if (s.phase === 'crawling') parts.push('crawling your library');
+      else if (s.phase === 'committing') parts.push('writing the index');
+      else parts.push(s.phase);
+    }
+    // No "page N": the crawl is cursor-based and has no page number to report.
+    // `pagesDone` against the cap is the honest progress reading.
+    if (s.pagesDone) parts.push(s.pagesDone + (s.maxPages ? ' of ' + s.maxPages : '') + ' pages done');
+    parts.push(s.seen > 0 ? s.seen + ' seen' : 'clips seen —');
     if (s.added) parts.push(s.added + ' added');
-    // How many clips are actually indexed on disk — the number the user cares about.
-    if (s.total) parts.push(s.total + ' indexed');
+    // How many clips are actually indexed on disk — the number the user cares
+    // about — and what Suno says it has. "400 indexed · Suno reports ~5,500" is
+    // the single most valuable string this dock can show: it makes a broken sync
+    // obvious at a glance, with no log and no inference, because the index can
+    // never be more complete than the smaller of the two numbers.
+    const counts = verdict.counts;
+    if (s.total) {
+      parts.push(counts ? (s.total + ' indexed · Suno reports ' + counts) : (s.total + ' indexed'));
+    } else if (counts) {
+      parts.push('Suno reports ' + counts);
+    }
+    if (verdict.missing !== null) parts.push(group(verdict.missing) + ' missing');
+    // The outcome is a WORD, never only a colour: "complete" / "incomplete" /
+    // "cancelled" is what a screen reader announces and what a colour-blind user
+    // reads, so the amber `sm-warn` banner below is decoration on top of this.
+    if (s.stopReason) parts.push(verdict.reason);
+    else if (verdict.kind === 'incomplete' && !s.running) parts.push('INCOMPLETE');
     parts.push('eta ' + fmtEta(s.etaMs));
     ui.syncState.textContent = parts.join(' · ');
 
     const fill = ui.syncBar ? ui.syncBar.firstChild : null;
     if (fill) {
-      // The denominator is the page CAP, not the pages already done: dividing by
-      // `pagesDone` (the old behaviour) made the bar jump to 100% after one page.
-      const denom = s.maxPages || s.pagesDone || 0;
-      const pct = denom ? Math.min(100, Math.round((s.page / denom) * 100)) : 0;
-      fill.style.width = (s.running ? pct : (s.state === 'done' ? 100 : 0)) + '%';
+      // The bar shows REAL completeness, never a decorative number. While the walk
+      // runs the only meaningful fraction is pages against the cap. Once it stops
+      // the crawl fraction is meaningless (a cursor walk has no target page), so
+      // the bar reports the fraction of Suno's count that was actually reached —
+      // full on a complete walk, the true shortfall on an incomplete one. The old
+      // `state === 'done' ? 60 : 0` painted 60% over an INCOMPLETE library, a
+      // number that corresponded to nothing the user could see.
+      let pct = 0;
+      if (s.running) {
+        const denom = s.maxPages > 0 ? s.maxPages : 0;
+        pct = denom ? Math.min(100, Math.round((s.pagesDone / denom) * 100)) : 0;
+      } else if (verdict.kind === 'complete') {
+        pct = 100;
+      } else if (typeof s.totalSeen === 'number' && s.totalSeen > 0 &&
+                 typeof s.expectedTotal === 'number' && s.expectedTotal > 0) {
+        pct = Math.max(0, Math.min(100, Math.round((s.totalSeen / s.expectedTotal) * 100)));
+      }
+      fill.style.width = pct + '%';
+      // The bar is decorative: `aria-hidden` keeps a screen reader from reading a
+      // bare percentage, while the status line above it already states the
+      // counts, the reason and the word INCOMPLETE.
+      if (ui.syncBar) ui.syncBar.setAttribute('aria-hidden', 'true');
     }
     const dot = ui.syncChip ? ui.syncChip.firstChild : null;
-    if (dot) dot.className = 'sm-sync-dot ' + (s.running ? 'run' : (s.state === 'done' ? 'ok' : ''));
+    // `done` is NOT `ok`: a walk that died on page 21 also sets `state:'done'`.
+    if (dot) dot.className = 'sm-sync-dot ' + (s.running ? 'run' : (verdict.kind === 'complete' ? 'ok' : ''));
     if (ui.syncChip && ui.syncChip.lastChild) {
-      ui.syncChip.lastChild.textContent = s.state === 'done'
-        ? (s.lastDurationMs ? Math.round(s.lastDurationMs / 1000) + 's' : 'synced')
-        : (s.state || 'not synced');
+      ui.syncChip.lastChild.textContent = s.running
+        ? (s.state || 'running')
+        : (verdict.kind === 'complete'
+          ? (s.lastDurationMs ? Math.round(s.lastDurationMs / 1000) + 's' : 'synced')
+          : (verdict.kind === 'incomplete' ? 'incomplete' : (s.state || 'not synced')));
     }
+
+    const incomplete = syncIsIncomplete();
     if (ui.truncWarn) {
+      if (ui.truncTitle) {
+        ui.truncTitle.textContent = s.stopReason === 'aborted'
+          ? 'Sync cancelled by you — the index is INCOMPLETE. '
+          : 'Library INCOMPLETE — the last sync stopped early. ';
+      }
       const detail = ui.truncWarn.querySelector('.sm-trunc-detail');
       if (detail) {
         detail.textContent = [
-          s.pagesDone ? s.pagesDone + ' of ' + (s.maxPages || '?') + ' pages crawled' : '',
-          s.total ? s.total + ' clips indexed' : '',
-          s.lastError ? 'last error: ' + s.lastError : ''
+          sentence(verdict.reason) + (verdict.error ? ' (' + verdict.error + ')' : ''),
+          counts ? 'Indexed ' + counts : '',
+          verdict.missing !== null
+            ? group(verdict.missing) + ' ' + (verdict.missing === 1 ? 'clip is' : 'clips are') + ' missing'
+            : '',
+          s.pagesDone ? s.pagesDone + (s.pagesDone === 1 ? ' page crawled' : ' pages crawled') : '',
+          s.stopReason === 'max_pages'
+            ? 'Raise the page cap and sync again, or lower it if this was deliberate.'
+            : ''
         ].filter(Boolean).join(' · ');
       }
+      // The cap button is the honest advice ONLY when the cap is what stopped
+      // the walk. After a failed request it is a red herring, so it is removed
+      // from the flow entirely rather than merely disabled — a control that is
+      // visible but wrong is the defect being fixed here.
+      //
+      // `style.display`, NOT the `hidden` attribute: `.sm-btn` is an author rule
+      // with `display: inline-flex`, and an author declaration beats the user
+      // agent's `[hidden] { display: none }` regardless of specificity. Setting
+      // `hidden` here would leave the button visible in Chrome while every DOM
+      // assertion (and every test) said otherwise.
+      if (ui.truncCapBtn) ui.truncCapBtn.style.display = s.stopReason === 'max_pages' ? '' : 'none';
+      if (ui.truncRetryBtn) ui.truncRetryBtn.style.display = s.stopReason === 'max_pages' ? 'none' : '';
       // A dismissal is session-scoped: routine status polls must not resurrect it.
-      ui.truncWarn.classList.toggle('on', !!s.truncated && !s.truncateDismissed);
+      ui.truncWarn.classList.toggle('on', incomplete && !s.truncateDismissed);
     }
   }
 
+  /**
+   * `SYNC_DONE` — store the contract on `state.sync` BEFORE rendering, so a
+   * later `SYNC_STATUS` poll (which may carry none of these fields) cannot wipe
+   * it, and so the banner, the status line and the toast all read one object.
+   *
+   * @param {object} m
+   */
   function onSyncDone(m) {
     state.sync.running = false;
-    state.sync.state = 'done';
+    if (typeof m.total === 'number') state.sync.total = m.total;
     state.sync.seen = typeof m.total === 'number' ? m.total : state.sync.seen;
     state.sync.added = typeof m.total === 'number' ? m.total : state.sync.added;
-    state.sync.truncated = !!m.truncated;
     state.sync.lastDurationMs = Number(m.durationMs) || 0;
     state.sync.lastProjects = Number(m.projects) || 0;
+    applySyncFacts(m);
+
+    const verdict = syncVerdict();
+    // `state` is the worker's own lifecycle label, trusted when present. The
+    // `done` fallback used to be unconditional, which asserted success over an
+    // INCOMPLETE crawl; it now follows the verdict, so the one case with no
+    // worker label at all cannot claim a finished walk that did not happen.
+    state.sync.state = typeof m.state === 'string' && m.state
+      ? m.state
+      : (verdict.kind === 'complete' ? 'done' : (verdict.stopReason === 'aborted' ? 'cancelled' : 'incomplete'));
     renderSync();
-    if (state.sync.truncated) {
-      showError('Sync hit the page cap — the local library is INCOMPLETE. Raise the page cap and re-sync before trusting counts.');
-      toast('Sync truncated: library incomplete', 6000);
-    } else {
+
+    if (verdict.kind === 'complete') {
+      // Clear OUR strip, and only ours: `showError(null)` would write the string
+      // "null" into the strip, and a blanket clear would wipe an unrelated
+      // failure the user still needs to read. A successful re-sync must be able
+      // to retract the incompleteness warning it just disproved.
+      if (ui.errorStrip && state.sync.lastErrorText &&
+          ui.errorStrip.textContent === state.sync.lastErrorText) clearError();
+      state.sync.lastErrorText = '';
       toast('Sync complete: ' + state.sync.seen + ' clips' +
         (state.sync.lastProjects ? ' across ' + state.sync.lastProjects + ' projects' : ''));
+    } else if (verdict.stopReason === 'aborted') {
+      toast('Sync cancelled — nothing is broken.', 4000);
+    } else {
+      const counts = countsPhrase(false);
+      const why = sentence(verdict.reason) + (verdict.error ? ' (' + verdict.error + ')' : '') + '.';
+      const text = 'Sync stopped early — the index is INCOMPLETE: ' + why +
+        (counts ? ' Indexed ' + counts + '.' : '') +
+        (verdict.missing !== null
+          ? ' ' + group(verdict.missing) + ' ' + (verdict.missing === 1 ? 'clip is' : 'clips are') + ' missing.'
+          : '') +
+        (verdict.stopReason === 'max_pages'
+          ? ' Raise the page cap and sync again.'
+          : ' Sync again to finish the crawl.');
+      state.sync.lastErrorText = text;
+      showError(text);
+      toast(verdict.stopReason === 'max_pages'
+        ? 'Sync stopped at your page cap: ' + state.sync.seen + ' clips indexed.'
+        : 'Sync stopped early: ' + state.sync.seen + ' clips indexed, index INCOMPLETE.', 6000);
     }
     refreshResults(true);
     refreshFacets();
     loadProjects();
+  }
+
+  /**
+   * `SYNC_ERROR` — a hard failure is an INCOMPLETE index, and it is applied
+   * through `applySyncFacts` for the same reason `SYNC_DONE` is: the contract has
+   * to reach `state.sync`, which is what `renderSync` reads.
+   *
+   * The old handler set only `state.sync.state = 'error'` and showed a strip.
+   * `state.sync.completed` kept its previous value, so a run that had previously
+   * SUCCEEDED still rendered the green `ok` dot and the word `synced` sitting
+   * beside a strip reading "Sync failed" — two opposite claims, one node apart.
+   *
+   * The contract is synthesised from the push (`completed:false` plus the worker's
+   * own reason, error and counts) rather than invented: `readSyncFacts` reads
+   * `expectedTotal` / `totalSeen` / `missing` straight off the message when it
+   * sends them, and a legacy push that sends none simply leaves the counts alone.
+   * Same shape as `side_panel.js`'s `SYNC_ERROR` case.
+   *
+   * @param {object} m
+   */
+  function onSyncError(m) {
+    state.sync.running = false;
+    const message = (m && m.error) ? String(m.error) : 'unknown sync error';
+    const stopReason = (m && typeof m.stopReason === 'string' && m.stopReason.trim())
+      ? m.stopReason.trim() : 'page_failed';
+    applySyncFacts(Object.assign({}, m || {}, {
+      completed: false,
+      stopReason: stopReason,
+      error: message,
+      state: 'error'
+    }));
+    state.sync.state = 'error';
+    // A failure is a stop the user did not ask for, so the amber banner shows it
+    // too — the same three-way decision the status line and the strip now share.
+    renderSync();
+    const counts = countsPhrase(false);
+    const text = 'Sync failed — the index is INCOMPLETE: ' + sentence(syncReasonPhrase(stopReason)) +
+      (message ? ' (' + message + ')' : '') + '.' +
+      (counts ? ' Indexed ' + counts + '.' : '') +
+      ' Sync again to finish the crawl.';
+    state.sync.lastErrorText = text;
+    showError(text);
+    toast('Sync failed: ' + message, 6000);
   }
 
   /* ================================================================== *
@@ -2453,7 +3273,7 @@
       if (ui.quotaChip.lastChild) ui.quotaChip.lastChild.textContent = 'n/a';
       ui.quotaChip.classList.add('sm-bad');
       ui.quotaChip.title = 'Download quota unavailable: ' + res.error;
-      fail('GET_QUOTA', { message: res.error });
+      fail('GET_QUOTA', { message: res.error, code: res.code });
       return;
     }
     ui.quotaChip.classList.remove('sm-bad');
@@ -2496,6 +3316,12 @@
     if (Array.isArray(res.ladder) && res.ladder.length) state.ladder = res.ladder;
     if (s && typeof s === 'object') {
       state.settings = cloneSettings(s);
+      // The worker's own diagnostics switch, read here so this file's `dbg()` is
+      // controllable the same way the worker's `log()` is — one setting, both
+      // halves. Until this read lands `debugOn` is false, so mount-time
+      // diagnostics are silent; that is the price of not hard-coding the answer,
+      // and it is why nothing load-bearing depends on `dbg()` reporting.
+      debugOn = s.debug === true;
     }
     if (ui.variantSel) {
       ui.variantSel.value = state.settings.variant;
@@ -2770,40 +3596,122 @@
    * 20. HLS capture — opt-in, off by default, always restored
    * ================================================================== */
 
-  const HLS_PATCH = [
-    '(function(){try{',
-    'if(window.__smHlsActive){window.__smHlsPatchError="already active";return;}',
-    'window.__smHlsActive=true;',
-    'window.__smHlsHadMS=("MediaSource" in window);',
-    'try{window.__smHlsSavedMS=window.MediaSource;}catch(e){window.__smHlsSaveError=String(e&&e.message||e);window.__smHlsSavedMS=undefined;}',
-    'try{window.MediaSource=undefined;}catch(e2){window.__smHlsPatchError=String(e2&&e2.message||e2);}',
-    '}catch(e3){window.__smHlsPatchError=String(e3&&e3.message||e3);}})();'
-  ].join('');
+  // The MediaSource patch/restore pair used to live here as two arrays of source
+  // STRINGS, appended to the page as inline scripts. It is now the worker's
+  // `RUN_MAIN_WORLD` route, and this file only names the operation. The behaviour
+  // those two strings relied on is recorded here because it is the contract the
+  // worker's MAIN-world functions must keep:
+  //
+  //   patch   1. `if (window.__smHlsActive) -> report alreadyActive:true and change
+  //             nothing`. A second patch must NOT clobber `__smHlsSavedMS`, or the
+  //             restore would put back an already-overwritten value.
+  //           2. `window.__smHlsActive = true`.
+  //           3. `window.__smHlsHadMS = ("MediaSource" in window)` — presence is
+  //             recorded BEFORE the write, because a page that never had the
+  //             property must be restored by DELETING it, not by assigning it.
+  //           4. `window.__smHlsSavedMS = window.MediaSource` in its own try/catch:
+  //             a throwing getter must not abort the patch, and a failed save
+  //             leaves `__smHlsSavedMS` undefined rather than losing the flag.
+  //           5. `window.MediaSource = undefined` in its own try/catch, so a
+  //             read-only/non-writable property is reported as a patch error
+  //             instead of throwing the whole thing away half-applied.
+  //   restore 1. `if (!window.__smHlsActive) -> a no-op, reported as notActive`, so
+  //             a restore that has nothing to undo does not claim success over a
+  //             patch that never landed.
+  //           2. `if (window.__smHlsHadMS) window.MediaSource = window.__smHlsSavedMS`,
+  //             ELSE `delete window.MediaSource` followed by a re-check: if the
+  //             delete silently failed the property is set back to undefined so
+  //             the player still sees it as unusable rather than half-present.
+  //           3. Both branches in ONE try/catch — a failure to restore must still
+  //             reach the flag-clearing step.
+  //           4. Always clear `__smHlsActive` / `__smHlsHadMS` / `__smHlsSavedMS`
+  //             so a later capture starts from a clean state.
+  //           5. Every step above reports its own error string, so one failed step
+  //             cannot leave the page unrestorable AND unexplained.
 
-  const HLS_RESTORE = [
-    '(function(){try{',
-    'if(!window.__smHlsActive){window.__smHlsRestoreNote="not active";return;}',
-    'try{',
-    'if(window.__smHlsHadMS){window.MediaSource=window.__smHlsSavedMS;}',
-    'else{delete window.MediaSource;if("MediaSource" in window){window.MediaSource=undefined;}}',
-    '}catch(e){window.__smHlsRestoreError=String(e&&e.message||e);}',
-    'window.__smHlsActive=false;window.__smHlsHadMS=false;window.__smHlsSavedMS=undefined;',
-    '}catch(e2){window.__smHlsRestoreError=String(e2&&e2.message||e2);}})();'
-  ].join('');
-
-  function runMainWorld(code) {
-    try {
-      const el = document.createElement('script');
-      el.textContent = code;
-      const host = document.head || document.documentElement;
-      if (!host) return false;
-      host.appendChild(el);
-      el.remove();
-      return true;
-    } catch (e) {
-      dbg('main-world injection failed:', e && e.message);
-      return false;
+  /**
+   * Run one of the worker's fixed MAIN-world operations.
+   *
+   * WHY THERE IS NO INLINE `<script>` ANY MORE: suno.com ships
+   * `script-src 'self' 'wasm-unsafe-eval' 'inline-speculation-rules' …` with no
+   * `'unsafe-inline'`. A content script that builds a `<script>` element, assigns
+   * `.textContent` to it and appends it to `document.head` gets a SUCCESSFUL APPEND
+   * and a BLOCKED EXECUTION — the CSP violation is reported afterwards — so the
+   * old injection helper returned `true` while doing nothing at all. That silently
+   * killed three things: the `MediaSource` patch never landed, so no
+   * `manifest.m3u8` ever appeared and every capture burned a 20s poll before
+   * failing with a misleading "no manifest appeared"; the Clerk reader never ran,
+   * so `requestPageToken()` was a no-op; and the RESTORE never ran either, which
+   * means that if the patch ever had landed, the page would have been left with
+   * `MediaSource` destroyed and Suno's own player broken. There is no way to make
+   * inline injection work from a content script, and the page's CSP is not to be
+   * worked around.
+   *
+   * The worker injects instead with `chrome.scripting.executeScript({world:'MAIN'})`,
+   * which runs in the page's main world but is NOT subject to the page's CSP. So
+   * the page is never handed a string to evaluate, the patch/restore pair stays
+   * inside one owner where it cannot drift, and this file cannot accidentally
+   * reintroduce an inline script.
+   *
+   * The reply is VERIFIED rather than trusted, because "reported success but did
+   * nothing" is the exact failure mode being removed: `ok:true` with no result
+   * means the injection never ran, and a non-empty `result.error` means it ran and
+   * failed. Either way this returns `{ok:false}` with the reason surfaced.
+   *
+   * @param {'auth-tap'|'auth-read'|'probe'|'hls-patch'|'hls-restore'} op
+   * @returns {Promise<{ok:boolean, result?:object, error?:string, code?:string}>}
+   */
+  /**
+   * Run one of the worker's fixed MAIN-world operations.
+   *
+   * Inline `<script>` injection is CSP-blocked on suno.com, so the worker uses
+   * `chrome.scripting.executeScript({world:'MAIN'})`, which the page CSP does not
+   * cover.
+   *
+   * `opts.quiet` suppresses the red error strip. It exists because "the tap is
+   * not installed" and "nothing captured yet" are NORMAL states for the auth
+   * ops, not failures: the tap is installed on demand and Suno has simply not
+   * made an authenticated request yet. Raising a user-visible error for them put
+   * a permanent red strip on every page load, which is the same
+   * reported-success-with-a-problem class of bug this extension is being fixed
+   * for. Genuine faults (`bad_op`, `no_tab`, `inject_failed`, a missing result)
+   * still surface — `quiet` is for absence, not for breakage.
+   *
+   * @param {'auth-tap'|'auth-read'|'probe'|'hls-patch'|'hls-restore'} op
+   * @param {{quiet?:boolean}} [opts]
+   * @returns {Promise<{ok:boolean, result?:object, error?:string, code?:string}>}
+   */
+  async function mainWorldOp(op, opts) {
+    const quiet = !!(opts && opts.quiet);
+    const why = (msg, code) => {
+      const text = String(msg || 'no reason given') + (code ? ' (' + code + ')' : '');
+      // A dead context is not THIS op failing — the op was never reached — and the
+      // dock has already been replaced by the reload notice, which says the same
+      // thing and is actionable. Painting it here as well would put a red strip
+      // about the transport on a surface the user is being told to reload past, and
+      // these two calls are UNCONDITIONAL on mount, so it would happen on every page
+      // after every extension reload.
+      if (code === DEAD_CODE) {
+        dbg('MAIN-world ' + op + ' never ran; the extension context is gone.');
+      } else if (!quiet) {
+        showError('MAIN-world ' + op + ' failed: ' + text);
+      } else {
+        dbg('MAIN-world ' + op + ' (quiet): ' + text);
+      }
+      return { ok: false, error: text, code: String(code || '') };
+    };
+    const res = await send('RUN_MAIN_WORLD', { op: op });
+    if (!res || !res.ok) {
+      // `bad_op`, `no_tab`, `inject_failed` and friends all land here.
+      return why((res && res.error) || 'the worker refused the request', res && res.code);
     }
+    if (!res.result || typeof res.result !== 'object') {
+      return why('the worker reported success but sent no result, so nothing was injected');
+    }
+    if (res.result.error) {
+      return why(res.result.error, res.result.code);
+    }
+    return { ok: true, result: res.result };
   }
 
   function setHlsStatus(txt) {
@@ -2811,15 +3719,22 @@
   }
 
   async function confirmHls() {
+    // The checkbox is a gesture, not a switch: it is forced back off here so the
+    // opt-in is always an explicit `window.confirm`, and the one that actually
+    // counts is the dialog below.
     if (ui.hlsEnable) ui.hlsEnable.checked = false;
     const answer = window.confirm([
       'Enable HLS stream capture for this session?',
       '',
-      'This temporarily sets window.MediaSource = undefined in the page MAIN world so',
-      "Suno's player falls back to a plain fetch, then reads the resulting",
-      'manifest.m3u8 (#EXT-X-MAP init segment + media segments).',
+      'On your confirmation, the service worker runs a MAIN-world operation that',
+      'sets window.MediaSource = undefined in the page, so Suno\'s player falls back',
+      'to a plain fetch. This dock then reads the resulting manifest.m3u8',
+      '(#EXT-X-MAP init segment + media segments).',
       '',
-      'It manipulates the page and is restored in a finally block.',
+      'The patch is rejected outright if it is already active, rather than being',
+      'stacked on top of itself.',
+      'The page is restored in a finally block, and a failed restore is reported',
+      'loudly rather than left for you to discover.',
       'The segment list is handed to the service worker, which writes the file.',
       '',
       'Continue?'
@@ -2838,10 +3753,30 @@
 
   async function runHlsCapture() {
     state.hls.active = true;
-    setHlsStatus('arming: waiting for Suno to expose an m3u8 stream…');
+    setHlsStatus('arming: asking the service worker to patch the page…');
+    // `patched` = THIS run's patch is confirmed in the page, so the finally block
+    // has something real to undo. It decides what the final status is allowed to
+    // claim, and nothing claims a restore that was not confirmed.
+    let patched = false;
     try {
-      const injected = runMainWorld(HLS_PATCH);
-      if (!injected) throw new Error('could not reach the page MAIN world');
+      // The patch MUST be confirmed before anything else happens. Polling for a
+      // manifest after a patch that never landed costs 20 wasted seconds and then
+      // blames the wrong thing ("no manifest appeared"), which is how a totally
+      // dead mechanism read as a flaky player.
+      const patch = await mainWorldOp('hls-patch');
+      if (!patch.ok) {
+        throw new Error('the MediaSource patch never reached the page: ' + patch.error);
+      }
+      if (patch.result.alreadyActive === true) {
+        // The page's re-entry guard was already set. This run changed NOTHING, so
+        // it must not be treated as a successful patch — but the finally block
+        // still runs the restore, which is exactly what clears the stale state.
+        throw new Error('the page still carries a MediaSource patch from an earlier '
+          + 'capture that never restored it; nothing was patched this time, and the '
+          + 'stale patch was cleared by the restore that follows');
+      }
+      patched = true;
+      setHlsStatus('patched: waiting for Suno to expose an m3u8 stream…');
       const manifestUrl = await pollForManifest(20000);
       if (!manifestUrl) throw new Error('no manifest.m3u8 appeared on any <audio> element within 20s');
       const manifest = await fetchManifest(manifestUrl);
@@ -2872,10 +3807,36 @@
       setHlsStatus('failed: ' + ((e && e.message) || e));
       showError('HLS capture failed: ' + ((e && e.message) || e));
     } finally {
-      // ALWAYS restore the page, whatever happened above.
-      runMainWorld(HLS_RESTORE);
+      // ALWAYS ask the worker to restore the page, whatever happened above. The
+      // restore is the SAFETY-CRITICAL half: a page left with MediaSource
+      // destroyed has no working player, and the user has to be told, because the
+      // fix is to reload the tab and they will not guess that. It is also the
+      // only thing that clears a stale patch, so it runs even when this run never
+      // patched anything.
+      const restore = await mainWorldOp('hls-restore');
       state.hls.active = false;
-      setHlsStatus('idle — window.MediaSource restored');
+      if (!restore.ok) {
+        const cause = restore.error || 'unknown reason';
+        if (patched) {
+          setHlsStatus('idle — RESTORE FAILED, window.MediaSource may still be disabled (' + cause + ')');
+          showError('HLS restore FAILED: window.MediaSource may still be disabled in this '
+            + 'tab, so Suno\'s own player will not work here. Reload the tab. (' + cause + ')');
+        } else {
+          // Nothing was patched by this run, so there is nothing this failure can
+          // have left broken. Say what actually went wrong without crying wolf.
+          setHlsStatus('idle — no patch was applied, so there was nothing to restore (' + cause + ')');
+          dbg('restore after an unconfirmed patch failed too:', cause);
+        }
+      } else if (!patched && restore.result.notActive === true) {
+        setHlsStatus('idle — nothing was patched, and the page needed no restore');
+      } else {
+        // Only now, with the worker confirming the restore, may this claim success.
+        // `!patched` with a successful restore means the restore cleared a patch
+        // left behind by an earlier capture, which is worth saying out loud.
+        setHlsStatus(patched
+          ? 'idle — window.MediaSource restored'
+          : 'idle — a stale patch from an earlier capture was cleared; window.MediaSource restored');
+      }
     }
   }
 
@@ -2943,78 +3904,55 @@
   }
 
   /* ================================================================== *
-   * 21. token relay
+   * 21. session token — worker status only, no page relay
    * ================================================================== */
 
-  // Injected into the page MAIN world to read window.Clerk. Strings only, and the
-  // reply is validated by BOTH source and origin before it is trusted.
-  const CLERK_ORIGIN = JSON.stringify(String(location.origin || ''));
-  const CLERK_SCRIPT = [
-    '(async function(){try{',
-    'var o=0;',
-    'for(;(!window.Clerk||!window.Clerk.session)&&o<40;){await new Promise(function(r){setTimeout(r,500);});o++;}',
-    'if(window.Clerk&&window.Clerk.session){',
-    'var t=await window.Clerk.session.getToken();',
-    'window.postMessage({source:"suno-master-dock",kind:"token",token:t},' + CLERK_ORIGIN + ');',
-    '}else{window.postMessage({source:"suno-master-dock",kind:"token-error",error:"Clerk not available"},' + CLERK_ORIGIN + ');}',
-    '}catch(e){window.postMessage({source:"suno-master-dock",kind:"token-error",error:String(e&&e.message||e)},' + CLERK_ORIGIN + ');}',
-    '})();'
-  ].join('');
+  // There used to be a whole token RELAY here: a MAIN-world script string that read
+  // `window.Clerk`, and a `window.addEventListener('message', …)` handler that
+  // validated the answer and pushed the raw JWT into the worker with SET_TOKEN.
+  // Both halves are gone, for two independent reasons.
+  //
+  //   1. The script string was DEAD: appending it as an inline script is blocked
+  //      by suno.com's CSP, so it never executed and the handler never fired. It
+  //      could not have worked from a content script either way — `window.Clerk`
+  //      lives in the page world and is invisible to this isolated world.
+  //   2. It was REDUNDANT: the worker reaches the same credential without any page
+  //      string at all. It can mint one itself
+  //      (`chrome.scripting.executeScript({world:'MAIN'})`), and it can observe the
+  //      `Authorization: Bearer …` header on Suno's own requests — which is the
+  //      `auth-tap` / `auth-read` pair `mount()` installs (see section 22).
+  //      GET_TOKEN_STATUS mints opportunistically when it holds nothing.
+  //
+  // So asking the worker IS the page read, and this file never holds a credential.
+  // What is left is the status half: renderTokenInfo / readTokenStatus /
+  // applyTokenStatus / refreshToken / refreshTokenStatusQuietly, all driven by the
+  // worker's tokenStatus() OBJECT.
 
-  let clerkTried = false;
-
-  function requestPageToken() {
-    if (!document.body && !document.documentElement) {
-      toast('document not ready yet');
-      return;
-    }
-    clerkTried = true;
-    const ok = runMainWorld(CLERK_SCRIPT);
-    if (!ok) showError('could not inject the Clerk reader (no document element yet)');
-  }
-
-  function setupTokenRelay() {
-    window.addEventListener('message', (event) => {
-      try {
-        // BOTH checks are required: origin alone would let any same-origin script
-        // (or an injected <script>) overwrite the extension's credential for the
-        // whole profile.
-        if (event.source !== window) return;
-        if (event.origin !== location.origin) return;
-        const d = event.data;
-        if (!d || typeof d !== 'object') return;
-        if (d.source !== 'suno-master-dock' || d.kind !== 'token') return;
-        const token = typeof d.token === 'string' ? d.token.trim() : '';
-        if (!TOKEN_RE.test(token)) {
-          fail('page token', { message: 'rejected: malformed token' });
-          return;
-        }
-        storeToken(token, 0);
-      } catch (e) {
-        dbg('token relay handler error:', e && e.message);
-      }
-    });
-  }
-
-  async function storeToken(token, expiresAt) {
-    state.token = token;
-    state.tokenExpiresAt = Number(expiresAt) || 0;
-    state.tokenHas = true;
-    renderTokenInfo();
-    const res = await send('SET_TOKEN', { token: token, expiresAt: state.tokenExpiresAt });
-    if (!res.ok) {
-      state.tokenHas = false;
-      fail('SET_TOKEN', { message: res.error });
-    }
+  /**
+   * Ask the service worker to re-read the page session, and apply what it reports.
+   *
+   * This used to inject a MAIN-world script string that read `window.Clerk`
+   * directly. That could never have worked: inline injection is blocked by
+   * suno.com's CSP (the append succeeded and the execution was refused, which is
+   * why it reported success while doing nothing), and `window.Clerk` is invisible
+   * to this isolated world anyway. The function now converges on
+   * `refreshToken()` — GET_TOKEN_STATUS reads the worker's tap and mints
+   * opportunistically when it holds nothing — and this alias exists only so the
+   * two buttons keep distinct, honest intents.
+   *
+   * @returns {Promise<void>} resolves once the worker's status has been applied
+   */
+  async function requestPageToken() {
+    await refreshToken();
   }
 
   function renderTokenInfo() {
     if (!ui.tokenInfo) return;
     const bits = [];
-    // `state.token` holds ONLY a raw JWT the page relay handed over. The worker
-    // reports STATUS, never the credential, so presence is tracked separately.
+    // Everything below comes from the worker's tokenStatus() OBJECT. The worker
+    // reports presence and expiry, never the credential, so there is no JWT in
+    // this file to report on.
     bits.push(state.tokenHas ? 'worker: token present' : 'worker: no token');
-    if (state.token) bits.push('page relay: ' + state.token.length + ' chars');
     if (state.tokenExpiresAt) bits.push('expires ' + new Date(state.tokenExpiresAt).toLocaleTimeString());
     else bits.push('expiry unknown');
     ui.tokenInfo.textContent = bits.join(' · ');
@@ -3027,8 +3965,8 @@
    * Read the worker's `tokenStatus()` OBJECT.
    *
    * `GET_BOOT.token` and `GET_TOKEN_STATUS.token` are both
-   * `{hasToken, expiresAt, secondsRemaining, source, badToken}` — an OBJECT. The
-   * previous guard was `TOKEN_RE.test(String(res.token))`, and
+   * `{hasToken, expiresAt, secondsRemaining, source, badToken}` — an OBJECT. An
+   * earlier guard here ran a JWT-pattern test against `String(res.token)`, and
    * `String({hasToken:true,…})` is `"[object Object]"`, which can never match the
    * JWT pattern, so the whole block was unreachable dead code. It must be read by
    * field and must never be stringified.
@@ -3059,6 +3997,25 @@
     renderTokenInfo();
   }
 
+  /**
+   * Re-read the worker's token status and apply it, without toasting.
+   *
+   * `refreshToken()` is the user-facing button: it toasts, and it tells the user
+   * to re-sign-in on a bad token. Both of those are wrong for the two places
+   * that only want the panel to become true — the end of `mount()`, and the
+   * TOKEN_CHANGED push. This is the same route, quietly.
+   *
+   * @returns {Promise<void>}
+   */
+  async function refreshTokenStatusQuietly() {
+    const res = await send('GET_TOKEN_STATUS');
+    if (!res.ok) {
+      dbg('token status read failed:', res.error, res.code);
+      return;
+    }
+    applyTokenStatus(readTokenStatus(res));
+  }
+
   async function refreshToken() {
     // GET_TOKEN_STATUS is the route that reports the token (and mints one
     // opportunistically when the worker has none).
@@ -3082,8 +4039,17 @@
         + (info.secondsRemaining !== null && info.secondsRemaining < 300 ? ' — expiring soon' : ''));
       return;
     }
-    // No token in the worker: the page MAIN world is the only source of a raw JWT.
-    requestPageToken();
+    // No token yet. This used to call `requestPageToken()`, which after the relay
+    // was retired is just `refreshToken()` — so it recursed into itself and spun
+    // the message channel until the tab went unresponsive, showing the same
+    // "no token" answer forever. There is nothing left for this file to read: the
+    // page credential is observed by the worker's MAIN-world auth tap and only
+    // exists inside the worker, so one re-ask of the status route is the entire
+    // available remedy. The tap catches the token as soon as Suno makes its next
+    // authenticated request, and the worker broadcasts TOKEN_CHANGED then.
+    showError('The service worker holds no session token yet. The page is not sending '
+      + 'one, so no authenticated call can be attempted — sign in at suno.com and '
+      + 'reload this tab. Re-reading will not help.');
   }
 
   /* ================================================================== *
@@ -3136,15 +4102,18 @@
     return [ui.errorStrip, ui.toast];
   }
 
-  async function mount() {
-    if (state.mounted) return;
-    if (!document.body) {
-      document.addEventListener('DOMContentLoaded', mount, { once: true });
-      return;
-    }
-    state.mounted = true;
-
-    // ---- shadow host -------------------------------------------------
+  /**
+   * Create the shadow host, apply the stylesheet, and return the empty root to fill.
+   *
+   * Extracted from `mount()` because the dead-context notice needs exactly the same
+   * seam — same host, same stylesheet, same z-index, so the notice is styled by the
+   * same CSS as the dock it replaces instead of arriving as an unstyled fragment.
+   *
+   * @returns {Promise<{root:HTMLElement, cssText:string}|null>} null if there is no
+   *   body yet, which is the document_start case this file is written against
+   */
+  async function createRoot() {
+    if (!document.body) return null;
     const existing = document.getElementById(HOST_ID);
     if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
 
@@ -3170,6 +4139,31 @@
 
     const root = h('div', { class: 'sm-root' });
     shadow.appendChild(root);
+    return { root: root, cssText: cssText };
+  }
+
+  async function mount() {
+    if (state.mounted) return;
+    if (!document.body) {
+      document.addEventListener('DOMContentLoaded', mount, { once: true });
+      return;
+    }
+    // Nothing below can work without a live context, and a dock built on top of a
+    // dead one is the defect this check exists for: it looks interactive and every
+    // control fails. In practice the script was just injected so this is alive;
+    // it is checked because it costs nothing and the failure it prevents is silent.
+    if (!contextAlive()) {
+      dbg('mount() reached with a dead extension context; showing the reload notice');
+      await showReloadNotice();
+      return;
+    }
+    state.mounted = true;
+
+    // ---- shadow host -------------------------------------------------
+    const created = await createRoot();
+    if (!created) return;
+    const cssText = created.cssText;
+    const root = created.root;
     const bits = buildToast();
     root.appendChild(bits[0]);
     root.appendChild(bits[1]);
@@ -3214,13 +4208,70 @@
     attachObserver();
 
     // ---- wire the SW --------------------------------------------------
-    setupTokenRelay();
     const bootRes = await send('REGISTER_TAB', {
       url: location.href,
       path: location.pathname,
       title: document.title
     });
-    if (!bootRes.ok) fail('REGISTER_TAB', { message: bootRes.error });
+    if (!bootRes.ok) fail('REGISTER_TAB', { message: bootRes.error, code: bootRes.code });
+
+    // ---- sign-in: install the Authorization-header tap FIRST ----------
+    // ORDER MATTERS, and this is the sign-in fix. The worker reads the token by
+    // observing the `Authorization: Bearer …` header on Suno's OWN requests, and
+    // that observer lives in the page, so it has to exist before the page issues
+    // its first authenticated fetch. Suno's shell + Clerk session bootstrap
+    // happens during first paint, which is already under way by the time this
+    // dock is built, so the tap is installed as soon as the dock is up — and
+    // BEFORE the first GET_BOOT / GET_TOKEN_STATUS, because those are the calls
+    // that make the worker try to mint, and minting blind is what produced
+    // "no Clerk JWT available; authenticated call not attempted" for a user who
+    // was plainly signed in.
+    //
+    // Self-healing on reload: the tap lives in the page, so a full reload wipes
+    // it — but a full reload also re-runs this content script, so mount() runs
+    // again and reinstalls it. That is why there is deliberately NO
+    // `pageshow`/`visibilitychange` reinstall handler here: it would be a second
+    // mechanism for something that already repairs itself. The worker's
+    // `alreadyInstalled` reply makes the one redundant case (mount() reached
+    // twice without a reload) harmless, and it is treated as success below.
+    //
+    // A tap failure must NOT block the mount: Clerk may still work through the
+    // worker's own mint path, and a dock that refuses to appear because an auth
+    // helper is unhappy is strictly worse than a dock with no tap. `mainWorldOp`
+    // has already shown the error strip for the real reason, so this only adds
+    // a debug line and carries on.
+    const tap = await mainWorldOp('auth-tap', { quiet: true });
+    if (!tap.ok) dbg('auth tap not installed; the worker may have to mint instead:', tap.error);
+    else dbg('auth tap live (alreadyInstalled=' + (tap.result.alreadyInstalled === true) + ')');
+
+    // ONE eager read, so the worker has a token before it needs one instead of
+    // minting on the critical path. Best-effort like the tap: if it yields
+    // nothing, GET_TOKEN_STATUS below still asks the worker, and the worker's own
+    // tap will pick the token up on Suno's next authenticated request.
+    const read = await mainWorldOp('auth-read', { quiet: true });
+    if (!read.ok) {
+      dbg('eager auth read failed; falling back to the worker status route:', read.error);
+    } else if (read.result.token && read.result.token.length > 20) {
+      // `expiresAt: 0` means "unknown expiry", which is what SET_TOKEN documents
+      // and what the tap can honestly supply: it sees a bearer header, not a
+      // verified JWT `exp` claim. The worker re-derives and caches real expiry
+      // from the JWT it stores, and broadcasts TOKEN_CHANGED when that lands.
+      const set = await send('SET_TOKEN', { token: String(read.result.token), expiresAt: 0 });
+      if (!set.ok) {
+        dbg('worker refused the tapped token:', set.error, set.code);
+      } else {
+        applyTokenStatus({
+          hasToken: true,
+          expiresAt: Number(set.expiresAt) || 0,
+          secondsRemaining: null,
+          source: 'auth-tap',
+          badToken: false
+        });
+        dbg('tapped token handed to the worker via SET_TOKEN');
+      }
+    } else {
+      dbg('auth read found no token yet; the tap will catch the next request');
+    }
 
     const boot = await send('GET_BOOT');
     if (boot.ok) {
@@ -3238,7 +4289,7 @@
       // TOKEN_CHANGED itself when the token changes (see the onMessage case below),
       // so nothing needs to be sent.
     } else {
-      fail('GET_BOOT', { message: boot.error });
+      fail('GET_BOOT', { message: boot.error, code: boot.code });
     }
 
     await Promise.all([
@@ -3253,7 +4304,11 @@
     refreshResults(true);
     renderSync();
 
-    if (!clerkTried) requestPageToken();
+    // The tap only sees a token when Suno makes an authenticated request, which
+    // happens at its own pace. GET_BOOT above read the worker's status before
+    // that could have happened, so ask once more, quietly, and let the panel show
+    // whatever is true by now.
+    await refreshTokenStatusQuietly();
     dbg('mounted; stylesheet source:', cssText ? 'content/content.css' : 'fallback');
   }
 
@@ -3274,9 +4329,132 @@
     dbg('destroyed');
   }
 
+  /* ---------------- dead extension context (see DEAD_CODE) ------------ */
+
+  /**
+   * Set once this script has lost the extension. Not user state: it exists so the
+   * many things that can notice a dead context — a `send()` failure, the mount
+   * probe, the tab-focus re-check — agree on whether the notice has been shown.
+   */
+  let contextDead = false;
+
+  /**
+   * Is this script's extension context still usable?
+   *
+   * WHY A PROBE AT ALL: the authority is the transport failure classified in
+   * `send()`, which is definitive. But it only arrives when the user presses
+   * something. Reloading the extension while a tab sits open invalidates every
+   * mounted content script at once, and the tab then shows a dock that still looks
+   * completely live — same chips, same buttons, same row checkboxes — over a
+   * context that can no longer answer. The user has to press something before this
+   * file learns it is dead, and the result of that press is an error about a
+   * feature they did not break. This is the cheap check that notices first.
+   *
+   * WHY TWO SIGNALS, AND WHY IT FAILS SAFE: `chrome.runtime.id` and
+   * `chrome.runtime.getManifest()` both belong to the extension context, so both
+   * die with it while `document`, timers and this file keep running — that
+   * asymmetry is the whole defect. A context counts as ALIVE if EITHER answers.
+   * That is deliberate: the cost of a false negative is nothing new (the user
+   * presses a control and `send()` classifies the real failure anyway), whereas a
+   * false positive would tear down a working dock on every page load — a far worse
+   * failure than the one this is here to catch, and one this file could not
+   * recover from without the reload it is asking for.
+   *
+   * @returns {boolean}
+   */
+  function contextAlive() {
+    try {
+      const rt = chrome.runtime;
+      if (!rt) return false;
+      if (rt.id) return true;
+      try { return !!rt.getManifest(); }
+      catch (manifestErr) {
+        dbg('getManifest() threw on a context with no runtime.id:', manifestErr && manifestErr.message);
+        return false;
+      }
+    } catch (e) {
+      dbg('extension-context probe threw:', e && e.message);
+      return false;
+    }
+  }
+
+  /**
+   * Replace the dock with the one thing a dead context needs: an explanation and a
+   * way out. A reload is the ONLY fix — nothing in this file can revive an
+   * invalidated context, which is why there is no retry here and why the button
+   * says so rather than offering one.
+   *
+   * The teardown is SYNCHRONOUS and happens before the first `await`, because the
+   * `send()` that got us here has already resolved: any consumer of that reply
+   * resumes on the microtask queue and must find nothing left to paint, or it puts
+   * Chrome's transport string on screen before the notice arrives.
+   *
+   * `destroy()` is the same seam the "Hide" button uses, so the observer, the row
+   * controls and `state.mounted` all come down with it. Leaving `state.mounted`
+   * false is what keeps the notice itself quiet: `toast()` and the error strip
+   * are gated on it, so nothing further can be painted over the explanation.
+   *
+   * @returns {Promise<void>}
+   */
+  async function showReloadNotice() {
+    if (ui.reloadNotice) return;
+    stopSyncPoll();
+    destroy();
+    const created = await createRoot();
+    if (!created) return;
+    ui.reloadNotice = buildReloadNotice();
+    created.root.appendChild(ui.reloadNotice);
+    dbg('reload notice shown');
+  }
+
+  /**
+   * The notice itself. Existing CSS classes only (`sm-panel`, `sm-warn`,
+   * `sm-brand`, `sm-btn`): it must look like part of this dock, because the
+   * failure it reports is that the user cannot tell the difference between a
+   * working dock and a dead one.
+   *
+   * @returns {HTMLElement}
+   */
+  function buildReloadNotice() {
+    return h('div', {
+      class: 'sm-panel',
+      // The panel's own width is the layout's; clamped here because a one-line
+      // notice inside a 940px surface reads as a page that failed to load.
+      style: 'max-width:min(520px,94vw)'
+    }, [
+      h('div', { class: 'sm-warn on', role: 'alert' }, [
+        h('b', { text: 'This extension was reloaded, so this page cannot talk to it any more.' }),
+        // What is actually broken, in the user's terms: the controls are still
+        // drawn but every one of them fails from here on.
+        h('span', {
+          class: 'sm-trunc-detail',
+          text: 'The dock below was built by the previous copy of the extension. Its '
+            + 'buttons, filters and sync status can no longer reach the worker, and '
+            + 'no amount of retrying will change that — the extension has to be loaded '
+            + 'into this page again.'
+        }),
+        h('div', { class: 'sm-warn-actions' }, [
+          // The one action that is honest here. `location.reload()` re-injects the
+          // content script into a context the freshly-loaded extension owns, which
+          // is the only path back to a working dock.
+          btn('Reload this page', () => { location.reload(); }, 'primary'),
+          h('span', {
+            class: 'sm-help',
+            text: 'Your indexed clips, downloads and settings are untouched — they live '
+              + 'in the worker, not on this page.'
+          })
+        ])
+      ])
+    ]);
+  }
+
   /* ================================================================== *
    * 23. pushes from the service worker
    * ================================================================== */
+
+  // Unhandled push types, by name. Purely a diagnostic tally (see `default:`
+  // below); it is not user state and nothing renders it.
+  const unknownPushes = {};
 
   chrome.runtime.onMessage.addListener((msg) => {
     try {
@@ -3285,17 +4463,75 @@
         case 'SYNC_PROGRESS':
           applySyncProgress(msg);
           renderSync();
+          scheduleSyncPoll();
           break;
 
-        case 'SYNC_DONE':
-          onSyncDone(msg);
+        // The three lifecycle pushes below were MISSING from this switch, so they
+        // fell through to `default:` and vanished: a sync started from the popup or
+        // the side panel left this dock idle (no running dot, no phase, no poll),
+        // and a cancellation started elsewhere was never reflected at all. All
+        // three are in the worker's PUSH_TYPES, both other surfaces handle them,
+        // and the dock is the surface that reports the crawl's completeness — so a
+        // dropped push here is a dropped verdict, not a cosmetic gap.
+        case 'SYNC_STARTED':
+          // The worker announces the crawl before its first progress push, so this
+          // is the dock's cue that the counters below belong to a NEW walk and not
+          // to the previous one. `total` is deliberately NOT read from it: that
+          // field is Suno's clip count, while `state.sync.total` is the number
+          // INDEXED, and writing one over the other is what turns "400 indexed ·
+          // Suno reports ~5,500" into a single contradictory number.
+          state.sync.running = true;
+          resetSyncRun();
+          if (typeof msg.maxPages === 'number' && msg.maxPages > 0) state.sync.maxPages = msg.maxPages;
+          renderSync();
+          scheduleSyncPoll();
           break;
+
+        case 'SYNC_CANCEL_REQUESTED':
+          // An abort is COOPERATIVE: the worker has signalled the controller and the
+          // crawl unwinds at its next await, which during a rate-limit backoff can
+          // be seconds away. So this is "stopping", not "stopped" — the same
+          // distinction `cancelSync()` draws by polling `SYNC_STATUS` before it
+          // claims anything, and the reason the poll stays armed here.
+          state.sync.running = true;
+          state.sync.orphaned = false;
+          state.sync.state = 'cancelling';
+          toast('Stopping the library sync.');
+          renderSync();
+          scheduleSyncPoll();
+          break;
+
+        case 'SYNC_CANCELLED':
+          // The worker only broadcasts this when NO controller was attached, so
+          // nothing will follow it with a SYNC_DONE: the press either cleared an
+          // orphaned cursor or found nothing running. Both are terminal for the
+          // crawl, hence the poll stops — and because no verdict rides on this
+          // push, the durable cursor is re-read below rather than guessed at, for
+          // the reason `cancelSync()` reads it too.
+          stopSyncPoll();
+          state.sync.running = false;
+          state.sync.orphaned = false;
+          state.sync.state = msg.orphanedCursorCleared === true ? 'interrupted' : 'cancelled';
+          toast(msg.orphanedCursorCleared === true
+            ? 'Cleared a crawl the extension worker had abandoned. Indexed clips were kept.'
+            : 'No sync was running.');
+          renderSync();
+          pollSyncStatus().catch((pollErr) => dbg('post-cancel status read failed:', pollErr && pollErr.message));
+          break;
+
+case 'SYNC_DONE':
+        stopSyncPoll();
+        onSyncDone(msg);
+        break;
 
         case 'SYNC_ERROR':
-          state.sync.running = false;
-          state.sync.state = 'error';
-          renderSync();
-          showError('Sync failed: ' + (msg.error || 'unknown'));
+          stopSyncPoll();
+          // A hard failure is an INCOMPLETE index, so it has to be applied
+          // through the SAME writer as `SYNC_DONE`. The old copy only set
+          // `state.sync.state = 'error'`, which left `state.sync.completed` on its
+          // previous value — so `renderSync` could paint the green `ok` dot and
+          // the word `synced` immediately beside a strip reading "Sync failed".
+          onSyncError(msg);
           break;
 
         case 'DL_PROGRESS': {
@@ -3341,17 +4577,45 @@
 
         case 'TOKEN_CHANGED':
           // A real PUSH from the worker (it broadcasts this from SET_TOKEN), not a
-          // route — so this only LISTENS. The payload carries the new expiry only.
+          // route — so this only LISTENS. The payload carries the new expiry ONLY.
+          //
+          // The worker sends `expiresAt: authCache.exp || null`, and `null` means
+          // "unknown", not "none". This used to fold both into
+          // `tokenHas = expiresAt > 0`, which meant that handing the worker a
+          // freshly tapped token whose `exp` had not been parsed yet immediately
+          // downgraded the panel from "token present" to "no token" — the worker
+          // broadcasting a SUCCESS was read as the token disappearing. So an
+          // unknown expiry updates the expiry field and leaves presence alone,
+          // and presence is only ever cleared by a status read that says so.
           state.tokenExpiresAt = Number(msg.expiresAt) || 0;
-          state.tokenHas = state.tokenExpiresAt > 0;
+          if (state.tokenExpiresAt > 0) state.tokenHas = true;
           renderTokenInfo();
+          // The expiry may have moved underneath us, so re-read the authoritative
+          // status rather than trusting a push that carries one field.
+          refreshTokenStatusQuietly();
           break;
 
         default:
-          // Unknown push: ignore silently rather than logging noise.
+          // NOT silent. A push type this switch does not know is either a worker
+          // that grew one (the dock is then behind the contract and a feature may
+          // silently do nothing) or a message this build should never have been
+          // sent — and either way it is unanswerable from here. It goes to the
+          // diagnostic sink, which `settings.debug` turns on, with a count, so a
+          // repeated push shows up once with a number attached rather than being
+          // buried in a stream of identical lines.
+          //
+          // Deliberately not a user-visible strip: a push this dock does not model
+          // may be informational, and painting every unknown type red is how a
+          // permanent error bar appears on pages where nothing is wrong — the exact
+          // regression the `quiet` option on `mainWorldOp` exists to prevent.
+          unknownPushes[msg.type] = (unknownPushes[msg.type] || 0) + 1;
+          dbg('unhandled push type:', msg.type, '(x' + unknownPushes[msg.type] + ')');
           break;
       }
     } catch (e) {
+      // A fault in here would drop every later push too, so it is reported rather
+      // than swallowed: `debugOn` is false by default, which is why this sink is
+      // driven from settings rather than a constant.
       dbg('push handler failed:', e && e.message);
     }
   });

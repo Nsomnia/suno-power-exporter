@@ -19,9 +19,17 @@
  *    from the `SYNC_START` reply) and `done / total` for a batch. The previous
  *    arithmetic was `Math.max(page + 2, 5)`, which pinned the bar near 50 %
  *    forever.
- * D. `truncated:true` gets a persistent, dismissible-per-session banner. A
- *    capped crawl leaves an INCOMPLETE library on disk and the user has to be
- *    told, not shown a green checkmark.
+ * D. The sync tile is a THREE-WAY decision — complete / incomplete / cancelled
+ *    — read from `completed`, `stopReason` and `expectedTotal`, never from
+ *    `state === 'idle'`. The defect this replaces: a walk that died on the 21st
+ *    request still reported `state:'idle'`, so `status === 'idle' ? 'Up to date'`
+ *    painted green over a 400-of-5,500 index, and `lastError` was rendered only
+ *    on the `state === 'error'` branch, which a `break` never produces. So the
+ *    UI threw away the one piece of information that explained the failure.
+ *    `expectedTotal` is what makes the failure self-evident: "400 of ~5,500"
+ *    needs no log and no inference. The persistent banner is gated on
+ *    `completed === false` (accepting `truncated` for older replies) for the
+ *    same reason.
  * E. Downloads and credits are SEPARATE tiles. They are different resources;
  *    the previous badge showed credits, so a user at zero downloads saw a
  *    healthy badge.
@@ -40,6 +48,15 @@
  *    because it is the only route that carries `plan.stoppedReason` /
  *    `plan.quotaStop` — a popup reopened mid-batch has no other way to learn
  *    what the worker is actually doing.
+ * J. NOTHING CONVEYED BY COLOUR ALONE. The tile value is a `role="status"`
+ *    live region and always spells the state in words — `Incomplete`,
+ *    `Cancelled`, `Failed`, `Up to date` — with the amber/red tint applied
+ *    inline on top. A user who cannot see the colour still gets the answer.
+ * K. `SYNC_REASON_PHRASE` IS SHARED COPY. The same map, with byte-identical
+ *    values, is duplicated in `side_panel.js` and `content/content.js`. A stop
+ *    described three different ways across the three surfaces is a support
+ *    question, so the wording is duplicated deliberately and must be changed in
+ *    all three together.
  * ===========================================================================
  */
 
@@ -85,7 +102,12 @@
     selectionCount: 0,
     quota: null,
     credits: null,
-    truncated: false,
+    /**
+     * The sync facts that justify the persistent incompleteness banner, or null
+     * when the last sync completed cleanly. Replaces the old boolean
+     * `truncated`, which could not say WHY and could never be cleared.
+     */
+    truncFacts: null,
     token: null,
     sync: null,
     bootCounts: null,
@@ -97,6 +119,36 @@
     syncMaxPages: 0,
     syncSeen: 0,
     syncEtaMs: 0,
+    /**
+     * True once a cancel has been signalled and the crawl has not yet reported
+     * itself finished. Used to keep the progress line honest: a cancelling run
+     * must not keep rendering a live percentage as if it were still making
+     * progress.
+     */
+    syncCancelling: false,
+    syncCancelRequestedAt: 0,
+    /**
+     * The stored cursor claimed `running` but no controller owns it — an MV3
+     * worker eviction, not a live crawl. Kept separate from `syncRunning` because
+     * the two need different copy and different affordances: a running crawl can
+     * be stopped, an orphaned one can only be resumed.
+     */
+    syncOrphaned: false,
+    /**
+     * Which phase of the crawl is running, plus that phase's own counters.
+     *
+     * THE SINGLE SOURCE OF TRUTH IS THE WORKER, NOT THIS OBJECT. Three surfaces
+     * show this crawl (the popup, the in-page dock, the side panel) and they were
+     * each keeping their own copy of "is a sync running and how far along", which
+     * is how they came to disagree — the popup saying "Syncing" while the dock said
+     * idle and Stop said nothing was running. Every surface now derives this from
+     * the worker's `SYNC_STATUS` / `SYNC_PROGRESS` and nothing else, and `phase`
+     * exists because the phase is the one fact all three were previously guessing.
+     */
+    syncPhase: '',
+    syncPhasePages: 0,
+    syncPhaseJoined: 0,
+    syncPhaseItems: 0,
     downloadRunning: false,
     downloadDone: 0,
     downloadTotal: 0,
@@ -139,6 +191,79 @@
     if (err && typeof err.message === 'string' && err.message) return err.message;
     if (typeof err === 'string' && err) return err;
     return 'unknown error';
+  }
+
+  function noop() {}
+
+  /**
+   * How long a cancel request waits for the worker to report the run finished
+   * before it gives up and shows the authoritative state.
+   *
+   * Aborting is cooperative — the crawl observes the signal only where it
+   * awaits — and a rate-limit backoff can hold a page open for tens of seconds.
+   * Twenty seconds is long enough for a normal unwind and short enough that the
+   * popup never sits on "Cancelling…" with no way out.
+   */
+  var SYNC_CANCEL_WAIT_MS = 20000;
+  var SYNC_POLL_MS = 2000;
+  var syncPollTimer = 0;
+
+  /**
+   * @param {number} ms
+   * @returns {Promise<void>}
+   */
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function startSyncPoll() {
+    if (syncPollTimer) return;
+    syncPollTimer = setInterval(function () {
+      refreshSyncStatus().catch(function (pollErr) {
+        addLog('Could not read sync status: ' + textOf(pollErr), 'warn');
+        stopSyncPoll();
+      });
+    }, SYNC_POLL_MS);
+  }
+
+  function stopSyncPoll() {
+    if (!syncPollTimer) return;
+    clearInterval(syncPollTimer);
+    syncPollTimer = 0;
+  }
+
+  function scheduleSyncPoll(running) {
+    if (syncPollTimer) {
+      if (!running) stopSyncPoll();
+      return;
+    }
+    if (!running) return;
+    startSyncPoll();
+  }
+
+  async function refreshSyncStatus() {
+    try {
+      var reply = await send('SYNC_STATUS', {});
+      if (reply && reply.cancelling === true) {
+        state.syncRunning = true;
+        state.syncCancelling = true;
+      }
+      if (reply && reply.running === true) {
+        state.syncRunning = true;
+        state.syncCancelling = reply.cancelling === true;
+      }
+      if (reply && reply.running === false && state.syncRunning === true) {
+        state.syncRunning = false;
+        state.syncCancelling = false;
+        applySyncReply(reply, {});
+        addLog('Sync ended. state=' + String(reply.state || '') + ' completed=' + String(reply.completed || '') + ' stopReason=' + String(reply.stopReason || ''), 'info');
+        renderAll();
+      }
+      scheduleSyncPoll(!!(reply && reply.running));
+    } catch (err) {
+      stopSyncPoll();
+      addLog('Could not read sync status: ' + textOf(err), 'warn');
+    }
   }
 
   /**
@@ -190,6 +315,470 @@
 
   function plural(n, one, many) {
     return n === 1 ? one : (many || one + 's');
+  }
+
+  /**
+   * Thousands separators without `Intl`, so "5,500" is spelled the same way in
+   * every locale and in every harness that reads this file's output.
+   *
+   * @param {number} value
+   * @returns {string} '' when the value is not a finite number
+   */
+  function group(value) {
+    var num = Number(value);
+    if (!isFinite(num)) return '';
+    var rounded = Math.round(num);
+    var sign = rounded < 0 ? '-' : '';
+    var digits = String(Math.abs(rounded));
+    return sign + digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  /** @param {string} text @returns {string} */
+  function sentence(text) {
+    var s = String(text || '');
+    return s ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+  }
+
+  /**
+   * The first candidate that is a real, positive count; null when none is.
+   *
+   * @param {...unknown} values
+   * @returns {number|null}
+   */
+  function firstPositive() {
+    for (var i = 0; i < arguments.length; i += 1) {
+      var num = Number(arguments[i]);
+      if (isFinite(num) && num > 0) return num;
+    }
+    return null;
+  }
+
+  /* --------------------------------------------------- sync completeness */
+
+  /**
+   * `stopReason` -> plain English. THE SHARED MAP.
+   *
+   * Byte-identical copies of this object live in `side_panel.js` and
+   * `content/content.js` (see header note K). Values are complete phrases with
+   * a subject, so they can be dropped into a tile note, a banner sentence and an
+   * activity-log line without any of the three re-wording them.
+   */
+  var SYNC_REASON_PHRASE = {
+    complete: 'the crawl finished cleanly',
+    suspected_truncation: 'the feed stopped early — your library is only partly indexed',
+    cursor_missing: 'it could not read the feed\'s paging field, so it could not continue',
+    page_failed: 'it stopped on a failed request',
+    empty_page: 'the feed returned an empty page',
+    stuck_cursor: 'the pagination cursor repeated',
+    no_new_ids: 'a page returned no new clips',
+    max_pages: 'it hit your page cap',
+    expected_total: 'it found fewer clips than Suno reports',
+    aborted: 'it stopped because you cancelled',
+    interrupted: 'the extension worker was stopped mid-crawl — press Sync to resume'
+  };
+
+  /** Used when the walk stopped but the worker named no reason at all. */
+  var SYNC_REASON_FALLBACK = 'it stopped early for a reason the worker did not report';
+
+  /**
+   * @param {unknown} stopReason
+   * @returns {string} a plain-English phrase; never '' and never `undefined`
+   */
+  function syncReasonPhrase(stopReason) {
+    var key = typeof stopReason === 'string' ? stopReason.trim() : '';
+    return SYNC_REASON_PHRASE[key] || SYNC_REASON_FALLBACK;
+  }
+
+  /**
+   * Read the sync-completeness contract out of ANY reply, flat or wrapped.
+   *
+   * `SYNC_DONE` carries the fields at the top level, `SYNC_STATUS.cursor`
+   * carries the same cursor fields one level down and `GET_BOOT.sync` carries
+   * that cursor object itself, so all three are accepted. EVERY field is
+   * optional: a worker older than the contract returns an object whose only
+   * key is `pagesDone`, and this returns `hasContract:false` with nulls rather
+   * than throwing or inventing numbers.
+   *
+   * @param {unknown} reply
+   * @returns {object|null} null when there is no object to read
+   */
+  function readSyncFacts(reply) {
+    if (!reply || typeof reply !== 'object') return null;
+    var cursor = (reply.cursor && typeof reply.cursor === 'object') ? reply.cursor : null;
+    /**
+     * A field that is present but `null` means "the worker knows nothing", which
+     * is the same thing as absent. Folding it in instead would make
+     * `Number(null) === 0` turn "expectedTotal: null" into "0 of ~0".
+     *
+     * @param {string} key
+     * @returns {unknown}
+     */
+    function pick(key) {
+      if (reply[key] !== undefined && reply[key] !== null) return reply[key];
+      var nested = cursor ? cursor[key] : undefined;
+      return (nested !== undefined && nested !== null) ? nested : undefined;
+    }
+
+    /**
+     * Whether the key is present AT ALL, `0` included. This is the only correct
+     * test for "the worker told us", and it exists because `undefined`/`null`
+     * folding (correct for `expectedTotal`, whose `0` is a sentinel) is exactly
+     * what makes a naive `Number(pick(k)) > 0` reject a legitimate `0`.
+     *
+     * @param {string} key
+     * @returns {boolean}
+     */
+    function has(key) {
+      if (reply[key] !== undefined) return true;
+      return !!(cursor && cursor[key] !== undefined);
+    }
+
+    var completed = pick('completed');
+    var truncated = pick('truncated');
+    var stopReason = pick('stopReason');
+    var expected = Number(pick('expectedTotal'));
+    // ABSENT and `0` are different facts and must not collapse. `pick()` already
+    // returns `0` unchanged (only `undefined`/`null` fold to absent), so `has()`
+    // plus a numeric coercion is the whole test — once, here, for every consumer.
+    var missing = has('missing') && isFinite(Number(pick('missing')))
+      ? Number(pick('missing')) : null;
+    // `totalSeen` is what the contract calls it, but the STORED CURSOR counts the
+    // unique clips it actually walked under `uniqueSeen` and `GET_BOOT.sync`
+    // publishes that name — reading `totalSeen` alone there yields 0, and
+    // "0 of ~5,500" over a 5,500-clip library is worse than no count at all. So
+    // the first POSITIVE of the two names wins, and "no positive count" is
+    // reported as unknown rather than as zero.
+    var totalSeen = firstPositive(pick('totalSeen'), pick('uniqueSeen'));
+    // `expectedTotal === 0` is the worker's "Suno reported no count" sentinel, so
+    // it is treated as unknown for display.
+    var expectedTotal = isFinite(expected) && expected > 0 ? expected : null;
+
+    return {
+      /** Did this reply say ANYTHING about completeness? */
+      hasContract: completed !== undefined || truncated !== undefined ||
+        stopReason !== undefined || expectedTotal !== null ||
+        missing !== null || totalSeen !== null || Array.isArray(pick('workspaces')),
+      completed: typeof completed === 'boolean' ? completed : null,
+      truncated: typeof truncated === 'boolean' ? truncated : null,
+      stopReason: typeof stopReason === 'string' ? stopReason.trim() : '',
+      // `lastError` is the pre-contract spelling; accepting both means an old
+      // worker still gets its real message instead of "unknown error".
+      error: (pick('error') || pick('lastError')) ? String(pick('error') || pick('lastError')) : '',
+      expectedTotal: expectedTotal,
+      totalSeen: totalSeen,
+      // The worker's `missing` is AUTHORITATIVE whenever the key is present as a
+      // number — `0` included. `0` is the one value that most needs preserving:
+      // the worker computes `missing` against rows EXAMINED (a clip in two
+      // projects is counted twice) while publishing `totalSeen` as the UNIQUE
+      // count, so `expectedTotal:5502, totalSeen:5501` with `missing:0` is a
+      // COMPLETE library. Re-deriving here printed "1 clip is missing" on a
+      // finished crawl, permanently. Derivation is the legacy-reply fallback and
+      // runs only when the key is entirely absent.
+      missing: missing !== null ? missing
+        : (expectedTotal !== null && totalSeen !== null ? expectedTotal - totalSeen : null),
+      // `oracleApplied === false` means the crawl ran with filters, so the counts
+      // are a LOWER BOUND rather than a shortfall. Optional: absent means unknown.
+      oracleApplied: pick('oracleApplied') === false ? false : (pick('oracleApplied') === true ? true : null),
+      workspaces: Array.isArray(pick('workspaces')) ? pick('workspaces') : [],
+      // Mechanical evidence that a walk HAPPENED. Not part of the completeness
+      // contract, but the placeholder test needs it: `pagesDone:20, total:400`
+      // is a real walk, and treating that reply as "nothing ran" would report a
+      // legacy sync as "Never".
+      pagesDone: Number(pick('pagesDone')) || 0,
+      total: Number(pick('total')) || 0
+    };
+  }
+
+  /** The shape a reply has when it carries nothing but emptiness. */
+  var NO_WALK = {
+    completed: null, truncated: null, stopReason: '', error: '',
+    expectedTotal: null, totalSeen: null, missing: null, workspaces: [],
+    pagesDone: 0, total: 0
+  };
+
+  /**
+   * TRUE for the PLACEHOLDER reply an account with no finished walk gets:
+   * `completed:false`, `stopReason:null`, `error:null`, `expectedTotal:0`,
+   * `totalSeen:0`, `missing:0`, `truncated:false`. An explicit
+   * `truncated:true` is NOT a placeholder — that one really is a short walk —
+   * and neither is a record that walked a page or indexed a clip, which is
+   * mechanical proof that something happened even when the verdict is missing.
+   *
+   * It says "no walk has finished", NOT "a walk stopped", and treating it as the
+   * latter painted a brand-new install "Incomplete" forever. `expectedTotal:0`
+   * is the worker's "Suno reported no count" sentinel, so it counts as empty here.
+   *
+   * @param {object|null} facts
+   * @returns {boolean}
+   */
+  function isPlaceholderSyncFacts(facts) {
+    if (!facts) return false;
+    return !facts.completed && !facts.stopReason && !facts.error && facts.truncated !== true &&
+      !(facts.pagesDone > 0) && !(facts.total > 0) &&
+      (facts.totalSeen === null || facts.totalSeen <= 0) &&
+      (facts.expectedTotal === null || facts.expectedTotal <= 0) &&
+      (facts.missing === null || facts.missing <= 0);
+  }
+
+  /**
+   * The three-way decision, in one place so the tile, the banner, the summary
+   * and the log cannot disagree about whether the library is whole.
+   *
+   * THE RULE, AND IT IS THE WORKER'S CALL TO MAKE: when `completed` is present
+   * as a BOOLEAN it is the verdict, and `missing` is NOT read to overturn it. The
+   * worker computes `oracleApplied` (whether the walk was unfiltered, so that
+   * `project.clip_count` measures the same set the walk did) and already ANDed
+   * it into its own verdict, so a shortfall from a filtered walk reaches us as
+   * ADVISORY: `completed:true, stopReason:'complete', oracleApplied:false,
+   * missing:100`. Re-deriving failure from `missing` second-guessed a decision
+   * that had been made with the walk's own evidence, and on this build it was
+   * wrong on every sync — `includeTrashed` is hard-coded false in
+   * `background/background.js`, so `oracleApplied` is `false` always, and any
+   * account holding trashed or disliked clips got a permanent "Incomplete" over
+   * a crawl the worker had called clean. That false alarm is what this rule
+   * removes.
+   *
+   * The legacy heuristics below are kept whole, and only for a reply with NO
+   * `completed` KEY at all: such a worker predates the oracle, so there is no
+   * scoped verdict to respect and the counts are the only evidence there is. The
+   * test for that is the KEY (`stated` below), never the folded value — a legacy
+   * reply carrying `truncated:false` folds into `completed === true`, and taking
+   * that fold at face value is what let a legacy `missing:177` render as "Up to
+   * date" while the banner beneath it said the library was short.
+   *
+   * `truncated` remains the compatibility stand-in (`truncated` equals
+   * `!completed` by contract) and a bare `stopReason: 'complete'` is believed,
+   * since it is the same statement.
+   *
+   * @param {object|null} facts from `readSyncFacts`
+   * @param {object|null} sync the worker's own sync record, for `state`
+   * @returns {{kind:string, status:string, reason:string, error:string,
+   *   counts:string, expectedTotal:number|null, totalSeen:number|null,
+   *   missing:number|null, workspaces:object[]}}
+   */
+  function syncVerdict(facts, sync) {
+    // A placeholder is a distinct KIND, not an incomplete walk: see
+    // `isPlaceholderSyncFacts`.
+    var placeholder = isPlaceholderSyncFacts(facts);
+    var f = placeholder ? NO_WALK : (facts || {});
+    var completed = f.completed;
+    if (completed === null && f.truncated !== null) completed = f.truncated === false;
+    if (completed === null && f.stopReason) completed = f.stopReason === 'complete';
+
+    var missing = f.missing;
+    /* Whether the worker actually STATED a verdict. This is the test the rule
+     * turns on, and it is deliberately not `completed === null`: a legacy reply
+     * carrying `truncated:false` or a bare `stopReason:'complete'` folds into a
+     * `true` on the two lines below, so the fold cannot be what tells a reply
+     * with a verdict from a reply without one. `hasContract` records the same
+     * fact at the reply level; here it is the `completed` key specifically. */
+    var stated = typeof f.completed === 'boolean';
+    /* `oracleApplied === false` says the worker did NOT check `missing` against
+     * `clip_count` — the walk was filtered, so the gap may be rows the filters
+     * removed on purpose rather than rows the crawl missed. The figure still
+     * ships (in `countsPhrase`, carrying the lower-bound caveat the worker asks
+     * for in `advisory`), but it is not an established shortfall: it decides
+     * nothing and it is never stated as "N clips are missing". Absent is not
+     * `false`: a legacy reply said nothing about the oracle, and then the number
+     * is the only evidence there is and it is used normally. */
+    var unchecked = f.oracleApplied === false;
+    var kind;
+    if (!stated) {
+      // NO `completed` KEY AT ALL — a worker that predates the contract, and with
+      // it the oracle. Falling through to "incomplete" on nothing would paint
+      // every legacy sync amber, so the previous behaviour is kept whole: only an
+      // explicit error, an explicit `truncated`, or a positive `missing` makes it
+      // incomplete. An error with no verdict still must not paint green.
+      kind = (f.error || f.truncated === true || (missing !== null && missing > 0))
+        ? 'incomplete' : 'complete';
+    } else {
+      // `completed` is present, so it IS the verdict. `missing` is deliberately
+      // not read here — see the rule above.
+      kind = (completed === true && !f.error) ? 'complete' : 'incomplete';
+    }
+
+    if (placeholder) kind = 'none';
+
+    return {
+      kind: kind,
+      status: String((sync && sync.state) || 'idle'),
+      stopReason: f.stopReason || '',
+      reason: syncReasonPhrase(f.stopReason),
+      error: f.error || '',
+      expectedTotal: f.expectedTotal === undefined ? null : f.expectedTotal,
+      totalSeen: f.totalSeen === undefined ? null : f.totalSeen,
+      missing: (missing !== null && missing > 0 && !unchecked) ? missing : null,
+      // Exact for a complete walk ("5,500 of 5,500"), approximate for an
+      // incomplete one ("400 of ~5,500") because Suno's count can include
+      // clips the crawl cannot reach, and "~" says so. The tilde is ALSO kept for
+      // a filtered walk that finished: `expectedTotal` is then Suno's unfiltered
+      // count measured against a filtered numerator, which is approximate
+      // whatever the verdict says.
+      counts: countsPhrase(f, kind === 'complete' && !unchecked),
+      workspaces: f.workspaces || []
+    };
+  }
+
+  /**
+   * @param {object} f facts
+   * @param {boolean} [exact] drop the "~"
+   * @returns {string} '' when `expectedTotal` is unknown
+   */
+  function countsPhrase(f, exact) {
+    if (f.expectedTotal === null || f.expectedTotal === undefined) return '';
+    var expected = (exact ? '' : '~') + group(f.expectedTotal);
+    var text = (f.totalSeen === null || f.totalSeen === undefined)
+      ? expected : group(f.totalSeen) + ' of ' + expected;
+    // `oracleApplied === false`: crawl filters ran, so Suno's count is a FLOOR on
+    // what the walk could reach, not a target it fell short of. Saying "a lower
+    // bound" stops the UI implying the user is missing clips they never asked for.
+    return f.oracleApplied === false ? text + ' — a lower bound, filters applied' : text;
+  }
+
+  /**
+   * THE ONE writer of the completeness contract onto `state.sync`.
+   *
+   * `SYNC_DONE` and `SYNC_ERROR` both go through here, which is the whole point:
+   * they are the same event as far as the tile is concerned, and when `SYNC_ERROR`
+   * wrote only `state.truncFacts` the tile kept the previous run's `completed:true`
+   * and said "Up to date" directly above an INCOMPLETE banner. One writer means the
+   * two paths cannot drift apart again.
+   *
+   * `overrides` supplies the fields a given path must assert regardless of what
+   * the worker sent — a hard failure has no `completed:true` to inherit, and
+   * `stopReason` has a documented fallback. Mechanical counters (`pagesDone`,
+   * `dislikedCount`, `durationMs`, `state`) are still read off the reply, so a
+   * `SYNC_ERROR` that carries progress keeps it.
+   *
+   * @param {object} msg the `SYNC_DONE` / `SYNC_ERROR` push
+   * @param {object} [overrides] contract fields this path asserts
+   * @returns {object} the facts now on `state.sync`
+   */
+  function applySyncReply(msg, overrides) {
+    var over = overrides || {};
+    var view = Object.assign({}, msg || {}, over);
+    var facts = readSyncFacts(view);
+    var next = {};
+    var prev = (state.sync && typeof state.sync === 'object') ? state.sync : {};
+    for (var key in prev) {
+      if (Object.prototype.hasOwnProperty.call(prev, key)) next[key] = prev[key];
+    }
+    if (typeof msg.pagesDone === 'number') next.pagesDone = msg.pagesDone;
+    if (typeof msg.dislikedCount === 'number') next.dislikedCount = msg.dislikedCount;
+    if (typeof msg.durationMs === 'number') next.lastDurationMs = msg.durationMs;
+    // `state` is read off the MERGED view so an override wins. `SYNC_ERROR` carries
+    // no `state` of its own, and the tile's "Failed" label is gated on
+    // `status === 'error'` — without this the override would be dropped and the
+    // tile would read "Incomplete" (or inherit a stale `'idle'`) instead.
+    if (typeof view.state === 'string') next.state = view.state;
+    if (facts.completed !== null) next.completed = facts.completed;
+    if (facts.truncated !== null) next.truncated = facts.truncated;
+    next.stopReason = facts.stopReason;
+    // `error` AND `lastError` are both written, from the one value read. A clean
+    // `SYNC_DONE` therefore retracts a stale error left in the record by an
+    // earlier run, instead of leaving a permanent amber tile behind a green one.
+    next.error = facts.error;
+    next.lastError = facts.error;
+    next.expectedTotal = facts.expectedTotal;
+    next.totalSeen = facts.totalSeen;
+    // `missing` is written verbatim, `0` included — see `readSyncFacts`. A
+    // derived `null` is still written so a stale count from a previous run cannot
+    // outlive the reply that should have replaced it.
+    next.missing = facts.missing;
+    next.oracleApplied = facts.oracleApplied;
+    next.workspaces = facts.workspaces;
+    state.sync = next;
+    return facts;
+  }
+
+  /**
+   * Fold a `GET_BOOT.sync` record into the one already held.
+   *
+   * Mechanical counters (`pagesDone`, `total`, `state`, …) always take the fresh
+   * value. The VERDICT fields take it too — EXCEPT when the record already held
+   * carries `completed`, in which case a re-read of a less-informed boot reply
+   * must not overrule a verdict that arrived on a `SYNC_DONE` push. Without that
+   * rule the boot read undid the fix: the tile dropped back to a bare fallback
+   * reason the moment `refreshBootSafe()` landed after the push.
+   *
+   * @param {object|null} stored
+   * @param {object} boot
+   * @returns {object}
+   */
+  function mergeSyncRecord(stored, boot) {
+    var out = {};
+    var source = stored && typeof stored === 'object' ? stored : {};
+    for (var i in source) {
+      if (Object.prototype.hasOwnProperty.call(source, i)) out[i] = source[i];
+    }
+    var storedIsAuthoritative = source.completed !== undefined;
+    for (var key in boot) {
+      if (!Object.prototype.hasOwnProperty.call(boot, key)) continue;
+      if (storedIsAuthoritative && VERDICT_FIELDS[key] === 1) continue;
+      out[key] = boot[key];
+    }
+    return out;
+  }
+
+  /** The fields that answer "is the library whole?", as opposed to how far it got. */
+  var VERDICT_FIELDS = {
+    completed: 1, stopReason: 1, error: 1, lastError: 1,
+    expectedTotal: 1, totalSeen: 1, missing: 1, workspaces: 1, oracleApplied: 1
+  };
+
+  /**
+   * The facts that justify the persistent banner, or null for "say nothing".
+   *
+   * `completed === false` is the gate; `truncated === true` is accepted for a
+   * worker that predates it, and a `stopReason` other than `complete` counts as
+   * too. A reply carrying none of these leaves the existing decision alone
+   * rather than inventing a warning or clearing a real one on no evidence.
+   *
+   * @param {object|null} facts
+   * @returns {object|null}
+   */
+  function bannerFacts(facts) {
+    if (!facts) return null;
+    // Evidence that NO walk finished is not evidence that a walk stopped.
+    if (isPlaceholderSyncFacts(facts)) return null;
+    // The rule is stated once, in `syncVerdict`: a `completed` boolean present on
+    // the reply is the worker's verdict and is not second-guessed here either.
+    // `completed:false` is still a failure, so oracle scoping can never hide one.
+    if (facts.completed === false) return facts;
+    if (facts.completed === true) return null;
+    // ---- LEGACY REPLIES ONLY (no `completed` key). These predate the oracle,
+    // so the count heuristics are all the evidence there is.
+    if (facts.truncated === true) return facts;
+    if (facts.stopReason && facts.stopReason !== 'complete') return facts;
+    if (facts.expectedTotal !== null && facts.missing !== null && facts.missing > 0) return facts;
+    return null;
+  }
+
+  /**
+   * The lead sentence of the incompleteness banner. Identical wording in the
+   * popup, the side panel and the dock, because it is the sentence a user
+   * screenshots into a bug report.
+   *
+   * @param {object} verdict
+   * @returns {string}
+   */
+  function bannerSentence(verdict) {
+    var parts = ['The last sync stopped early — the index is INCOMPLETE and some clips are missing.'];
+    var why = sentence(verdict.reason) + (verdict.error ? ' (' + verdict.error + ')' : '') + '.';
+    parts.push(why);
+    if (verdict.counts) parts.push('Indexed ' + verdict.counts + '.');
+    if (verdict.missing !== null) {
+      parts.push(group(verdict.missing) + ' ' + plural(verdict.missing, 'clip') + ' ' +
+        (verdict.missing === 1 ? 'is' : 'are') + ' missing.');
+    }
+    if (verdict.stopReason === 'max_pages') {
+      parts.push('Raise "Max pages per sync" in Settings, then sync again.');
+    } else if (verdict.stopReason === 'aborted') {
+      parts.push('Nothing is broken — start the sync again when you are ready.');
+    } else {
+      parts.push('Sync again to finish the crawl; the activity log names the reason.');
+    }
+    return parts.join(' ');
   }
 
   /* ------------------------------------------------------------ transport */
@@ -425,36 +1014,128 @@
     }
   }
 
+  /**
+   * Paint the tile.
+   *
+   * `text` is the WORD — `Up to date`, `Incomplete`, `Failed`, `Cancelled` — and
+   * it is the primary signal: the colour is decoration on top of it, never the
+   * only carrier (header note J). `colour` is applied INLINE because
+   * `popup.css` has no warn tile rule and this file does not own that
+   * stylesheet.
+   *
+   * `full` is the unabbreviated sentence. It goes on `title` and `aria-label`
+   * because BOTH fields ellipsize inside a ~90 px tile: the counts a complete
+   * walk has to show ("Up to date — 5,500 of 5,500") do not fit at 17 px, and a
+   * clipped "Up to date — 5,5…" tells the user nothing. The visible note still
+   * carries the same numbers.
+   *
+   * @param {string} text the state word
+   * @param {string} [colour] '' | 'var(--sm-warn)' | 'var(--sm-bad)'
+   * @param {string} [full] the unabbreviated sentence
+   */
+  function setSyncValue(text, colour, full) {
+    els.tileSync.textContent = text;
+    els.tileSync.style.color = colour || '';
+    els.tileSync.title = full || '';
+    els.tileSync.setAttribute('aria-label', full || text);
+  }
+
+  /**
+   * Join the note fragments that are actually present, dropping separators
+   * rather than emitting `' · '` twice.
+   *
+   * @param {string[]} parts
+   * @returns {string}
+   */
+  function joinParts(parts) {
+    var out = [];
+    for (var i = 0; i < parts.length; i += 1) {
+      if (parts[i]) out.push(parts[i]);
+    }
+    return out.join(' · ');
+  }
+
   function renderSyncTile() {
+    // A live region on the WORD, so a screen reader announces "Incomplete" the
+    // moment the walk finishes badly. `aria-describedby` points at the note, so
+    // the reason is the accessible description of the same node.
+    if (els.tileSync.getAttribute('aria-live') !== 'polite') {
+      els.tileSync.setAttribute('role', 'status');
+      els.tileSync.setAttribute('aria-live', 'polite');
+      els.tileSync.setAttribute('aria-atomic', 'true');
+      els.tileSync.setAttribute('aria-describedby', 'sm-tile-sync-note');
+    }
+
+    if (state.syncOrphaned) {
+      setSyncValue('Interrupted', 'bad', 'The extension worker was stopped mid-crawl. Indexed clips are kept — press Sync to resume.');
+      els.tileSyncNote.textContent = state.syncPagesDone > 0
+        ? group(state.syncPagesDone) + (state.syncPagesDone === 1 ? ' page crawled' : ' pages crawled')
+          + (state.syncSeen > 0 ? ' · ' + group(state.syncSeen) + ' indexed' : '')
+        : 'the crawl stopped before it reported a page';
+      return;
+    }
     if (state.syncRunning) {
-      els.tileSync.textContent = 'Syncing';
-      els.tileSyncNote.textContent = state.syncMaxPages
-        ? state.syncPagesDone + ' of ' + state.syncMaxPages + ' pages'
-        : 'crawling the feed';
+      setSyncValue(state.syncCancelling ? 'Stopping' : 'Syncing', '', 'Crawling your Suno feed. Nothing is downloaded.');
+      // The page cap is PER WORKSPACE and this counter is the RUN total, so
+      // "73 of 200 pages" implied a bound the run is not held to. Report the
+      // crawl count and name the cap for what it is.
+      var tileSeen = state.syncSeen > 0 ? ' · ' + group(state.syncSeen) + ' seen' : '';
+      els.tileSyncNote.textContent = state.syncPagesDone > 0
+        ? group(state.syncPagesDone) + (state.syncPagesDone === 1 ? ' page crawled' : ' pages crawled')
+          + (state.syncMaxPages ? ' · cap ' + state.syncMaxPages + '/workspace' : '') + tileSeen
+        : 'crawling the feed' + tileSeen;
       return;
     }
     var sync = state.sync || null;
     if (!sync) {
-      els.tileSync.textContent = 'Never';
+      setSyncValue('Never', '', 'No sync has run yet.');
       els.tileSyncNote.textContent = 'no sync has run';
       return;
     }
-    var status = String(sync.state || 'idle');
-    if (status === 'error') {
-      els.tileSync.textContent = 'Failed';
-      els.tileSyncNote.textContent = sync.lastError ? String(sync.lastError).slice(0, 90) : 'see the activity log';
+
+    var verdict = syncVerdict(readSyncFacts(sync), sync);
+    var pages = (sync.pagesDone || 0) + ' pages';
+    var dislikes = (sync.dislikedCount !== null && sync.dislikedCount !== undefined
+      ? sync.dislikedCount + ' dislikes known'
+      : 'dislikes partial');
+    var missing = verdict.missing !== null
+      ? group(verdict.missing) + ' ' + plural(verdict.missing, 'clip') + ' missing'
+      : '';
+
+    if (verdict.status === 'cancelled') {
+      // Neutral, and explicitly NOT an error: the user did this.
+      setSyncValue('Cancelled', '', 'The last sync was cancelled by you. ' + verdict.reason + '. ' + pages + '.');
+      els.tileSyncNote.textContent = joinParts([verdict.reason, verdict.counts, missing]);
       return;
     }
-    if (status === 'cancelled') {
-      els.tileSync.textContent = 'Cancelled';
-      els.tileSyncNote.textContent = (sync.pagesDone || 0) + ' pages done';
+
+    if (verdict.kind === 'none') {
+      // Nothing has ever finished walking the feed: this is the pre-contract
+      // "Never" state, not a failure.
+      setSyncValue('Never', '', 'No sync has finished walking your feed yet.');
+      els.tileSyncNote.textContent = joinParts([pages]);
       return;
     }
-    els.tileSync.textContent = status === 'idle' ? 'Up to date' : status;
-    els.tileSyncNote.textContent = (sync.pagesDone || 0) + ' pages · '
-      + (sync.dislikedCount !== null && sync.dislikedCount !== undefined
-        ? sync.dislikedCount + ' dislikes known'
-        : 'dislikes partial');
+
+    if (verdict.kind === 'complete') {
+      setSyncValue('Up to date', '',
+        'Up to date' + (verdict.counts ? ' — ' + verdict.counts : '') + '. ' + pages + '.');
+      els.tileSyncNote.textContent = joinParts([verdict.counts, pages, dislikes]);
+      return;
+    }
+
+    // One sentence, reused for the hover text, the accessible name and the note,
+    // so the three can never describe the same failure differently.
+    var why = sentence(verdict.reason) + (verdict.error ? ' (' + verdict.error + ')' : '') + '.';
+    var full = 'The last sync is INCOMPLETE. ' + why
+      + (verdict.counts ? ' Indexed ' + verdict.counts + '.' : '')
+      + (verdict.missing !== null ? ' ' + group(verdict.missing) + ' ' + plural(verdict.missing, 'clip') + ' missing.' : '');
+    if (verdict.status === 'error') {
+      setSyncValue('Failed', 'var(--sm-bad)', 'The last sync failed. ' + full);
+    } else {
+      setSyncValue('Incomplete', 'var(--sm-warn)', full);
+    }
+    els.tileSyncNote.textContent = joinParts([verdict.reason + (verdict.error ? ' (' + verdict.error + ')' : ''), verdict.counts, missing]);
   }
 
   function renderQuotaTile() {
@@ -516,8 +1197,20 @@
   /** Real percentage: nothing here is estimated from a page counter. */
   function currentPercent() {
     if (state.activity === 'sync') {
-      if (!state.syncMaxPages) return null;
-      return clampInt((state.syncPagesDone / state.syncMaxPages) * 100, 0, 100, 0);
+      // The only honest denominator is Suno's own count for the account. The old
+      // ratio (`syncPagesDone / syncMaxPages`) divided a RUN total by a
+      // PER-WORKSPACE cap, which produced a number that meant nothing and was
+      // the "37%" the user saw frozen at 73 pages. With no expected total, the
+      // bar is indeterminate rather than confidently wrong.
+      var facts = state.sync || null;
+      var expected = facts && isFinite(Number(facts.expectedTotal)) && Number(facts.expectedTotal) > 0
+        ? Number(facts.expectedTotal)
+        : null;
+      if (expected === null || state.syncSeen <= 0) return null;
+      // The crawl is filtered by default (trashed and disliked excluded), so the
+      // indexed total will legitimately finish below Suno's count. Clamp rather
+      // than let the bar sit pinned at a misleading value.
+      return clampInt((state.syncSeen / expected) * 100, 0, 100, 0);
     }
     if (state.activity === 'download') {
       if (!state.downloadTotal) return null;
@@ -533,13 +1226,48 @@
     var fill = els.progressFill;
 
     if (state.activity === 'sync') {
-      label = 'Syncing library';
-      var pageText = state.syncMaxPages
-        ? 'page ' + state.syncPagesDone + ' of ' + state.syncMaxPages
-        : 'page ' + state.syncPagesDone;
-      detail = pageText + ' · ' + state.syncSeen + ' clips seen'
-        + (state.syncEtaMs > 0 ? ' · ~' + formatDuration(state.syncEtaMs) + ' left' : '');
-      if (percent === null) {
+      label = state.syncCancelling ? 'Stopping the library sync' : 'Syncing library';
+      // `syncMaxPages` is a PER-WORKSPACE cap, while `syncPagesDone` is the
+      // run total across every workspace. Pairing them ("page 73 of 200") implied
+      // a bound that does not exist — a 20-workspace library can legitimately
+      // need far more than one workspace's cap — so the run total is now labelled
+      // as a crawl count and the cap is named as what it is.
+      var pageText = state.syncPagesDone > 0
+        ? group(state.syncPagesDone) + (state.syncPagesDone === 1 ? ' page crawled' : ' pages crawled')
+        : 'starting';
+      // Never render a confident 0 for a cumulative count: "0 clips seen" beside
+      // a running bar reads as "nothing has been fetched", which is a different
+      // and much more alarming claim than "not known yet".
+      var seenText = state.syncSeen > 0
+        ? group(state.syncSeen) + (state.syncSeen === 1 ? ' clip seen' : ' clips seen')
+        : 'clips seen —';
+      // WHICH PHASE. A sync spends most of its wall clock paging `/api/project/me`
+      // and `/api/project/feed` (~180 pages) before it indexes a single clip, so
+      // without this the progress line read "starting · clips seen —" for minutes
+      // and looked like a dead crawl. The phase names the work that is happening.
+      var phaseText = '';
+      if (state.syncPhase === 'planning') {
+        phaseText = 'listing your workspaces';
+      } else if (state.syncPhase === 'mapping') {
+        var mapped = state.syncPhasePages > 0 ? state.syncPhasePages + ' pages' : '';
+        phaseText = 'mapping clips to workspaces' + (mapped ? ' · ' + mapped : '')
+          + (state.syncPhaseJoined > 0 ? ' · ' + group(state.syncPhaseJoined) + ' joined' : '')
+          + ' · no clips indexed yet';
+      } else if (state.syncPhase === 'crawling') {
+        phaseText = 'crawling your library';
+      } else if (state.syncPhase === 'committing') {
+        phaseText = 'writing the index';
+      }
+      detail = (phaseText ? phaseText + ' · ' : '') + pageText + ' · ' + seenText
+        + (state.syncEtaMs > 0 && !state.syncCancelling ? ' · ~' + formatDuration(state.syncEtaMs) + ' left' : '')
+        + (state.syncCancelling ? ' · waiting for the current page to finish' : '');
+      if (state.syncCancelling) {
+        // A cancelling run is not making progress; a live percentage would keep
+        // implying otherwise until the worker actually unwinds.
+        els.progressPct.textContent = 'stopping';
+        els.progressFill.style.width = '100%';
+        fill.classList.add('is-indeterminate');
+      } else if (percent === null) {
         els.progressPct.textContent = 'working';
         els.progressFill.style.width = '100%';
         fill.classList.add('is-indeterminate');
@@ -614,16 +1342,25 @@
     els.summaryQuota.textContent = state.summaryQuotaText || '';
   }
 
+  /**
+   * The persistent incompleteness banner. Gated on `completed === false` via
+   * `bannerFacts()`, and it says the ACTUAL cause: the previous copy told every
+   * user "the page cap was reached", which was false for the failure that
+   * mattered most — a request that 500'd on page 21.
+   */
   function renderTruncated() {
-    if (!state.truncated) {
+    var facts = bannerFacts(state.truncFacts);
+    if (!facts) {
       els.truncated.hidden = true;
       els.truncatedText.textContent = '';
+      els.truncated.removeAttribute('title');
       return;
     }
+    var verdict = syncVerdict(facts, state.sync);
+    var text = bannerSentence(verdict) + ' "Download all" queues only what is indexed.';
     els.truncated.hidden = false;
-    els.truncatedText.textContent = 'The page cap was reached during the last sync, so the library on disk is '
-      + 'INCOMPLETE — some clips are missing and "Download all" will queue only what is indexed. Raise '
-      + '"Max pages per sync" in Settings, then sync again.';
+    els.truncatedText.textContent = text;
+    els.truncated.title = text;
   }
 
   function renderButtons() {
@@ -659,8 +1396,13 @@
       ? 'Your library is empty — this will be a first sync of the whole feed.'
       : 'Resume or extend the crawl of your Suno feed. Nothing is downloaded.';
     els.btnDownload.disabled = state.busy || state.downloadRunning || libraryEmpty();
-    els.btnCancel.disabled = state.busy || !(state.syncRunning || state.downloadRunning);
-    els.btnCancel.textContent = state.downloadRunning ? 'Stop batch' : (state.syncRunning ? 'Stop sync' : 'Cancel');
+    /* An orphaned cursor also needs clearing, so the button stays enabled for it —
+     * otherwise the user is shown a frozen "Syncing" with no way to clear it,
+     * * which is exactly the dead end this state used to be. */
+    els.btnCancel.disabled = state.busy || !(state.syncRunning || state.downloadRunning || state.syncOrphaned);
+    els.btnCancel.textContent = state.downloadRunning
+      ? 'Stop batch'
+      : (state.syncOrphaned ? 'Clear stale sync' : (state.syncRunning ? 'Stop sync' : 'Cancel'));
     els.btnPanel.disabled = state.busy;
     if (refreshBtn) refreshBtn.disabled = state.busy;
     if (outcomeBtn) outcomeBtn.disabled = state.busy;
@@ -853,10 +1595,10 @@
       // hang.
       var go = window.confirm(
         'Your local library is empty, so this will be a FIRST sync.\n\n'
-        + 'It crawls your Suno feed from page 1 (up to ' + maxPages + ' pages) and can take several '
-        + 'minutes. It downloads no audio and spends no quota'
+        +         'It walks your Suno feed from the start (up to ' + maxPages + ' pages per project) and can '
+        + 'take several minutes. It downloads no audio and spends no quota'
         + (settings.dislikedMode === 'both'
-          ? ', but the two-pass dislike diff means it walks the feed twice.'
+          ? ', but this setting indexes both liked and disliked, so it walks the feed twice.'
           : '.')
         + '\n\nStart it?'
       );
@@ -884,13 +1626,17 @@
         state.syncMaxPages = clampInt(reply.maxPages, 0, 100000, 0);
         state.summaryLines = ['Sync started'];
         state.summaryQuotaText = (settings.dislikedMode === 'both'
-          ? 'two-pass crawl (include + exclude downvotes) — roughly double the time'
+          ? 'indexing disliked and non-disliked (two walks of the feed) — roughly double the time'
           : 'mode: ' + String(settings.dislikedMode));
         state.summaryIsBad = false;
         state.summaryKind = '';
         addLog('Sync started: ' + state.syncMaxPages + ' page cap, dislikedMode=' + String(reply.dislikedMode), 'info');
+        if (typeof reply.feedPageLimit === 'number') {
+          addLog('Worker resolved feedPageLimit=' + reply.feedPageLimit + ' maxPages=' + reply.maxPages, 'info');
+        }
         renderAll();
         toast('Syncing library…', '');
+        startSyncPoll();
       } catch (err) {
         addLog('Sync failed to start: ' + textOf(err), 'bad');
         renderAll();
@@ -1032,6 +1778,40 @@
     }
   }
 
+  /**
+   * After a cancel request, wait (bounded) for the worker to report the run as
+   * finished, then re-read authoritative state.
+   *
+   * Aborting is cooperative: the crawl only observes the signal where it awaits,
+   * so a run parked in a rate-limit backoff or a page retry keeps going for a
+   * while. The previous version showed "Cancelling the sync…" and then waited
+   * forever for a `SYNC_DONE` push that might never come, with no exit. A
+   * bounded wait plus an authoritative re-read means the popup always resolves to
+   * the truth, and can say plainly when the worker did not stop.
+   *
+   * @param {number} [timeoutMs]
+   * @returns {Promise<boolean>} true when the run is confirmed finished
+   */
+  async function awaitSyncSettled(timeoutMs) {
+    var deadline = Date.now() + (timeoutMs || SYNC_CANCEL_WAIT_MS);
+    var settled = false;
+    var polls = 0;
+    while (Date.now() < deadline) {
+      await sleep(400);
+      polls += 1;
+      var res = await send('SYNC_STATUS', {});
+      if (res && res.ok && res.running !== true) {
+        settled = true;
+        break;
+      }
+    }
+    // Always re-read: `SYNC_DONE` may have landed in between, and the cursor is
+    // the only place the final verdict is recorded.
+    await refreshBootSafe();
+    addLog('Post-cancel poll: ' + polls + ' queries, settled=' + String(settled), 'info');
+    return settled;
+  }
+
   function onCancelClick() {
     withBusy(async function () {
       try {
@@ -1042,8 +1822,48 @@
           return;
         }
         var sync = await send('SYNC_CANCEL', {});
-        addLog('Sync cancel requested (was running: ' + String(sync.running) + ').', 'warn');
-        toast('Cancelling the sync…', '');
+        // `running`/`cancelRequested`/`abortAvailable`/`orphanedCursorCleared` are
+        // the worker's contract. The old line read `sync.running` from a reply
+        // that only ever carried `{ok:true}`, so it logged "was running:
+        // undefined" and the user could not tell a real cancel from a no-op.
+        if (sync && sync.orphanedCursorCleared === true) {
+          state.syncOrphaned = false;
+          state.syncRunning = false;
+          state.syncCancelling = false;
+          addLog(sync.stale === true
+            ? 'Cleared a crawl the extension worker had abandoned. Your indexed clips were kept — press Sync to resume.'
+            : 'Cleared the stale "sync in progress" state. Indexed clips were kept.', 'warn');
+          toast('Cleared the stale sync state.', 'warn');
+          await refreshBootSafe();
+          stopSyncPoll();
+          renderAll();
+          return;
+        }
+        if (sync && sync.running === false) {
+          addLog('Nothing to cancel — no library sync is running. Re-reading authoritative state.', 'info');
+          toast('No sync is running.', '');
+          void refreshBootSafe().catch(noop);
+          void refreshSyncStatus().catch(noop);
+          renderButtons();
+          return;
+        }
+        if (sync && sync.cancelRequested === true) {
+          state.syncCancelling = true;
+          state.syncCancelRequestedAt = Date.now();
+          addLog('Cancel signalled. Waiting for the crawl to unwind…', 'warn');
+          toast('Cancelling the sync…', '');
+          renderProgress();
+          var settled = await awaitSyncSettled();
+          state.syncCancelling = false;
+          if (settled) {
+            addLog('Sync stopped.', 'info');
+            toast('Sync cancelled — nothing is broken.', '');
+          } else {
+            addLog('The worker has not reported the sync as stopped yet. It is likely waiting on a rate limit; it will stop at the next page boundary. If it does not, reload the extension.', 'warn');
+            toast('Still stopping — the worker is waiting on a rate limit.', 'warn');
+          }
+          renderAll();
+        }
       } catch (err) {
         addLog('Cancel failed: ' + textOf(err), 'bad');
         toast('Cancel failed: ' + textOf(err), 'bad');
@@ -1234,6 +2054,7 @@
   /* ---------------------------------------------------------------- pushes */
 
   function onSyncProgress(msg) {
+    var prevPhase = state.syncPhase;
     state.syncRunning = true;
     state.activity = 'sync';
     state.syncPagesDone = clampInt(msg.pagesDone, 0, 1000000, state.syncPagesDone);
@@ -1241,52 +2062,179 @@
       state.syncPagesDone = Math.max(state.syncPagesDone, clampInt(msg.page, 0, 1000000, 0));
     }
     if (isFinite(Number(msg.seen))) state.syncSeen = clampInt(msg.seen, 0, 10000000, state.syncSeen);
-    // The worker computes this ETA itself; surfacing it beats guessing one.
+    if (typeof msg.phase === 'string' && msg.phase) state.syncPhase = msg.phase;
+    if (Number.isFinite(Number(msg.phasePagesDone))) state.syncPhasePages = Number(msg.phasePagesDone);
+    if (Number.isFinite(Number(msg.phaseJoined))) state.syncPhaseJoined = Number(msg.phaseJoined);
+    if (Number.isFinite(Number(msg.phaseItems))) state.syncPhaseItems = Number(msg.phaseItems);
     state.syncEtaMs = Number(msg.etaMs) > 0 ? Number(msg.etaMs) : 0;
     if (!state.syncMaxPages && state.settings) {
       state.syncMaxPages = clampInt(state.settings.syncMaxPages, 0, 100000, 0);
+    }
+    if (state.syncPhase !== prevPhase) {
+      addLog('sync phase: ' + (state.syncPhase || '?'), 'info');
+    }
+    startSyncPoll();
+    renderProgress();
+    renderSyncTile();
+    renderButtons();
+  }
+
+  function onSyncStarted(msg) {
+    state.syncRunning = true;
+    state.syncCancelling = false;
+    state.syncOrphaned = false;
+    state.activity = 'sync';
+    state.syncPagesDone = 0;
+    state.syncSeen = 0;
+    state.syncEtaMs = 0;
+    if (typeof msg.maxPages === 'number') {
+      state.syncMaxPages = clampInt(msg.maxPages, 0, 100000, 0);
+    }
+    addLog('Library sync started…', 'info');
+    renderAll();
+  }
+
+  function onSyncCancelRequested(msg) {
+    state.syncRunning = true;
+    state.syncCancelling = true;
+    state.syncCancelRequestedAt = Date.now();
+    if (msg.alreadyRequested === true) {
+      addLog('The sync was already being stopped.', 'warn');
+    } else {
+      addLog('Stopping the sync…', 'warn');
     }
     renderProgress();
     renderSyncTile();
     renderButtons();
   }
 
+  function onSyncCancelled(msg) {
+    state.syncRunning = false;
+    state.syncCancelling = false;
+    state.syncOrphaned = false;
+    state.activity = 'idle';
+    if (msg.orphanedCursorCleared === true) {
+      addLog('Cleared a stale sync record.', 'warn');
+    } else {
+      addLog('Sync cancelled.', 'info');
+    }
+    renderAll();
+    stopSyncPoll();
+    void refreshBootSafe().catch(noop);
+  }
+
+  /**
+   * `SYNC_DONE` — the completion contract, stored before anything is rendered.
+   *
+   * The new fields are written ONTO `state.sync`, not into a side channel, so
+   * that the `GET_BOOT` read on the next popup open (which carries the same
+   * cursor) cannot wipe them, and so `renderSyncTile()` and `renderTruncated()`
+   * see one object instead of two that can disagree.
+   *
+   * @param {object} msg
+   */
   function onSyncDone(msg) {
     state.syncRunning = false;
     state.activity = 'idle';
     if (typeof msg.total === 'number') state.libraryTotal = msg.total;
-    state.truncated = msg.truncated === true;
+
+    var facts = applySyncReply(msg, { state: msg && typeof msg.state === 'string' ? msg.state : undefined });
     state.syncPagesDone = state.syncPagesDone || state.syncMaxPages;
 
-    var duration = formatDuration(msg.durationMs);
-    var head = 'Sync finished: ' + state.libraryTotal + ' ' + plural(state.libraryTotal, 'clip')
-      + (duration ? ' in ' + duration : '');
-    state.summaryLines = state.truncated ? [head, 'INCOMPLETE — the page cap was reached'] : [head];
-    state.summaryQuotaText = state.truncated
-      ? 'Some clips are missing from the index. Raise "Max pages per sync" in Settings and sync again.'
-      : (isFinite(Number(msg.projects)) ? msg.projects + ' workspaces joined' : '');
-    state.summaryIsBad = state.truncated;
-    state.summaryKind = state.truncated ? 'bad' : '';
+    var verdict = syncVerdict(facts, state.sync);
+    // The banner's gate, stored as facts so a later `GET_BOOT` can reproduce it.
+    state.truncFacts = bannerFacts(facts);
 
-    addLog(head, state.truncated ? 'warn' : 'ok');
-    if (state.truncated) {
-      addLog('The page cap was hit, so the library on disk is incomplete.', 'bad');
+    var duration = formatDuration(msg.durationMs);
+    var cancelled = verdict.status === 'cancelled';
+    var head = (verdict.kind === 'complete' ? 'Sync complete' : (cancelled ? 'Sync cancelled' : 'Sync INCOMPLETE'))
+      + ': ' + group(state.libraryTotal) + ' ' + plural(state.libraryTotal, 'clip') + ' indexed'
+      + (duration ? ' in ' + duration : '');
+
+    var lines = [head];
+    if (verdict.kind !== 'complete') {
+      lines.push(sentence(verdict.reason) + (verdict.error ? ' (' + verdict.error + ')' : '') + '.');
+      if (verdict.counts) {
+        lines.push('Indexed ' + verdict.counts
+          + (verdict.missing !== null ? ' · ' + group(verdict.missing) + ' missing' : ''));
+      }
+    }
+    state.summaryLines = lines;
+    state.summaryQuotaText = verdict.counts
+      ? 'Indexed ' + verdict.counts + ' against the count Suno reports for your account.'
+      : (isFinite(Number(msg.projects)) ? msg.projects + ' workspaces joined' : '');
+    // Amber for an incomplete walk, red only for a hard failure. A walk that
+    // saved what it could and stopped is a warning, exactly like a quota stop.
+    state.summaryIsBad = verdict.status === 'error';
+    state.summaryKind = verdict.kind === 'complete' || cancelled
+      ? ''
+      : (state.summaryIsBad ? 'bad' : 'warn');
+
+    addLog(head, verdict.kind === 'complete' ? 'ok' : (cancelled ? 'info' : 'warn'));
+    if (verdict.kind !== 'complete') {
+      addLog('The walk did not finish: ' + verdict.reason
+        + (verdict.error ? ' (' + verdict.error + ')' : '') + '.', cancelled ? 'info' : 'warn');
+    }
+    // One line per workspace that did not complete. The aggregate hid a single
+    // bad workspace behind ~20 good ones, which is how a 20-page crawl over a
+    // 5,500-clip library was reported as a success.
+    for (var w = 0; w < verdict.workspaces.length; w += 1) {
+      var ws = verdict.workspaces[w];
+      if (!ws || typeof ws !== 'object' || ws.completed === true) continue;
+      var wsSeen = Number(ws.totalSeen);
+      var wsExpected = Number(ws.expected);
+      var wsMissing = Number(ws.missing);
+      addLog('Workspace ' + (ws.name ? String(ws.name) : String(ws.projectId || 'unknown'))
+        + ' — INCOMPLETE: ' + syncReasonPhrase(ws.stopReason)
+        + (ws.error ? ' (' + String(ws.error) + ')' : '')
+        + (isFinite(wsExpected) && wsExpected >= 0
+          ? ' · ' + (isFinite(wsSeen) ? group(wsSeen) + ' of ' : '') + '~' + group(wsExpected)
+          : '')
+        + (isFinite(wsMissing) && wsMissing > 0 ? ' · ' + group(wsMissing) + ' missing' : ''),
+        'warn');
     }
     renderAll();
+    stopSyncPoll();
     refreshBootSafe();
-    toast(state.truncated ? 'Sync finished but the library is INCOMPLETE.' : 'Library synced.', state.truncated ? 'bad' : 'ok');
+    if (verdict.kind === 'complete') {
+      toast('Library synced.', 'ok');
+    } else if (cancelled) {
+      toast('Sync cancelled — nothing is broken.', '');
+    } else {
+      toast(verdict.missing !== null
+        ? 'Sync stopped early: ' + group(state.libraryTotal) + ' of ~' + group(verdict.expectedTotal)
+          + ' indexed, ' + group(verdict.missing) + ' missing.'
+        : 'Sync stopped early: the library is INCOMPLETE.',
+      verdict.status === 'error' ? 'bad' : 'warn');
+    }
   }
 
   function onSyncError(msg) {
     state.syncRunning = false;
     state.activity = 'idle';
     var message = msg && msg.error ? String(msg.error) : 'unknown sync error';
+    // A hard failure IS an incomplete index, so it goes through the SAME
+    // `applySyncReply` as `SYNC_DONE` — the tile reads `state.sync`, and the old
+    // version wrote only `state.truncFacts`, which left the tile saying "Up to
+    // date" directly above an INCOMPLETE banner. The contract is synthesised here
+    // (a failure has no `completed:true` to inherit) rather than invented twice.
+    var facts = applySyncReply(msg || {}, {
+      completed: false,
+      error: message,
+      stopReason: (msg && typeof msg.stopReason === 'string' && msg.stopReason.trim())
+        ? msg.stopReason.trim() : 'page_failed',
+      state: 'error'
+    });
+    state.truncFacts = bannerFacts(facts);
     state.summaryLines = ['Sync failed: ' + message];
-    state.summaryQuotaText = '';
+    state.summaryQuotaText = countsPhrase(facts, false)
+      ? 'Indexed ' + countsPhrase(facts, false) + '.'
+      : '';
     state.summaryIsBad = true;
     state.summaryKind = 'bad';
     addLog('Sync error: ' + message, 'bad');
     renderAll();
+    stopSyncPoll();
     toast('Sync error: ' + message, 'bad');
   }
 
@@ -1616,6 +2564,9 @@
           case 'SYNC_PROGRESS': onSyncProgress(msg); break;
           case 'SYNC_DONE': onSyncDone(msg); break;
           case 'SYNC_ERROR': onSyncError(msg); break;
+          case 'SYNC_STARTED': onSyncStarted(msg); break;
+          case 'SYNC_CANCEL_REQUESTED': onSyncCancelRequested(msg); break;
+          case 'SYNC_CANCELLED': onSyncCancelled(msg); break;
           case 'DL_PROGRESS': onDlProgress(msg); break;
           case 'DL_ITEM': onDlItem(msg); break;
           case 'DL_DONE': onDlDone(msg); break;
@@ -1683,12 +2634,26 @@
       state.lastBootOk = true;
       state.settings = boot.settings || {};
       state.debug = state.settings.debug === true;
-      state.sync = boot.sync || null;
+      state.sync = (boot.sync && typeof boot.sync === 'object')
+        ? mergeSyncRecord(state.sync, boot.sync)
+        : state.sync;
       state.bootCounts = (boot.library && boot.library.counts) || null;
       if (state.bootCounts && typeof state.bootCounts.clips === 'number' && state.bootCounts.clips >= 0) {
         state.libraryTotal = state.bootCounts.clips;
       }
-      if (boot.sync && boot.sync.truncated === true) state.truncated = true;
+      if (boot.sync) {
+        // `GET_BOOT.sync` is the cursor record, i.e. the same object
+        // `SYNC_STATUS.cursor` returns, so it carries the same completeness
+        // fields. The banner is re-derived from it on every boot, which is what
+        // lets a later CLEAN sync clear a stale warning instead of leaving the
+        // popup permanently amber. It is read from the MERGED record, not from
+        // `boot.sync`, so a stale boot read cannot resurrect a warning that a
+        // newer `SYNC_DONE` already disproved.
+        var bootFacts = readSyncFacts(state.sync);
+        var banner = bannerFacts(bootFacts);
+        if (banner) state.truncFacts = banner;
+        else if (bootFacts && bootFacts.hasContract) state.truncFacts = null;
+      }
       if (boot.token) state.token = boot.token;
       if (boot.quota) {
         state.quota = boot.quota;
@@ -1706,6 +2671,54 @@
         state.syncRunning = true;
         state.activity = 'sync';
         state.syncPagesDone = clampInt(boot.sync.pagesDone, 0, 1000000, 0);
+        startSyncPoll();
+      }
+      /* AN ORPHANED CRAWL IS NOT A RUNNING ONE.
+       *
+       * `boot.sync.state === 'running'` used to be taken as proof that a crawl was
+       * in flight. It is not: the row is durable and the controller that owns it
+       * is not, so after a worker eviction the popup showed "Syncing" forever with
+       * a Stop button that truthfully reported "no library sync is running". The
+       * worker now reconciles that row on read and sets `interrupted`, but the
+       * state is also checked here so an older worker cannot reproduce it. */
+      if (boot.sync && boot.sync.interrupted === true) {
+        state.syncRunning = false;
+        state.syncCancelling = false;
+        state.activity = 'idle';
+        state.syncOrphaned = true;
+      } else if (boot.sync && boot.sync.state === 'running') {
+        state.syncOrphaned = false;
+      }
+      // The clips-seen counter is CUMULATIVE and lives in the cursor, so a
+      // reopened popup has to read it back. It previously only ever came from a
+      // live `SYNC_PROGRESS` push, which means any popup opened mid-crawl
+      // reported "0 clips seen" beside a running progress bar and an indexed
+      // count in the hundreds — a number that is confidently wrong rather than
+      // merely missing. `totalSeen` is the unique count under the sync contract's
+      // own name; `uniqueSeen` is accepted as an alias.
+      if (boot.sync) {
+        var bootSeen = Number(boot.sync.totalSeen);
+        if (!isFinite(bootSeen) || bootSeen < 0) bootSeen = Number(boot.sync.uniqueSeen);
+        if (isFinite(bootSeen) && bootSeen >= 0) state.syncSeen = Math.max(state.syncSeen, Math.floor(bootSeen));
+        if (typeof boot.sync.pagesDone === 'number' && boot.sync.pagesDone > 0) {
+          state.syncPagesDone = Math.max(state.syncPagesDone, Math.floor(boot.sync.pagesDone));
+        }
+        // Phase comes from the worker here too, so a freshly-opened popup shows
+        // "mapping clips to workspaces" rather than "starting".
+        if (typeof boot.sync.phase === 'string' && boot.sync.phase) state.syncPhase = boot.sync.phase;
+        if (Number.isFinite(Number(boot.sync.phasePagesDone))) state.syncPhasePages = Number(boot.sync.phasePagesDone);
+        if (Number.isFinite(Number(boot.sync.phaseJoined))) state.syncPhaseJoined = Number(boot.sync.phaseJoined);
+      }
+      /* Last resort for the clips figure: the cursor's own count can be behind the
+       * library after a resume, and "clips seen —" beside an indexed count in the
+       * hundreds is worse than showing the count we can actually measure. */
+      if (state.syncSeen <= 0 && state.bootCounts && typeof state.bootCounts.clips === 'number') {
+        state.syncSeen = state.bootCounts.clips;
+      }
+      // A cancel that landed while this popup was closed is reported by the
+      // cursor; reflect it instead of waiting for a push that already happened.
+      if (state.syncRunning === false) {
+        state.syncCancelling = boot.sync && boot.sync.cancelRequested === true;
       }
       renderAll();
     } catch (err) {

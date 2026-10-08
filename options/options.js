@@ -73,6 +73,12 @@
     autoSync: document.getElementById('opt-auto-sync'),
     syncInterval: document.getElementById('opt-sync-interval'),
 
+    syncState: document.getElementById('opt-sync-state'),
+    syncDetail: document.getElementById('opt-sync-detail'),
+    syncNowStart: document.getElementById('opt-sync-now-start'),
+    syncNowStop: document.getElementById('opt-sync-now-stop'),
+    syncNowRefresh: document.getElementById('opt-sync-now-refresh'),
+
     variant: document.getElementById('opt-variant'),
     ladder: document.getElementById('opt-ladder'),
     ladderEmpty: document.getElementById('opt-ladder-empty'),
@@ -199,8 +205,20 @@
      * The transcode value this page last WROTE, kept so the worker's reply can
      * be compared against it. See `applyTranscode`.
      */
-    askedTranscode: ''
+    askedTranscode: '',
+    sync: null,
+    syncRunning: false,
+    syncCancelling: false,
+    syncPhase: '',
+    syncPagesDone: 0,
+    syncTotalSeen: 0,
+    /* A message set by a button handler or a poll, shown in preference to the
+     * derived detail until real state moves again. */
+    syncNote: ''
   };
+
+  var syncListenersRegistered = false;
+  var syncWired = false;
 
   /* -------------------------------------------------------------- helpers */
 
@@ -1524,6 +1542,7 @@
   }
 
   function wireActions() {
+    wireSyncActions();
     C.saveBtn.addEventListener('click', function () { void saveSettings().catch(reportUnexpected); });
     C.resetBtn.addEventListener('click', function () { void resetSettings().catch(reportUnexpected); });
     C.exportBtn.addEventListener('click', function () { void exportSettings().catch(reportUnexpected); });
@@ -1545,6 +1564,273 @@
       event.preventDefault();
       event.returnValue = '';
       return '';
+    });
+  }
+
+  /* ----------------------------------------------------------- sync state */
+
+  var syncPollTimer = 0;
+  var SYNC_POLL_MS = 2000;
+
+  function stopSyncPoll() {
+    if (!syncPollTimer) return;
+    clearInterval(syncPollTimer);
+    syncPollTimer = 0;
+  }
+
+  function scheduleSyncPoll(running) {
+    if (syncPollTimer) {
+      if (!running) stopSyncPoll();
+      return;
+    }
+    if (!running) return;
+    syncPollTimer = setInterval(function () {
+      void refreshSyncStatus();
+    }, SYNC_POLL_MS);
+  }
+
+  async function refreshSyncStatus() {
+    try {
+      var reply = await send('SYNC_STATUS', {});
+      var wasRunning = state.syncRunning;
+      state.syncRunning = !!reply.running;
+      state.syncCancelling = !!(reply.cancelRequested || reply.cancelling);
+      /* FOLD THE RECORD, NOT JUST THE FLAG. This page is a tab: it can be open
+       * for the whole crawl and see none of the pushes, so the poll is the only
+       * thing that tells it what happened. Without this the headline stays
+       * "Never synced" forever on a tab that was opened before the first sync. */
+      if (!state.syncRunning && hasSyncRecord(reply)) {
+        state.sync = readSyncRecord(reply);
+        state.syncPhase = state.sync.phase || '';
+        state.syncPagesDone = state.sync.pagesDone || 0;
+        state.syncTotalSeen = state.sync.totalSeen || 0;
+        if (wasRunning) state.syncNote = 'Sync ended.';
+      }
+      if (state.syncRunning) state.syncNote = '';
+      dbg('refreshSyncStatus', reply);
+      paintSyncState();
+      scheduleSyncPoll(state.syncRunning);
+    } catch (err) {
+      state.syncNote = 'Could not read sync status: ' + textOf(err);
+      stopSyncPoll();
+      paintSyncState();
+      dbg('refreshSyncStatus error:', textOf(err));
+    }
+  }
+
+  /**
+   * Does this reply carry a usable sync record at all? A fresh install answers
+   * `null` for every measured field, and rendering that as "Incomplete" would
+   * paint a never-synced library as a broken one.
+   */
+  function hasSyncRecord(reply) {
+    if (!reply) return false;
+    return reply.state !== null && reply.state !== undefined
+      || reply.completed !== null && reply.completed !== undefined;
+  }
+
+  /** `SYNC_STATUS` carries the contract twice: flat and under `cursor`. */
+  function readSyncRecord(reply) {
+    var src = reply.cursor && typeof reply.cursor === 'object' ? reply.cursor : {};
+    function field(name) {
+      if (reply[name] !== null && reply[name] !== undefined) return reply[name];
+      return src[name];
+    }
+    return {
+      completed: !!field('completed'),
+      truncated: !!field('truncated'),
+      stopReason: field('stopReason') || null,
+      error: field('error') || null,
+      expectedTotal: Number(field('expectedTotal')) || 0,
+      totalSeen: Number(field('totalSeen')) || Number(field('uniqueSeen')) || 0,
+      missing: Number(field('missing')) || 0,
+      state: field('state') || null,
+      interrupted: reply.interrupted === true,
+      pagesDone: Number(field('pagesDone')) || 0,
+      phase: field('phase') || ''
+    };
+  }
+
+  function paintSyncState() {
+    var headline = 'Never synced';
+    var detail = '';
+    var running = state.syncRunning;
+    var cancelling = state.syncCancelling;
+
+    /* A NOTE SET BY A BUTTON HANDLER OUTRANKS THE DERIVED DETAIL, or pressing
+     * Stop and being told "there was nothing to cancel" would be erased by the
+     * very paint that reports it. Cleared as soon as real state moves again. */
+    if (state.syncNote) {
+      if (!cancelling && !running) {
+        detail = state.syncNote;
+      }
+    }
+
+    if (cancelling) {
+      headline = 'Stopping';
+      detail = 'waiting for the current page to finish';
+    } else if (running) {
+      headline = 'Syncing';
+      if (state.syncPhase) detail += state.syncPhase + ' — ';
+      detail += state.syncPagesDone + ' pages, ' + state.syncTotalSeen + ' clips indexed';
+    } else if (state.sync) {
+      var s = state.sync;
+      if (s.interrupted === true) {
+        headline = 'Interrupted';
+        detail = 'the worker was evicted mid-crawl';
+      } else if (s.state === 'cancelled') {
+        headline = 'Cancelled';
+      } else if (s.completed === true) {
+        headline = 'Finished';
+      } else if (s.state === 'error') {
+        headline = 'Failed';
+        detail = s.error || '';
+      } else if (s.completed === false) {
+        headline = 'Incomplete';
+        detail = (s.stopReason || 'unknown reason') + ' — ' + (s.missing || 0) + ' of ' + (s.expectedTotal || '?') + ' expected';
+      }
+    }
+
+    /* THE NOTE IS THE LAST WORD, applied AFTER the branches above rather than
+     * before them: the branch that derives `detail` is the normal case, and a
+     * handler-set note is the exception that has to survive it. */
+    if (state.syncNote && !cancelling && !running) {
+      detail = state.syncNote;
+    }
+
+    C.syncState.textContent = headline;
+    C.syncDetail.textContent = detail;
+
+    setDisabled(C.syncNowStart, running);
+    setDisabled(C.syncNowStop, !running);
+    setDisabled(C.syncNowRefresh, false);
+
+    dbg('paintSyncState', headline, detail);
+  }
+
+  function listenForSyncPushes() {
+    if (syncListenersRegistered) return;
+    syncListenersRegistered = true;
+
+    /* `broadcast()` in the worker sends the fields at the TOP LEVEL of the
+     * message object, not nested under `payload`. Reading `message.payload`
+     * yielded undefined for every sync push, which is why this page stayed on
+     * "Never synced" no matter what the worker said. */
+    chrome.runtime.onMessage.addListener(function (message, sender, sendReply) {
+      try {
+        var type = message && message.type;
+        dbg('onMessage', type);
+        if (typeof type !== 'string' || type.slice(0, 5) !== 'SYNC_') return;
+
+        if (type === 'SYNC_STARTED') {
+          state.syncRunning = true;
+          state.syncCancelling = false;
+          state.syncPhase = message.phase || '';
+          state.syncPagesDone = 0;
+          state.syncTotalSeen = 0;
+          state.syncNote = '';
+          dbg('SYNC_STARTED', message);
+          paintSyncState();
+          scheduleSyncPoll(true);
+        } else if (type === 'SYNC_PROGRESS') {
+          if (message.phase && message.phase !== state.syncPhase) {
+            dbg('phase change:', message.phase);
+            state.syncPhase = message.phase;
+          }
+          state.syncPagesDone = typeof message.pagesDone === 'number' ? message.pagesDone : state.syncPagesDone;
+          state.syncTotalSeen = typeof message.totalSeen === 'number' ? message.totalSeen : state.syncTotalSeen;
+          state.syncRunning = true;
+          state.syncCancelling = message.state === 'cancelling';
+          dbg('SYNC_PROGRESS', message.phase, message.pagesDone, message.totalSeen);
+          paintSyncState();
+          scheduleSyncPoll(true);
+        } else if (type === 'SYNC_CANCEL_REQUESTED') {
+          state.syncCancelling = true;
+          state.syncNote = '';
+          dbg('SYNC_CANCEL_REQUESTED', message.alreadyRequested);
+          paintSyncState();
+        } else if (type === 'SYNC_CANCELLED') {
+          state.syncRunning = false;
+          state.syncCancelling = false;
+          state.syncNote = message.orphanedCursorCleared === true
+            ? 'Cleared a stale sync record; nothing was running.'
+            : 'Sync cancelled.';
+          dbg('SYNC_CANCELLED', message);
+          stopSyncPoll();
+          paintSyncState();
+        } else if (type === 'SYNC_DONE' || type === 'SYNC_ERROR') {
+          state.syncRunning = false;
+          state.syncCancelling = false;
+          state.sync = readSyncRecord(message);
+          state.syncPhase = state.sync.phase || '';
+          state.syncPagesDone = state.sync.pagesDone || 0;
+          state.syncTotalSeen = state.sync.totalSeen || 0;
+          /* `stopReason:'watchdog_timeout'` and `'aborted'` are both real ends,
+           * and both are failures from the user's point of view — the crawl did
+           * not finish. Fold them into the error headline rather than letting
+           * `completed:false` render them as a routine "Incomplete". */
+          if (state.sync.stopReason === 'watchdog_timeout') {
+            state.sync.state = 'error';
+            state.sync.error = 'the sync ran past its time limit and was stopped';
+          }
+          state.syncNote = '';
+          dbg(type, state.sync);
+          stopSyncPoll();
+          paintSyncState();
+        }
+      } catch (e) {
+        dbg('listenForSyncPushes error:', textOf(e));
+      }
+    });
+  }
+
+  function wireSyncActions() {
+    if (syncWired) return;
+    syncWired = true;
+
+    C.syncNowStart.addEventListener('click', function () {
+      state.syncNote = 'starting…';
+      paintSyncState();
+      send('SYNC_START', {}).then(
+        function () { /* the SYNC_STARTED push does the rest */ },
+        function (err) {
+          state.syncRunning = false;
+          state.syncNote = textOf(err);
+          dbg('SYNC_START failed:', textOf(err));
+          paintSyncState();
+        }
+      );
+    });
+
+    C.syncNowStop.addEventListener('click', function () {
+      state.syncCancelling = true;
+      state.syncNote = '';
+      paintSyncState();
+      send('SYNC_CANCEL', {}).then(
+        function (reply) {
+          if (reply && reply.running === false) {
+            state.syncCancelling = false;
+            state.syncRunning = false;
+            state.syncNote = reply.orphanedCursorCleared === true
+              ? 'Cleared a stale sync record; nothing was running.'
+              : 'There was nothing to cancel.';
+          }
+          dbg('SYNC_CANCEL', reply);
+          paintSyncState();
+        },
+        function (err) {
+          state.syncCancelling = false;
+          state.syncNote = textOf(err);
+          dbg('SYNC_CANCEL failed:', textOf(err));
+          paintSyncState();
+        }
+      );
+    });
+
+    C.syncNowRefresh.addEventListener('click', function () {
+      void refreshSyncStatus().catch(function (err) {
+        C.syncDetail.textContent = textOf(err);
+      });
     });
   }
 
@@ -1571,6 +1857,9 @@
 
       await loadExampleClip();
       renderPreview();
+
+      void refreshSyncStatus();
+      listenForSyncPushes();
 
       setStatus('Settings loaded.', 'ok');
       setSaveNote('');

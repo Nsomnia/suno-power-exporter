@@ -3,11 +3,11 @@
 Every filter this extension offers, the `SunoFilter` spec key it writes, the
 **verified Suno field or route it reads**, and what it cannot do.
 
-The engine is `lib/suno.js` (1568 lines, zero dependencies — no imports, no
+The engine is `lib/suno.js` (1567 lines, zero dependencies — no imports, no
 network, no DOM, no `chrome.*`; it runs in the service worker, in a content
 script, and under node). The spec shape is one plain object; the UI builds it in
-`content/content.js:433-527` (`buildSpec`) and every surface sends it to the
-worker, which calls `SunoFilter.apply`.
+`content/content.js:454-540` (`buildSpec`) and every surface sends it to the
+worker, which calls `SunoFilter.apply` (`background/background.js:6886`).
 
 > **Read this bit first.** The previous version of this file was built on fields
 > that **do not exist on a Suno clip** — `is_disliked`, `dislike_count`,
@@ -32,7 +32,7 @@ Evaluated at `lib/suno.js:1038-1041`. Everything else in the `include.*` family 
 a **three-state boolean**: `true` = only these, `false` = none of these, **absent =
 no constraint** (`lib/suno.js:1049-1066`).
 
-The UI's tri-select maps straight onto them (`content/content.js:427-431`):
+The UI's tri-select maps straight onto them (`content/content.js:738`):
 
 ```js
 function triFlag(v) {
@@ -48,7 +48,7 @@ function triFlag(v) {
 
 | | |
 |---|---|
-| **UI control** | Liked tri-select in the page dock; a green row dot in the side panel list (`side_panel.js:307-317`) |
+| **UI control** | Liked tri-select in the page dock; a green row dot in the side panel list (`side_panel.js:594-600`) |
 | **Spec key** | `liked: 'only' \| 'exclude'` |
 | **Reads** | **`clip.is_liked`** — *your own* like state |
 | **NOT** | `upvote_count` |
@@ -81,24 +81,24 @@ There is also a separate, independent filter for the actual upvote count:
 `upvotesMin` / `upvotesMax`. **Use that one** if you want "songs with ≥10 upvotes".
 
 The inverse filter is `include.unliked: true` — *"only clips you have NOT liked"*
-(`lib/suno.js:1059-1060`; UI hint at `content/content.js:1075`).
+(`lib/suno.js:1059-1060`; UI hint at `content/content.js:1107`).
 
 ---
 
-## 👎 Downvoted — there is no field, so it costs double
+## 👎 Downvoted — no clip field, but the server filters on it, so one walk answers it
 
 | | |
 |---|---|
-| **UI control** | Downvoted tri-select; a red row dot (`side_panel.js:319-325`) |
+| **UI control** | Downvoted tri-select; a red row dot (`side_panel.js:601-607`) |
 | **Spec key** | `disliked: 'only' \| 'exclude'` |
-| **Reads** | **a diff of two `/api/feed/v2` pages** — not a clip field |
-| **Recon citation** | `lib/suno.js:864-868`, `lib/api.js:1909-1913`, `:2023-2026` |
+| **Reads** | **`is_disliked` on the stored clip row**, stamped by the crawl from the server-side filter it actually asked for |
+| **Recon citation** | `lib/suno.js:864-868`, `:901-902`; `lib/api.js:167-179`, `:2295-2308`; `background/background.js:6327-6329` |
 
-### The hard truth
+### The hard truth, unchanged
 
-**Suno exposes no per-clip dislike field.** There is no `is_disliked` and no
-`dislike_count` on a clip. `lib/suno.js:901-902` will *accept* `clip.disliked` or
-`clip.is_disliked` — but only as a caller-supplied fallback:
+**Suno still exposes no per-clip dislike field.** There is no `is_disliked` and no
+`dislike_count` on a clip that comes off the wire. `lib/suno.js:901-902` will
+*accept* one — as a caller-supplied value, alongside the diffed id set:
 
 ```js
 var dislikes = idSet(ctx.dislikedIds);
@@ -110,30 +110,54 @@ The doc comment immediately above it (`lib/suno.js:864-868`) says why:
 > `dislikedIds` Set/array of ids the caller diffed out of the feed
 > *(disliked state is NOT a clip field)*
 
-Both fallbacks are always `undefined` in production. **The first term is the only
-one that ever fires.**
+### What changed: the filter moved server-side
 
-### The only mechanism
+`/api/feed/v3` takes a **tri-state `disliked` filter whose values are strings** —
+`"True" | "False" | "Any"`, the bundle's `BooleanFilter`
+(`lib/api.js:167-179`, `:2295-2308`). So the server can be asked for exactly the
+disliked rows, and the crawl **stamps that verdict onto every clip it stores**:
 
-Page `/api/feed/v2` twice with `hide_disliked` flipped, and diff the id sets
-(`lib/api.js:2023-2026`):
-
-```
-pass A:  GET /api/feed/v2?hide_disliked=true   ->  baseIds
-pass B:  GET /api/feed/v2?hide_disliked=false  ->  seenIds
-
-dislikedIds = seenIds \ baseIds
+```js
+const stamped = clips.map((clip) => ({ ...clip, is_disliked: verdict }));
 ```
 
-**Cost: roughly double a sync** — two full crawls of your whole library. That is
-why `dislikedMode` defaults to `'exclude'` (single-pass, `background/background.js:677`) and
-the expensive `'both'` mode is opt-in.
+— `commitPage`, `background/background.js:6680-6700` (the stamp at `:6682`).
+It is stamped for **both** filter
+directions, because the server did the filtering: a `'False'` walk can only
+contain non-disliked clips and a `'True'` walk can only contain disliked ones.
 
-### Trust flag
+**The consequence is that this filter is now exact, and it costs one walk, not
+two.** The old two-pass symmetric difference existed only because Suno had no
+per-clip dislike field *and* no filter for it; the filter is why the difference is
+no longer needed at any point in the crawl.
 
-`cursor.dislikedApproximate` (`background/background.js:4836`) is set when the diff
-could not be computed honestly — a resumed two-pass run that never persisted its
-pass-A set, for instance. **Check it before trusting a "disliked only" result.**
+> **What the "roughly doubles sync time" warning was actually describing, and what
+> replaces it.** The honest tradeoff now is not *"dislikes are expensive"* but
+> **"which mode you are asking for."**
+>
+> | `dislikedMode` | walks | what you can trust |
+> |---|:--:|---|
+> | `exclude` (the default) | **1** — `filters.disliked:'False'` | `disliked:'exclude'` is **exact**. Rows stamped `is_disliked:false`; there are simply no disliked rows in the index |
+> | `include` | **1** — `filters.disliked:'Any'` | **nothing about dislikes is knowable.** This walk cannot classify rows it never filtered on, so `dislikedCount` stays `null` — reported as *unknown*, never as `0` |
+> | `both` | **2** — `'False'` for the library, then `'True'` for the disliked id set | both directions exact, and the count is a real number |
+>
+> **So the two-crawl cost is real only for `both`**, which is the one mode that
+> genuinely needs to see the disliked rows. It is no longer the default advice for
+> "I want a dislike filter" — `exclude` gives you that for free, and it is the
+> default for that reason (`DISMISSED_FILTER_BY_MODE`,
+> `background/background.js:362`, `dislikedMode: 'exclude'` at `:773`).
+>
+> One latent bug went with the two-pass shape: **`maxPages` was shared across
+> both passes**, so pass B was silently truncated to whatever pass A left over
+> (`lib/api.js:2194-2202`). One walk removes that by construction.
+
+### Trust flag — narrower than it was
+
+`cursor.dislikedApproximate` (`background/background.js:7020-7029`, published on
+every reply at `:7217`, `:7274` and `:5782`) is set when a `'True'` walk did not finish for **every**
+project — a cancelled or partial phase 2 makes the id set a **partial** set, and
+that is what gets reported. It no longer means *"the diff could not be computed"*,
+because there is no diff.
 
 Full mechanics: [KNOWN-LIMITS, section 5](KNOWN-LIMITS.md).
 
@@ -143,10 +167,10 @@ Full mechanics: [KNOWN-LIMITS, section 5](KNOWN-LIMITS.md).
 
 | | |
 |---|---|
-| **UI control** | multi-select over fetched projects, plus an *include unassigned* checkbox (`content/content.js:903-915`) |
+| **UI control** | multi-select over fetched projects, plus an *include unassigned* checkbox (`content/content.js:936-952`) |
 | **Spec key** | `projects: string[]` + `includeUnassigned: boolean` |
 | **Reads** | `GET /api/project/me` (names) and `GET /api/project/feed` (membership) |
-| **Recon citation** | `lib/api.js:912-913`, `background/background.js:4443` |
+| **Recon citation** | `lib/api.js:1086-1087`, `background/background.js:5581` |
 
 ### A workspace IS a project
 
@@ -161,15 +185,19 @@ shown is `My Workspace` (`lib/suno.js:32`, `UNASSIGNED_LABEL`).
 
 ### 🚨 Suno has NO project field on a clip
 
-`background/background.js:4443` is the statement of record:
+`background/background.js:5581-5583` is the statement of record:
 
 > Which workspace (project) a clip belongs to. Suno has NO project field on a
 > clip; membership is joined from the project feed, and `default` is named
 > "My Workspace". This is the only correct basis for a per-workspace filter.
 
 So membership is a **client-side join**, built once per sync from
-`/api/project/feed` (`background/background.js:4642`, shape `{items:[{type,added_at_ms,clip}]}`)
-and handed to the engine as `ctx.projectIdsById` (`lib/suno.js:199-207`).
+`/api/project/feed` (`background/background.js:6244-6278`, shape
+`{items:[{type,added_at_ms,clip}], next_cursor}`) and **stamped onto each clip row
+as `projectIds`** by `SunoAPIClient.hydrate` (`lib/api.js:2884-2916`), which is what
+the engine reads first (`lib/suno.js:905-908`). `ctx.projectIdsById` is a supported
+alternative the engine also accepts (`lib/suno.js:197-207`); this worker does not
+supply it, because the row already carries the join.
 
 Consequences:
 - **Clips in no project land in `default`** and are counted there in facets
@@ -178,10 +206,10 @@ Consequences:
   true: picking projects must never silently drop the unassigned bucket from a
   mass download."* Turn it off if you want strict project membership.
 - If `/api/project/feed` fails, the sync warns and continues
-  (`background/background.js:4649`) and **every clip reads as unassigned**.
+  (`background/background.js:6262-6277`) and **every clip reads as unassigned**.
 - `playlist` is a **search synonym for `project`**, not the same thing
   (`lib/suno.js:85`) — playlists are a different surface entirely
-  (`/api/playlist/me`, `lib/api.js:914`) and are not joined into membership.
+  (`/api/playlist/me`, `lib/api.js:1088`) and are not joined into membership.
 
 ### 🚨 Collaborative workspaces do not exist in prod
 
@@ -253,7 +281,8 @@ library lands in it.
 
 The search box is not a plain substring field. It goes through
 `SunoFilter.parseQuery` (`lib/suno.js:693-786`), and the UI hands the parsed terms
-to the spec verbatim (`content/content.js:450-463`).
+to the spec verbatim (`content/content.js:463-477`); the stems term at `:488-489`
+and the explicit-id list just below it.
 
 ### Operators
 
@@ -323,7 +352,7 @@ query. When terms exist, `text` is ignored (`lib/suno.js:1079-1092`) because
 `parseQuery` keeps the *raw* query in `text`, including `-term` and `field:`.
 
 The side panel uses the simple path — `spec.textMode = 'any'`
-(`side_panel.js:418`) with a 50-row page (`side_panel.html:359`). The page dock
+(`side_panel.js:696-703`) with a 50-row page (`side_panel.html:359`). The page dock
 uses the full parser.
 
 ---
@@ -345,7 +374,7 @@ uses the full parser.
 | **Duration min / max** | `durationMin`, `durationMax` | `clip.duration` | ⚠️ **type unverified** — see below |
 | **Plays min / max** | `playsMin`, `playsMax` | `clip.play_count` | |
 | **Upvotes min / max** | `upvotesMin`, `upvotesMax` | `clip.upvote_count` | a **public count**, not your like state |
-| **Clip ids** | `ids.include[]`, `ids.exclude[]` | — | one paste box; `content/content.js:990-1008` |
+| **Clip ids** | `ids.include[]`, `ids.exclude[]` | — | one paste box; `content/content.js:1020-1044` |
 | **Batch index** | `batchIndex` | `clip.batch_index` | the Nth item of a generation run |
 | **Stems** | a `terms` entry `{field:'any', value:'stems'}` | 🚫 **no field exists** | a literal text search; deliberate approximation |
 | **Raw model name** | `modelNames: string[]` | `clip.model_name` | exact-match, case-insensitive |
@@ -462,7 +491,7 @@ mirrored onto the instance (`lib/suno.js:1550-1556`) so content scripts find it.
 |---|---|---|
 | `ALL` | `{}` | **no constraints at all** |
 | `LIKED_ONLY` | `{liked:'only'}` | |
-| `DISLIKED_ONLY` | `{disliked:'only'}` | needs the two-pass diff |
+| `DISLIKED_ONLY` | `{disliked:'only'}` | exact — `is_disliked` is stamped per clip |
 | `NO_DISLIKES` | `{disliked:'exclude'}` | |
 | `V6` | `{models:['v6']}` | |
 | `V5_PLUS` | `{models:['v6','v6-mini','v5.5','v5']}` | "v5 **plus** everything newer" |
@@ -569,8 +598,8 @@ UI (content/content.js buildSpec, or side_panel.js, or popup.js)
 chrome.runtime.sendMessage { type:'GET_CLIPS' | 'DOWNLOAD_START', payload:{spec} }
   │   validateSender: sender.id === runtime.id AND sender.url allowlisted
   ▼
-background/background.js  queryClips() / resolveBatchClips()
-  │   ctx = { projects, dislikedIds, projectIdsById }
+background/background.js  queryClips() (6876) / resolveBatchClips() (4869)
+  │   ctx = { projects, dislikedIds }
   ▼
 SunoDB.clips.all()                        IndexedDB, the local index
   │
@@ -591,7 +620,7 @@ caller can chain them without double-applying `spec.limit`.
 
 `describe(spec)` (`lib/suno.js:1322-1394`) renders the one-line human summary —
 `Liked only · v6 · 2 projects · style:"dream pop" · not any:"metal"` — and it is
-what the batch plan stores as its description (`background/background.js:3749`, carried into the plan at `:3923`),
+what the batch plan stores as its description (`background/background.js:4887`, carried into the plan),
 so you always know what a saved batch was actually going to do.
 
 ---

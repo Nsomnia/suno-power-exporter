@@ -138,10 +138,33 @@ interesting thing in the ancestor.**
 repeated cursor as an incomplete crawl, and compares collected count against
 the advertised total.
 
-`lib/api.js#iterateFeed` (`:1934`) walks a **page-integer** feed instead:
+> ### 🔄 The route changed AGAIN at 6.2.0. Read this before reading the comparison below.
+>
+> **Everything in the rest of this subsection describes the build as it stood at
+> 6.0.1**, and the 6.0.1 `lib/api.js` no longer exists — the numbers below are that
+> build's line numbers, kept because this is a migration record and the history is
+> not being rewritten. For **current** behaviour read
+> [`ARCHITECTURE.md` § the cursor contract](docs/ARCHITECTURE.md) and
+> [`KNOWN-LIMITS` §25–28](docs/KNOWN-LIMITS.md).
+>
+> The short version: `iterateFeed` **is** a cursor-protocol walker now, over
+> `POST /api/feed/v3` with a `{cursor, limit, filters}` body
+> (`lib/api.js:2263-2522`; rationale at `:2190-2200`). The page-integer feed,
+> `STALL_PAGE_LIMIT` and the `query: { hide_disliked, page }` shape this subsection
+> describes were **removed** — along with `/api/feed/v2` itself, which appears in
+> **0 of 96** shipped bundle chunks and in **0** captures
+> (`lib/api.js:15-30`). So **two** of the three "uncovered behaviours" listed at
+> the end of this subsection have since been covered by the current build:
+> cursor pagination **and** expected-total reconciliation
+> (`expectedClipTotal`, `lib/api.js:2578-2586`). Only repeated-cursor stall
+> detection was implemented by a different mechanism — a null `next_cursor` ends
+> the walk and a repeated one is caught by name
+> (`stopReason: 'stuck_cursor'`).
+
+At **6.0.1**, `lib/api.js#iterateFeed` walked a **page-integer** feed instead:
 `query: { hide_disliked, page }`, terminating on an empty-page streak
 (`STALL_PAGE_LIMIT`) or `maxPages`, and reporting `{truncated, stalled, error}`
-in a final summary. The cursor vocabulary is absent from the whole build:
+in a final summary. The cursor vocabulary was absent from the whole 6.0.1 build:
 
 ```
 $ grep -rnE 'has_more|next_cursor|next_page' lib/ background/ side_panel.js \
@@ -149,7 +172,7 @@ $ grep -rnE 'has_more|next_cursor|next_page' lib/ background/ side_panel.js \
 (no matches — zero occurrences anywhere in the 6.0.1 build)
 ```
 
-`num_total_results` *is* named three times, but only in doc comments
+`num_total_results` *was* named three times, but only in doc comments
 (`lib/api.js:912`, `:914`, `:2336`) documenting the shapes of
 `/api/project/me` and `/api/playlist/me`. It is never read as a value:
 
@@ -159,12 +182,12 @@ $ grep -rn num_total_results lib/ background/ side_panel.js \
 (no matches — every occurrence is inside a comment)
 ```
 
-`fetchProjects` (`:2134`) takes its count from the per-project
-`project.clip_count` field, and `fetchPlaylists` (`:2341`) discards the total
-and returns the page it got. So nothing in 6.0.1 reconciles a collected count
+`fetchProjects` took its count from the per-project
+`project.clip_count` field, and `fetchPlaylists` discarded the total
+and returned the page it got. So nothing in 6.0.1 reconciled a collected count
 against a server-advertised total.
 
-Three specific ancestor behaviours are therefore uncovered:
+Three specific ancestor behaviours were therefore uncovered **as of 6.0.1**:
 
 1. cursor-based pagination (if any endpoint still returns cursors);
 2. **expected-total reconciliation** — 6.0.1 never compares what it collected
@@ -176,6 +199,13 @@ Points 2 and 3 are honesty guarantees that `docs/KNOWN-LIMITS.md` may well want
 regardless of protocol. The file is preserved unmodified as the reference
 implementation; nothing in the 6.0.1 build references it, so importing it
 without adaptation would be dead code. It is **not** copied into `lib/`.
+
+> 🕑 **As of 6.2.0: points 1 and 2 are closed and point 3 is closed by a different
+> mechanism.** The current crawl enumerates every project from `/api/project/me`,
+> walks each on `POST /api/feed/v3`, and publishes `missing`,
+> `oracleApplied` and `advisory` from one builder so every surface reads the same
+> numbers. The ancestor's `feed.js` is still the clearest written description of
+> the cursor state machine, and still worth reading — just no longer a gap.
 
 ### 5. Smaller genuinely-uncapped items
 

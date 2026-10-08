@@ -8,8 +8,141 @@ date ranges, instrumental-or-not, remixes, trashed, contests, public-only, exact
 clip-id lists — every filter the Suno API can *actually* support, and an honest
 account of the three it cannot.
 
-Version **6.1.0** (see [`CHANGELOG.md`](CHANGELOG.md)). Manifest V3.
+Version **6.2.0** (see [`CHANGELOG.md`](CHANGELOG.md)). Manifest V3.
 Chrome 116+.
+
+> **6.2.0 is the release that fixed the library crawl.** A sync over a large
+> library indexed 400 of ~5,500 clips and reported **"Up to date"**. It now walks
+> every workspace on `POST /api/feed/v3` and cannot report success over a short
+> library. → [`CHANGELOG.md` 6.2.0](CHANGELOG.md)
+
+---
+
+## 🤝 The one property this extension is actually built around
+
+Everything else here is a feature. This is the requirement.
+
+> **If the extension does not know, it says so — out loud, with a number.**
+>
+> No green tick over a library that is short. No "complete" that means "I stopped".
+> No count rounded to look settled.
+
+**The headline example is the bug that made this a release.** A user with ~5,500
+clips pressed *Sync library*. The extension indexed **400**, and the popup said:
+
+```
+✅  Up to date        400 indexed
+```
+
+That was not a display bug. The crawl was paging a route Suno's web app has
+never called, with a fixed page size of 20, and stopped after 20 pages — while the
+21st request **failed** and the error was thrown away on the way to the screen.
+
+### What it says now
+
+The same crawl, on the same account, now renders like this — tile word, then the
+count, then the named cause:
+
+```
+⚠️  Incomplete
+
+   a page request failed (HTTP 429) · 400 of ~5,500 · 5,100 clips missing
+```
+
+and the accessible name, hover text and banner are **one reused string**, so the
+three can never describe the same failure differently:
+
+```
+The last sync is INCOMPLETE. a page request failed (HTTP 429).
+Indexed 400 of ~5,500. 5,100 clips missing.
+```
+
+The in-page dock says the same thing in its own register — `Library INCOMPLETE —
+the last sync stopped early.` — because the dock is a different surface with a
+different amount of room, but **the `stopReason` → English map is byte-identical
+in all three files** (`popup/popup.js:263-272`, `side_panel.js:174-183`,
+`content/content.js:1866-1877`). That coupling is deliberate and each file says so.
+
+### …and the converse, which is the actual property
+
+The obvious direction is "never say *Up to date* over a short library." That was
+the bug. **The harder half is never saying *Incomplete* over a complete one** —
+and this build got that wrong too, in a way that is worth showing you because it
+is the same defect wearing a different hat.
+
+20 workspaces × 275 clips = **5,502** by Suno's own per-project counts. **One**
+clip lives in two workspaces, so 5,501 unique rows are on disk. The crawl did
+exactly the right thing:
+
+```
+✅  Up to date        5,501 indexed · Suno reports ~5,502
+```
+
+and then the UI overrode it:
+
+```
+⚠️  INCOMPLETE — 1 clip is missing          ← forever, on a finished crawl
+```
+
+**Why.** The worker counts rows **examined** (a clip in two workspaces is walked
+twice) and stores clips **once** — so "missing" has to be computed against
+*examined*. It was publishing the **unique** count under the same field name, and
+all three surfaces then re-did the subtraction themselves. The worker had already
+answered `missing: 0`. The UI didn't believe it.
+
+The rule now: **the worker's `missing` is authoritative whenever the key is
+present, `0` included.** It is derived only when the key is *entirely* absent —
+the legacy-reply case. The root cause was a helper that chose its fallback on
+*falsiness*, so a present `0` looked like no answer at all. **A falsy check where
+a presence check belongs.** That shape of bug recurs across this codebase, and it
+is why a green tick is not the thing to be satisfied about.
+
+> A wrong answer in the cautious direction is **still a wrong answer** — and it is
+> the one that teaches you to stop reading the word.
+
+### Three numbers, one glance
+
+The local count, the count Suno itself reports
+(from each project's own `clip_count`), and the verdict. The **`~` is load-bearing**
+— the count is a lower bound, because Suno's project list is itself read
+page-by-page — so the extension renders *"400 of ~5,500"*, not *"400 of 5,500."*
+
+And when the crawl ran with filters — which it always does, trashed and disliked
+rows excluded — Suno's per-project count is a **lower bound on the whole
+library**, not a target this walk fell short of. The extension says so in words
+rather than failing the run over a number nobody can verify. It publishes a
+boolean **`oracleApplied`** — *was the shortfall **checked**, or merely
+**reported**?* — and a human **`advisory`** sentence carrying the answer, and the
+three surfaces render it as a qualifier on the counts:
+
+```
+5,501 of ~5,502 — a lower bound, filters applied
+```
+
+That is a deliberate **loss of a guarantee**, and the extension documents it as
+one: with `oracleApplied:false` the sync can no longer *prove* a clip is missing,
+so the advisory is the only signal and it is a statement about **which number to
+trust**, not a measurement. What would restore the guarantee is one
+authenticated capture proving `clip_count` excludes trashed and disliked rows. →
+[KNOWN-LIMITS §26](docs/KNOWN-LIMITS.md).
+
+**"Up to date" is now unfalsifiable over an incomplete library — and "Incomplete"
+over a complete one.** There is no code path that produces either. A crawl is
+complete only when the server's own cursor says so, and every other outcome
+carries a named cause: a page failed, a page came
+back empty, the cursor repeated itself, a page added nothing new, the per-workspace
+page cap was hit, or Suno's clip count disagrees with what was found **where that
+count can be compared against an unfiltered walk**.
+
+The same rule covers the awkward cases people usually leave out:
+
+- one workspace failing **does not lose the other nineteen** — it is named
+- a resumed sync **cannot skip pages it never saw**
+- a library that *looks* complete but is short **says "Incomplete"**
+- a library that *is* complete never **says "Incomplete"**
+
+**This is why the KNOWN-LIMITS page is 28 items long and the sync banner is a
+warning instead of a decoration.**
 
 ---
 
@@ -20,13 +153,16 @@ This is not a footnote. Three things will bite you.
 | | What | Where |
 |---|---|---|
 | 🔤 | **The `?format=` enum is undocumented.** The client passes your string through unchanged and tallies what it has tried. Only `m4a` is guaranteed — and `wav`/`wav-48k` are honest regardless, because they are rendered locally rather than asked for. That is *also* why MP3 and Ogg Vorbis live under **Convert** rather than under the format dropdown. | [KNOWN-LIMITS §1](docs/KNOWN-LIMITS.md) |
-| 👎 | **Suno exposes no per-clip dislike field.** Detecting dislikes means paging your whole library **twice** and diffing the id sets, so a disliked pass costs roughly double a sync. | [KNOWN-LIMITS §5](docs/KNOWN-LIMITS.md) |
+| 👎 | **Suno exposes no per-clip dislike field** — but `/api/feed/v3` filters on it server-side, so one walk answers the question and the result is exact. Only the `"index both"` mode genuinely needs two crawls. | [KNOWN-LIMITS §5](docs/KNOWN-LIMITS.md) |
 | ⚖️ | **The MP3 encoder is LGPL-3.0, and shipping this extension redistributes it.** Both encoders are vendored byte-identically with their notices, but a distributor inherits a real obligation — and the Xiph BSD text for the Ogg build is referenced by URL rather than reproduced on disk. | [KNOWN-LIMITS §12](docs/KNOWN-LIMITS.md) |
 
-Plus: bulk ZIP's response shape is unknown, `duration`'s type is unverified, the
-feed page size is unknown, collaborative workspaces don't exist in prod, and the
-free-tier download allowance is genuinely unknown. **The full list — 20 items, all
-of them read out of the shipped code — is [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md).**
+Plus: bulk ZIP's response shape is unknown, `duration`'s type is unverified,
+collaborative workspaces don't exist in prod, the free-tier download allowance is
+genuinely unknown, **`window.Clerk` is not confirmed to be a page global on
+suno.com at all**, and the `/api/feed/v3` contract rests on the shipped bundle plus
+two third-party extensions rather than on a live capture. **The full list — 28
+items, all of them read out of the shipped code — is
+[`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md).**
 
 > 🎉 **MP3 and Ogg Vorbis used to be the #1 limitation on that page and are now a
 > shipped feature.** Both encoders are vendored in `vendor/` at the exact upstream
@@ -49,25 +185,48 @@ session doesn't rediscover the same walls.
 3. **Load unpacked** → select **this directory**
 4. **Sign in to [suno.com](https://suno.com) in the same browser profile**
 
-That last step is not optional. The extension **mints its Clerk JWT from the page**,
-not from a cookie. `__session` is HttpOnly and is a different, Next.js SSR value —
-sending it as a Bearer token is a bug (`lib/api.js:33-35`). So: you must be logged
-in on `suno.com`, in the same profile, in a tab that has loaded.
+That last step is not optional. The extension gets its Clerk JWT **from the page's
+own requests**, not from a cookie. `__session` is HttpOnly and is a different,
+Next.js SSR value — sending it as a Bearer token is a bug (`lib/api.js:42-44`).
+So: you must be logged in on `suno.com`, in the same profile, in a tab that has
+loaded.
 
-Hit the toolbar icon. The chip at the top tells you whether a usable session was
-found.
+**How it actually gets the token** is a four-rung ladder, cheapest first:
+read the `Authorization: Bearer …` header off a passive observer of Suno's own
+requests; install that observer if it is missing; fall back to polling for
+`window.Clerk` inside the page for up to 12 seconds; then re-read the observer in
+case the page called an authenticated API while that wait was running. The
+observer is installed the moment the dock mounts, before the first call that could
+need a token. Two caveats are worth knowing up front: **nobody has confirmed
+`window.Clerk` is a page global on suno.com**, and the observer can only capture a
+header Suno sends *after* it is installed — so if the panel still says no token,
+press *Refresh token*. → [KNOWN-LIMITS §21, §23](docs/KNOWN-LIMITS.md)
 
 > **401 with `exp` still in the future = bad token, not bad session.**
-> (`lib/api.js:36-38`) That distinction is surfaced as `error.code` so you know
+> (`lib/api.js:45-47`) That distinction is surfaced as `error.code` so you know
 > which one you have.
 
 ---
 
 ## ⚡ 60-second start
 
-1. **Sync library** — popup → *Sync library*. Pages through `/api/feed/v2` into
-   IndexedDB. Watch for the truncation banner; if it appears, your library is
-   incomplete (raise `syncMaxPages` in settings).
+1. **Sync library** — popup → *Sync library*. Walks **every workspace** on
+   `POST /api/feed/v3`, following a server cursor 100 clips at a time, and writes
+   each page into IndexedDB as it lands. If a workspace fails, the others still
+   finish and the failed one is named.
+
+   **Then read the two numbers next to the sync state.** They are the whole point
+   of the honesty guarantee:
+
+   > ### `400 indexed · Suno reports ~5,500`
+   >
+   > If your library is short, **this is where it says so** — with a count, in
+   > plain words, before you find out by downloading 400 songs and wondering where
+   > the other five thousand went. A sync that cannot prove it is complete is
+   > rendered **`Incomplete`** (never "Up to date"), announces itself through an
+   > `aria-live` region, and names the cause: a failed request, a page cap, a
+   > repeated cursor, or a workspace Suno counts as bigger than the walk found.
+   > See [`KNOWN-LIMITS §4`](docs/KNOWN-LIMITS.md).
 2. **Pick your filters** — the dock injected into every `suno.com` page has the
    full catalog; the side panel is faster for browsing and searching.
 3. **Hit download** — *Start (current filter)*, or tick rows and *Start (selected
@@ -75,11 +234,11 @@ found.
 
 **Turn on dry run first** if this is your first batch. Settings → *dry run (plan
 only, no files)* plans the whole thing and reports what each item would do without
-spending a single download (`background/background.js:684`).
+spending a single download (`background/background.js:779`).
 
 And before you commit to a 200-song batch, run **`PROBE_DRM`** on one clip. It is
 diagnostic only — no bytes, no quota — and it tells you which rungs would work and
-whether any of them is free (`background/background.js:5660-5733`).
+whether any of them is free (`background/background.js:8206-8280`).
 
 ---
 
@@ -120,7 +279,7 @@ actually download music — it saved 111-byte 403 XML under audio filenames.
 ### 🎚️ Formats: three variants, four conversions — two different things
 
 The **variant** list is exactly `m4a`, `wav-48k` and `wav`
-(`background/background.js:460`), and that is a capability decision: a variant
+(`background/background.js:555`), and that is a capability decision: a variant
 selects the *download route*, and the `?format=` enum behind it is undocumented.
 
 | Variant | What it is | Cost |
@@ -130,7 +289,7 @@ selects the *download route*, and the `?format=` enum behind it is undocumented.
 | `wav` | a local render at `settings.wavSampleRate` — decode, resample, real RIFF header | 🟢 free |
 
 Separately, the **Convert** setting performs four conversions — `none`, `wav`,
-**`mp3`**, **`ogg`** (`background/background.js:549`) — using the two encoders
+**`mp3`**, **`ogg`** (`background/background.js:644`) — using the two encoders
 vendored in `vendor/`:
 
 | Convert | What happens | Cost |
@@ -195,6 +354,15 @@ absence of a mid-batch quota guard.
 
 → **The full accounting: [`CHANGELOG.md`](CHANGELOG.md), 6.0.1.**
 
+**And the same shape of failure got through one release after that audit.** In
+6.1.0 sign-in was *completely* non-functional — every authenticated call needed a
+token, and no token could be minted, for a user who was plainly signed in. The
+cause was an injection helper that appended a `<script>` and returned `true`, while
+suno.com's CSP refused to execute it, so the HLS patch, its restore and the
+`window.Clerk` reader were all dead code with no error anywhere. Three more defects
+were stacked behind it before anything worked. → **[`CHANGELOG.md`](CHANGELOG.md),
+6.1.1.**
+
 ---
 
 ## 🎛️ The filter catalog
@@ -220,11 +388,13 @@ library essentially every clip has at least one, so the old filter matched
 "popular" threshold, use the **upvotes min/max** filter — it is a different filter,
 reading a different field.
 
-**👎 Downvoted has no field behind it.** There is no `is_disliked` and no
-`dislike_count` on a Suno clip. The only mechanism is paging `/api/feed/v2` twice
-with `hide_disliked` flipped and diffing the id sets — which is why a disliked pass
-costs roughly double a sync. Check `dislikedApproximate` before trusting a
-"disliked only" result.
+**👎 Downvoted has no field behind it, but the server does the filtering.** There is
+no `is_disliked` and no `dislike_count` on a Suno clip. The old build compensated
+by paging `/api/feed/v2` **twice** with `hide_disliked` flipped and diffing the id
+sets. `/api/feed/v3` has a **tri-state `disliked` filter** instead, so **one walk**
+answers the question and the verdict is stamped onto every clip the crawl stores —
+which makes the filter exact. Only the *"index both"* mode still costs two walks,
+because only that mode needs to see the disliked rows at all.
 
 **📁 A workspace IS a project, and the default one is literally
 `{"id":"default","name":"My Workspace"}`.** Suno has **no project field on a
@@ -274,7 +444,7 @@ implicitly, which silently shrank mass downloads. Use `NO_TRASHED`.
 
 ## 🏗️ Architecture at a glance
 
-34,187 lines of JS, HTML and CSS across eight libraries and one orchestrator, plus
+38,242 lines of JS, HTML and CSS across eight libraries and one orchestrator, plus
 2.8 MB of vendored third-party JavaScript. The
 libraries take
 their dependencies **by injection** — `fetchImpl`, a clock, a logger, an
@@ -284,14 +454,16 @@ one runs unmodified in the service worker, in a content script, and under node.
 ```
 manifest.json ─ declares permissions + CSP (script-src 'self')
 
-┌─ background/background.js ─ 6257 lines ─ the ONLY orchestrator ──────┐
-│  18 numbered sections. Owns HTTP, storage, the ladder, the batch      │
-│  driver, resumable crawls, the message router and the lifecycle.      │
+┌─ background/background.js ─ 8284 lines ─ the ONLY orchestrator ──────┐
+│  18 numbered sections + §5b. Owns HTTP, storage, the ladder, the    │
+│  batch driver, the per-workspace library crawl and its completeness  │
+│  verdict, the message router, the lifecycle, and the only MAIN-world │
+│  page channel.                                                       │
 └───────────────────────────────────────────────────────────────────────┘
         │                    │                     │
         ▼                    ▼                     ▼
    lib/api.js            lib/db.js            lib/drm.js
-   23 verified routes    5 IDB stores,        the Mango pipeline
+   24 verified routes    5 IDB stores,        the Mango pipeline
    RateLimiter 4/s       schema v3             rights → AES-GCM →
    typed errors          downloads keyed       chunked AES-CTR →
                          ['clipId','variant']  container verify
@@ -299,6 +471,7 @@ manifest.json ─ declares permissions + CSP (script-src 'self')
    lib/suno.js      lib/crypto.js     lib/tagger.js    lib/lyrics.js    lib/audio.js
    the filter       AES-GCM + CTR     ID3 / MP4       .lrc / .json     decode, resample,
    engine + parser                   metadata        sidecars         BPM, interleave
+   + the cursor walk on /api/feed/v3
 
 ┌─ offscreen/ ──────────────────────────────────────────────────────────┐
 │  A real DOM page, because the worker has no Web Audio and no          │
@@ -329,6 +502,7 @@ These are the interesting ones — each removal forced a specific design.
 | **`runtime.sendMessage` can't reach content scripts** | every push fans out to `runtime.sendMessage` **and** `tabs.sendMessage` |
 | **`window` is undefined in a worker** | a four-line alias shim before `importScripts`. **Load-bearing — don't remove it** |
 | **No remote code** | the two audio encoders are **vendored under `vendor/`** and hash-verified, because `script-src 'self'` makes a CDN fetch impossible — so there is no "grab it if missing" fallback to degrade to |
+| **A page's CSP forbids inline `<script>`** | MAIN-world access goes through the **worker**, via `chrome.scripting.executeScript({world:'MAIN'})`, which is not subject to the page's CSP. The op is one of six keys in a frozen allowlist — no code string ever reaches the page |
 
 > The `sendMessage` one is worth remembering: the previous build *documented* the
 > limitation in a comment and then used only the broken path. **No event ever
@@ -361,6 +535,7 @@ Not "not yet". Deliberately, with reasons.
 | **`/b-side/*` staff routes** | **84 routes, 168 requests, all 404**, anonymous and authenticated. Authorization is by non-deployment. It's the best **disclosure** candidate in the recon — report it, don't use it. |
 | **Staging API** (`studio-api-staging.suno.com`) | live and **unauthenticated** — 58 flags vs prod's 47. A misconfiguration **to report**, not a resource. The client enforces a host denylist at construction time, so it cannot be configured away. |
 | **`/api/playlist/liked/`** | **does not exist.** The old build paged it and silently got nothing — which is why "liked only" never worked. |
+| **`GET /api/feed/v2`** | 🚨 **it answers, and it is still the wrong route.** It appears in **0 of 96** bundle chunks and **0** captures — Suno's web app has never called it — its own `num_total_results` reported **21** for a library of **3,444**, and its page size is a fixed **20**. Enumerating through it indexed **400 clips of ~5,500** and reported success. Removed from the route table outright rather than kept as a "fallback". Library enumeration is `POST /api/feed/v3`. |
 | **`suno.com/api/*`** | the web origin does not proxy `/api/*`; every such call 404s. |
 | **Reconstructing payloads from 422 `loc` chains** | **fabricated** — a renamed projection. Real bodies are flat. The rights call tries three shapes for exactly this reason. |
 | **The Studio-download bypass** | **closed server-side 2026-09-09.** Report it as fixed. Do not present it as an exploit. |
@@ -386,7 +561,8 @@ Not "not yet". Deliberately, with reasons.
 - **The rate limit is 4 req/s + jitter by default because that is production.**
   Not because we're cautious — recon used the same number for the same reason
   (`../suno-recon/README.md:74`). It's tunable between 0.2 and 20 req/s
-  (`background/background.js:1067`); leave it alone unless you have a reason.
+  (`background/background.js:708`, clamped 0.2–20 at `:1162`); leave it alone
+  unless you have a reason.
 - **Stay inside your own quota.** 20/month on Pro, 60/month on Premier, resets on
   the billing date, no carryover. One song = one download, regardless of format.
 - **Suno's ToS exists to make mass export harder.** The September 2026 policy post
@@ -444,7 +620,7 @@ Suggested first reads:
 
 1. `docs/KNOWN-LIMITS.md` — before you touch anything
 2. `background/background.js:33-54` — the eight hard invariants
-3. `lib/api.js:1-43` — the seven hard-won behaviours, in the author's own words
+3. `lib/api.js:1-56` — the eight hard-won behaviours, in the author's own words
 4. `lib/drm.js:1-76` — the DRM pipeline and its two unresolved questions
 5. `vendor/README.md` — the encoders' provenance, licences and the API traps
 
@@ -452,12 +628,12 @@ Suggested first reads:
 
 | file | what it is |
 |---|---|
-| [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md) | 🚨 **20 hard limits** (plus the MP3/OGG item, now resolved). Read first. |
+| [`docs/KNOWN-LIMITS.md`](docs/KNOWN-LIMITS.md) | 🚨 **28 hard limits** (plus the MP3/OGG item, now resolved). Read first. |
 | [`docs/FILTERS.md`](docs/FILTERS.md) | every filter, its spec key, its verified field, its caveats |
 | [`docs/DOWNLOAD-LADDER.md`](docs/DOWNLOAD-LADDER.md) | the seven rungs, quota semantics, the DRM pipeline, format support |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | file map, MV3 constraints, message protocol, data flows, IDB schema |
 | [`docs/RECON-NOTES.md`](docs/RECON-NOTES.md) | the verified-truth ledger: what we built on, what we refused to |
-| [`CHANGELOG.md`](CHANGELOG.md) | 6.1.0 vs 6.0.1 vs 6.0.0 vs 5.0.0 — 86 defects in the rewrite, 9 more in the audit |
+| [`CHANGELOG.md`](CHANGELOG.md) | 6.2.0 vs 6.1.1 vs 6.1.0 vs 6.0.1 vs 6.0.0 vs 5.0.0 — 86 defects in the rewrite, 9 more in the audit, 2 more in the sign-in fix, and 2 that made the library crawl lie |
 
 Upstream recon: [`../suno-recon/`](../suno-recon/) — start at
 [`reports/FINDINGS.md`](../suno-recon/reports/FINDINGS.md).
