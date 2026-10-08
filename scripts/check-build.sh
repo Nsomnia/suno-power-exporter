@@ -415,6 +415,110 @@ else
 	fail "missing  $VENDOR_INDEX (cannot verify the encoders without it)"
 fi
 
+# --- 4b. duplicated stopReason maps must stay identical --------------------
+# The sync stopReason -> English map is deliberately duplicated, byte-identically,
+# in the popup, the side panel and the content script: content scripts and
+# extension pages share no module graph (docs/ARCHITECTURE.md:1467-1472), so
+# there is nowhere to put ONE copy that all three can read.
+#
+# The cost of that decision is that nothing but discipline keeps them equal, and
+# a stopReason added to one file and forgotten in the other two produces two
+# surfaces describing the same failure differently — which is precisely the class
+# of bug this repo's completeness contract exists to prevent. So it is checked.
+#
+# The `advisory` key is intentionally absent from all three and is not compared:
+# it is a non-error severity carried alongside stopReason, not a reason itself.
+printf '\n-- duplicated stopReason maps (popup / side panel / content script)\n'
+stopreason_out=$(python3 - <<'PY' 2>&1
+import re, sys
+
+TARGETS = [("popup/popup.js", "popup"), ("side_panel.js", "side panel"),
+           ("content/content.js", "content script")]
+# A map entry looks like:  key: 'text',   with single quotes and an escaped one.
+ENTRY = re.compile(r"^([a-z_]+):\s*'((?:[^'\\]|\\.)*)'\s*,?\s*$")
+
+
+def extract(path):
+    """Return {key: value} for the stopReason map, or None if not found.
+
+    Located by a key every map must carry, then read to the closing brace, rather
+    than by line number: line numbers move with every edit above, which is how a
+    check like this silently stops checking anything.
+    """
+    try:
+        lines = open(path, encoding="utf-8").read().split("\n")
+    except OSError as exc:
+        print("  cannot read %s: %s" % (path, exc))
+        sys.exit(1)
+    start = None
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*complete:\s*'the crawl finished cleanly'", line):
+            start = i
+            break
+    if start is None:
+        return None
+    # Read CONSECUTIVE entry lines, not a brace-balanced span. The map's entries
+    # contain no braces, so counting them leaves depth at 0 and a balanced scan
+    # stops after the FIRST key — which compares one trivial key across three
+    # files and passes no matter how far they have drifted. Verified: that bug
+    # shipped in this check's first draft and silently passed an injected drift.
+    out = {}
+    for line in lines[start:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = ENTRY.match(stripped)
+        if not m:
+            break  # the run of entries has ended
+        out[m.group(1)] = m.group(2)
+    return out or None
+
+
+maps = {}
+bad = False
+for path, label in TARGETS:
+    got = extract(path)
+    if not got:
+        print("  FAIL %-44s no stopReason map found" % label)
+        bad = True
+        continue
+    maps[label] = got
+    print("    ok   %-44s %d reasons" % (label, len(got)))
+
+if len(maps) > 1:
+    ref_label = next(iter(maps))
+    ref = maps[ref_label]
+    for label, got in maps.items():
+        if label == ref_label:
+            continue
+        only_ref = sorted(set(ref) - set(got))
+        only_got = sorted(set(got) - set(ref))
+        drift = sorted(k for k in set(ref) & set(got) if ref[k] != got[k])
+        if only_ref or only_got or drift:
+            bad = True
+            print("  FAIL %s differs from %s:" % (label, ref_label))
+            for k in only_ref:
+                print("      missing in %s: %s" % (label, k))
+            for k in only_got:
+                print("      not in %s: %s" % (k, ref_label))
+            for k in drift:
+                print("      wording differs for %s:" % k)
+                print("        %s: %s" % (ref_label, ref[k]))
+                print("        %s: %s" % (label, got[k]))
+        else:
+            print("    ok   %-44s identical to %s" % (label, ref_label))
+if bad:
+    sys.exit(1)
+PY
+)
+	if [ $? -eq 0 ]; then
+		pass "stopReason maps are byte-identical across all three surfaces"
+	else
+		printf '%s\n' "$stopreason_out"
+		fail "stopReason maps have drifted; a surface will describe one failure differently"
+		printf '%s\n' "$stopreason_out" | grep -E '^\s+ok' || true
+	fi
+
 # --- 5. JavaScript syntax -------------------------------------------------
 printf '\n-- JavaScript syntax (node --check)\n'
 for f in $BUILD_FILES; do
