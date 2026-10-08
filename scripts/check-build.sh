@@ -612,6 +612,93 @@ PY
 		fail "an extracted part shadows a global name; this fails SILENTLY at runtime"
 	fi
 
+# --- 4d. every extracted part is registered, built, and probed ---------------
+# Two ways a part can exist on disk and still be wrong:
+#
+#   P1  it is not listed in BUILD_FILES, so it is never syntax-checked and a
+#       parse error in it ships silently. The manifest/importScripts check
+#       proves the path EXISTS; nothing proved it is BUILT.
+#   P3  the worker's MISSING_PARTS probe names a symbol the part does not
+#       actually export, so the probe passes while the real export is missing —
+#       a health check that reports healthy on a broken part. That is the same
+#       failure shape as the parity-check bug, one level up.
+printf '\n-- extracted parts: registered in BUILD_FILES and probed honestly\n'
+partsreg_out=$(python3 - "$BUILD_FILES" <<'PY' 2>&1
+import glob, re, sys
+
+build_files = set(sys.argv[1].split())
+parts = sorted(glob.glob("background/parts/*.js"))
+bad = False
+
+if not parts:
+    print("    ok   no parts on disk yet")
+    sys.exit(0)
+
+# P1: registered for building.
+for p in parts:
+    if p in build_files:
+        print("    ok   %-44s in BUILD_FILES" % p)
+    else:
+        bad = True
+        print("  FAIL %-44s NOT in BUILD_FILES (never syntax-checked)" % p)
+
+# P3: every MISSING_PARTS probe names a symbol its part really exports.
+Q = chr(39)
+try:
+    worker = open("background/background.js", encoding="utf-8").read()
+except OSError as exc:
+    print("  cannot read worker: %s" % exc)
+    sys.exit(1)
+
+probes = re.findall(r"MISSING_PARTS\.push\(" + Q + r"([^" + Q + r"]+)" + Q + r"\)", worker)
+if not probes:
+    print("    ok   worker declares no MISSING_PARTS probes")
+for raw in probes:
+    m = re.match(r"(.+?)\s*\((.+?)\)", raw)
+    if not m:
+        print("  FAIL unparseable MISSING_PARTS probe: %s" % raw)
+        bad = True
+        continue
+    path, symbol = m.group(1).strip(), m.group(2).strip()
+    if path not in parts:
+        print("  FAIL probe names %s, which is not a part on disk" % path)
+        bad = True
+        continue
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError as exc:
+        print("  cannot read %s: %s" % (path, exc))
+        sys.exit(1)
+    # An export block is `globalThis.SMU<Name> = { a, b, c };` (shorthand) or
+    # `{ a: 1, b: 2 }`. Split on commas rather than scanning for delimiters: the
+    # outer match already consumed the opening brace, so the FIRST exported name
+    # has no preceding `{` or `,` and a delimiter-scan silently drops exactly
+    # the symbol most likely to be probed. It did — the check reported a false
+    # positive on the one part that exports the probed symbol.
+    exported = set()
+    for block in re.findall(r"globalThis\.SMU\w*\s*=\s*\{(.*?)\}\s*;", text, re.S):
+        for item in block.split(","):
+            name = item.split(":")[0].strip()
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", name):
+                exported.add(name)
+    if symbol in exported:
+        print("    ok   %-44s probe names exported %s" % (path, symbol))
+    else:
+        bad = True
+        print("  FAIL %-44s probe names %s, which it does NOT export" % (path, symbol))
+        print("        probe reports healthy on a part missing the symbol")
+
+sys.exit(1 if bad else 0)
+PY
+)
+	if [ $? -eq 0 ]; then
+		pass "every extracted part is built and its MISSING_PARTS probe is honest"
+	else
+		printf '%s\n' "$partsreg_out" | grep -vE '^\s+ok' || true
+		printf '%s\n' "$partsreg_out" | grep -E '^\s+ok' || true
+		fail "an extracted part is unregistered, or its health probe names a symbol it does not export"
+	fi
+
 # --- 5. JavaScript syntax -------------------------------------------------
 printf '\n-- JavaScript syntax (node --check)\n'
 for f in $BUILD_FILES; do
