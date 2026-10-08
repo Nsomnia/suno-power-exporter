@@ -546,7 +546,12 @@ body {
 
 <div id="sp-truncated" class="sp-banner" role="alert" hidden>
   <span class="sp-banner-title">Library incomplete</span>
-  <span id="sp-truncated-text">The last sync hit its page cap, so some clips are missing from this index.</span>
+  <!-- Placeholder only, and deliberately NOT a claim: `paintBanner()` writes this
+       node from the worker's own `completed` / `stopReason` / `expectedTotal`
+       before it is ever shown. The previous text asserted a page cap here, which is
+       false for the failure that matters most — a request that 500'd on page 21 —
+       and could flash for a moment before the real reason replaced it. -->
+  <span id="sp-truncated-text">The last sync stopped early, so some clips are missing from this index.</span>
 </div>
 
 <div id="sp-error" class="sp-alert" role="alert" hidden></div>

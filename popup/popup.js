@@ -57,6 +57,31 @@
  *    described three different ways across the three surfaces is a support
  *    question, so the wording is duplicated deliberately and must be changed in
  *    all three together.
+ * L. "IS A SYNC RUNNING?" HAS EXACTLY ONE ANSWER, AND IT IS THE WORKER'S.
+ *    `SYNC_STATUS` answers it from the live controller; the `SYNC_STARTED` /
+ *    `SYNC_CANCEL_REQUESTED` / `SYNC_CANCELLED` pushes carry the same three
+ *    booleans. Every one of them goes through `applySyncAuthority()`, which
+ *    OVERWRITES local state on an explicit boolean `running` and ignores anything
+ *    without one. This used not to hold: `syncRunning` was assigned in five places
+ *    (`refreshSyncStatus`, three push handlers, the `SYNC_START` reply and
+ *    `GET_BOOT`) and each had its own idea of which outranked which, which is how
+ *    the popup could show "Syncing" while the dock said idle and the panel still
+ *    offered a live Sync — a disagreement that was also exploitable, because a
+ *    surface that could not SEE the worker's in-flight flag would send `SYNC_START`
+ *    and then render a confusing failure. `SYNC_VIEW_WORD` is the matching shared
+ *    table for the wording, duplicated alongside `SYNC_REASON_PHRASE`.
+ * M. AN UNANSWERED QUESTION IS NOT AN ANSWER. `refreshToken()` used to set
+ *    `state.token = { hasToken: false }` when `GET_TOKEN_STATUS` REJECTED, and
+ *    `renderAuth` drew "Not signed in. Open suno.com in a tab and sign in" from it.
+ *    An MV3 worker torn down mid-request rejects that call, so a signed-in user was
+ *    told to go and sign in, at the same moment the tiles fell back to "—" and the
+ *    clips note to "no local library yet". Nothing in that triad had been verified,
+ *    and the only trace was a settings-gated `dbg()`. The catch now leaves `token`
+ *    null, which is its own state with its own wording and its own action — retry
+ *    the READ, do not open suno.com — and it says so in the activity log so the
+ *    failure is visible without the debug setting. `bootAttempted` does the same job
+ *    for `GET_BOOT`, and `state.tokenReadFailed`/`tokenStatusKnown` for the dock's
+ *    "worker: no token" line.
  * ===========================================================================
  */
 
@@ -135,6 +160,41 @@
      */
     syncOrphaned: false,
     /**
+     * Whether THIS popup instance has read an authoritative `SYNC_STATUS` reply.
+     *
+     * The Sync control is disabled until it has. That closes the window the user
+     * reported: a popup opened while a crawl started from the dock or the side
+     * panel is already in flight paints an enabled "Sync library" and nothing has
+     * pushed yet, so "not running" here really meant "I have not been told" — and
+     * one click starts a second crawl. `syncRunning` is false by default, so a
+     * boolean alone cannot tell "idle" apart from "unread"; this flag can.
+     */
+    syncStatusKnown: false,
+    /**
+     * A cancel was signalled and the worker's bounded wait expired without it
+     * reporting the run finished.
+     *
+     * Distinct from `syncCancelling`, which means "the worker is still unwinding
+     * and something here is watching it": at this point nothing is watching, so
+     * the popup stops claiming a crawl is in flight and says plainly that the stop
+     * was never confirmed. Without it the progress bar stayed on its indeterminate
+     * "stopping" animation with nothing left that could ever end it.
+     */
+    syncStopUnconfirmed: false,
+    /**
+     * The last terminal state this popup saw was a stop the user asked for, so the
+     * shared wording reads "Sync stopped" rather than the generic "Sync idle".
+     * Cleared as soon as a crawl is authoritative-active again.
+     */
+    syncStopped: false,
+    /**
+     * The last `syncView()` announced into the activity log. The log is a
+     * `role="status"` live region (`#sm-log`, `aria-live="polite"`,
+     * `aria-relevant="additions"`), so one row per TRANSITION is what makes the
+     * state audible; without this guard every 2s poll would append a row.
+     */
+    lastSyncView: '',
+    /**
      * Which phase of the crawl is running, plus that phase's own counters.
      *
      * THE SINGLE SOURCE OF TRUTH IS THE WORKER, NOT THIS OBJECT. Three surfaces
@@ -168,7 +228,25 @@
     summaryIsBad: false,
     /** '' | 'warn' | 'bad' — drives the summary border and the toast tint. */
     summaryKind: '',
+    /** Whether `GET_BOOT` answered. `false` covers both "not asked yet" and
+     *  "asked and did not answer", so `bootAttempted` tells the two apart. */
     lastBootOk: false,
+    /**
+     * Whether a `GET_BOOT` read has been made yet.
+     *
+     * Needed because `boot()` paints synchronously BEFORE the first read lands, and
+     * without this flag that opening paint would claim the local index could not be
+     * read — a different wrong answer from "no library yet", in the other
+     * direction. "Not asked yet" and "asked, no answer" are different facts.
+     */
+    bootAttempted: false,
+    /**
+     * Whether a `GET_TOKEN_STATUS` read has FAILED, as opposed to never having been
+     * made. `token` is null for both, and the two need different words: "Checking
+     * session…" while the read is still in flight, and "could not read the session"
+     * only once a worker has actually failed to answer.
+     */
+    tokenReadFailed: false,
     busy: false,
     debug: false
   };
@@ -196,17 +274,62 @@
   function noop() {}
 
   /**
-   * How long a cancel request waits for the worker to report the run finished
-   * before it gives up and shows the authoritative state.
+   * How long a cancel request watches the worker for the run to end before it
+   * gives up and reaches a terminal state anyway.
    *
    * Aborting is cooperative — the crawl observes the signal only where it
    * awaits — and a rate-limit backoff can hold a page open for tens of seconds.
-   * Twenty seconds is long enough for a normal unwind and short enough that the
-   * popup never sits on "Cancelling…" with no way out.
+   * Twenty seconds is long enough for a normal unwind.
+   *
+   * It is NOT the end of the story, which is the fix: on expiry the popup stops
+   * claiming a crawl is running and shows the "Stop requested" state, so no
+   * animation is ever left running with no terminal condition behind it. Before
+   * that, expiry left `syncRunning` true with `syncCancelling` cleared and the
+   * indeterminate bar still animating — a spinner with nothing left able to stop
+   * it. Same bounds as `content/content.js` and `side_panel.js` use.
    */
   var SYNC_CANCEL_WAIT_MS = 20000;
   var SYNC_POLL_MS = 2000;
   var syncPollTimer = 0;
+
+  /**
+   * The shared sync vocabulary. Every surface shows the crawl in these words, and
+   * each word says what is happening AND what happens next.
+   *
+   * Duplicated byte-for-byte in `side_panel.js` and `content/content.js` for the
+   * same reason `SYNC_REASON_PHRASE` is (header note K): a content script and an
+   * extension page share no module graph. They must change together.
+   */
+  var SYNC_VIEW_WORD = {
+    checking: 'Checking whether a sync is running',
+    active: 'Sync active',
+    stopping: 'Sync stopping',
+    stopped: 'Sync stopped',
+    interrupted: 'Sync interrupted',
+    unconfirmed: 'Stop requested',
+    idle: 'Sync idle'
+  };
+
+  var SYNC_VIEW_NOTE = {
+    checking: 'Checking with the worker whether a library sync is running. Sync stays unavailable until it answers.',
+    active: 'A library sync is running. It indexes your Suno feed and downloads nothing.',
+    stopping: 'Stopping the library sync. The worker checks for the stop between pages, so it ends after the current page finishes.',
+    stopped: 'The library sync stopped. Nothing is broken and the clips already indexed are kept.',
+    interrupted: 'The extension worker was stopped mid-crawl. Indexed clips are kept.',
+    unconfirmed: 'The worker has not confirmed that the sync stopped. It checks for the stop between pages, so it ends after the current page finishes.',
+    idle: 'No library sync is running.'
+  };
+
+  /**
+   * What this surface calls its two sync controls.
+   *
+   * The shared sentences above deliberately name NO control, because the three
+   * surfaces do not label theirs identically (this popup says "Sync library", the
+   * panel and the dock say "Sync") and a shared sentence that names one of them
+   * would be wrong on the other two. Each surface appends its own names where it
+   * renders its own buttons.
+   */
+  var SYNC_CONTROL = { start: 'Sync library', stop: 'Stop' };
 
   /**
    * @param {number} ms
@@ -241,29 +364,188 @@
     startSyncPoll();
   }
 
+  /**
+   * Which of the seven shared states the popup is in.
+   *
+   * ONE function, because the defect being fixed is a surface answering this
+   * question from several places: `syncRunning` was set by `refreshSyncStatus`, by
+   * three push handlers, by the `SYNC_START` reply and by `GET_BOOT`, and each
+   * had its own idea of which of those outranked which. Everything renders from
+   * this, so the button, the progress line, the tile and the announcement cannot
+   * describe the same crawl differently.
+   *
+   * @returns {'checking'|'active'|'stopping'|'stopped'|'interrupted'|'unconfirmed'|'idle'}
+   */
+  function syncView() {
+    if (state.syncStopUnconfirmed) return 'unconfirmed';
+    if (state.syncOrphaned) return 'interrupted';
+    if (state.syncRunning) return state.syncCancelling ? 'stopping' : 'active';
+    if (state.syncStopped) return 'stopped';
+    if (!state.syncStatusKnown) return 'checking';
+    return 'idle';
+  }
+
+  /**
+   * THE single reader of the worker's authoritative crawl state, in this file.
+   *
+   * `SYNC_STATUS` answers `{ok, running, cancelRequested, cancelling,
+   * interrupted, cursor, …}`, and the `SYNC_STARTED` / `SYNC_CANCEL_REQUESTED` /
+   * `SYNC_CANCELLED` pushes carry those same three booleans, so all four go
+   * through here. The rule is the whole fix:
+   *
+   *   - a reply with an explicit boolean `running` OVERWRITES local state, in
+   *     both directions;
+   *   - anything WITHOUT one is not evidence about whether a crawl is in flight
+   *     and leaves `syncRunning` alone. `SYNC_PROGRESS` is the case that matters:
+   *     it says `state:'running'` and nothing else, and taking that as proof is how
+   *     a surface could claim a crawl while another surface started one.
+   *
+   * `syncStatusKnown` is set only here, so "I have not been told" is always
+   * distinguishable from "the worker says nothing is running" — and only the
+   * latter may enable the Sync control.
+   *
+   * @param {unknown} reply any reply or push that may carry `running`
+   * @returns {boolean} true when the reply was authoritative and was applied
+   */
+  function applySyncAuthority(reply) {
+    if (!reply || typeof reply !== 'object' || typeof reply.running !== 'boolean') return false;
+    state.syncStatusKnown = true;
+    state.syncRunning = reply.running;
+    state.syncCancelling = reply.running === true
+      && (reply.cancelRequested === true || reply.cancelling === true);
+    if (reply.interrupted === true) {
+      // A stored cursor with no controller behind it: an MV3 eviction, not a
+      // crawl. `running` is the controller test, so the two cannot both be true.
+      state.syncOrphaned = true;
+      state.syncRunning = false;
+      state.syncCancelling = false;
+    } else if (reply.running === true) {
+      state.syncOrphaned = false;
+    }
+    if (reply.running === true) {
+      // A confirmed live crawl supersedes anything the popup was still showing
+      // about the previous one, including a stop it never saw confirmed.
+      state.syncStopUnconfirmed = false;
+      state.syncStopped = false;
+    }
+    /* Only the SYNC line of the progress panel follows the crawl. `activity` also
+     * carries 'download', and a `SYNC_STATUS` poll must not erase a running batch's
+     * progress just because it landed — the previous version never wrote
+     * `activity` here at all, and a blanket assignment would have been a new
+     * cross-surface bug in the other direction. */
+    if (state.activity === 'sync' || state.activity === 'idle') {
+      state.activity = state.syncRunning ? 'sync' : 'idle';
+    }
+    return true;
+  }
+
+  /**
+   * Put one crawl-state line into the activity log, and only on a TRANSITION.
+   *
+   * The log is a `role="status"` live region with `aria-relevant="additions"`, so
+   * appending the row is what makes the change audible — a state change that only
+   * moved pixels is invisible to a screen reader, which is the half of the
+   * disagreement the user could not act on.
+   */
+  function announceSyncView() {
+    var view = syncView();
+    // `checking` is the absence of an answer, not an answer: the failure path that
+    // produced it says so itself, and a poll that simply has not run yet must not
+    // append a row every two seconds.
+    if (view === 'checking') return;
+    if (view === state.lastSyncView) return;
+    state.lastSyncView = view;
+    addLog(SYNC_VIEW_NOTE[view], view === 'idle' || view === 'stopped' ? 'info' : 'warn');
+  }
+
+  /**
+   * The one read that decides whether a crawl is in flight.
+   *
+   * Returns whether it got an authoritative answer, because the caller has to be
+   * able to tell "the worker says nothing is running" (the only thing that may
+   * enable Sync) apart from "the worker could not be asked".
+   *
+   * @returns {Promise<boolean>}
+   */
   async function refreshSyncStatus() {
+    var reply = null;
     try {
-      var reply = await send('SYNC_STATUS', {});
-      if (reply && reply.cancelling === true) {
-        state.syncRunning = true;
-        state.syncCancelling = true;
-      }
-      if (reply && reply.running === true) {
-        state.syncRunning = true;
-        state.syncCancelling = reply.cancelling === true;
-      }
-      if (reply && reply.running === false && state.syncRunning === true) {
-        state.syncRunning = false;
-        state.syncCancelling = false;
+      reply = await send('SYNC_STATUS', {});
+    } catch (err) {
+      // `syncStatusKnown` is deliberately left alone. An unanswered question is not
+      // an answer, and a surface that could not ask must not offer to start a
+      // crawl: that is the duplicate-start hole, and it opens the moment a status
+      // read fails. `onSurfaceFocus` asks again, so the control is not stranded.
+      stopSyncPoll();
+      dbg('SYNC_STATUS failed:', textOf(err));
+      addLog('Could not read sync status: ' + textOf(err), 'warn');
+      renderButtons();
+      return false;
+    }
+    var before = syncView();
+    applySyncAuthority(reply);
+    announceSyncView(before);
+    if (!state.syncRunning) {
+      stopSyncPoll();
+      if (before === 'active' || before === 'stopping') {
+        // The completeness contract, read from the reply that first reported the
+        // crawl as ended, and ONLY there. A mid-crawl poll's cursor is sparse and
+        // `applySyncReply` writes `stopReason` / `expectedTotal` / `missing`
+        // unconditionally, so folding every poll in would blank the previous run's
+        // counts while the next one was still walking. The verdict still has to
+        // come from the worker's own `completed` field — nothing here decides it.
         applySyncReply(reply, {});
         addLog('Sync ended. state=' + String(reply.state || '') + ' completed=' + String(reply.completed || '') + ' stopReason=' + String(reply.stopReason || ''), 'info');
-        renderAll();
+        // The cursor is where the final verdict is recorded, and a crawl that ended
+        // between two pushes has only been reported by this reply.
+        void refreshBootSafe();
       }
-      scheduleSyncPoll(!!(reply && reply.running));
-    } catch (err) {
-      stopSyncPoll();
-      addLog('Could not read sync status: ' + textOf(err), 'warn');
+      renderAll();
+    } else {
+      scheduleSyncPoll(true);
+      renderProgress();
+      renderSyncTile();
+      renderButtons();
     }
+    return true;
+  }
+
+  /**
+   * Ask the worker whether a crawl is in flight BEFORE starting one.
+   *
+   * THE guard that actually closes the duplicate-start window. The button is
+   * disabled while `syncRunning`, but a crawl can begin between the paint and the
+   * click — from another surface, or from a surface this popup has not heard from.
+   * Re-reading here means the press is decided on the worker's own answer and not
+   * on a local guess, and the worker still refuses a genuine overlap with
+   * `code:'sync_running'`, which is handled below as the same fact rather than as
+   * a failure.
+   *
+   * @returns {Promise<{ok: boolean, reason: string}>} `reason` is the plain sentence
+   *   to show when `ok` is false.
+   */
+  async function guardSyncStart() {
+    var known = await refreshSyncStatus();
+    if (!known) {
+      return {
+        ok: false,
+        reason: 'Could not ask the worker whether a library sync is already running, so nothing was started. Open the popup again to retry.'
+      };
+    }
+    if (state.syncRunning) {
+      return {
+        ok: false,
+        reason: state.syncCancelling
+          ? 'A library sync is already stopping. Press ' + SYNC_CONTROL.stop + ' again in a moment, or Sync library once it reports as stopped.'
+          : 'A library sync is already running. Press ' + SYNC_CONTROL.stop + ' to end it, or wait for it to finish.'
+      };
+    }
+    /* NOT refused for an interrupted record. That is a stored cursor with no
+     * controller behind it, not a live crawl, and the worker starts a fresh walk over
+     * it without complaint — refusing here would be blocking something the extension
+     * can do. The popup's own "Clear stale sync" affordance is left in place for
+     * anyone who prefers it. */
+    return { ok: true, reason: '' };
   }
 
   /**
@@ -972,30 +1254,68 @@
 
   /* ------------------------------------------------------------ rendering */
 
+  /**
+   * The session chip: three real states and one that is NOT a state at all.
+   *
+   * `token` is `null` when the worker did not answer. That is UNKNOWN, and it is
+   * not the same fact as `hasToken:false`. This function used to receive
+   * `{hasToken:false}` for both, because `refreshToken()` fabricated that object
+   * when `GET_TOKEN_STATUS` rejected — so an MV3 worker being torn down mid-request
+   * rendered "Not signed in. Open suno.com in a tab and sign in", the tiles at "—"
+   * and the clips note at "no local library yet". Three confident claims, none of
+   * them verified, and one of them an instruction to go sign in when the user was
+   * already signed in.
+   *
+   * So the unread case gets its own branch: it says what happened and what to try,
+   * never what the session is. Both `is-ok` and `is-bad` are cleared, because
+   * neither is true. And while the read is still IN FLIGHT the wording is
+   * "Checking session…", which is the truth — `boot()` paints before the first read
+   * lands, so claiming a failure that has not happened yet would just be the same
+   * bug one moment earlier.
+   *
+   * @param {object|null|undefined} token the worker's token status, or null
+   */
   function renderAuth(token) {
-    var info = token && typeof token === 'object' ? token : {};
     els.auth.classList.remove('is-ok', 'is-bad');
 
+    if (!token || typeof token !== 'object') {
+      // No class: `.sm-chip`'s own default is the neutral style, which is the
+      // honest one — the session is unknown, and neither green nor red.
+      if (!state.tokenReadFailed) {
+        els.auth.textContent = 'Checking session…';
+        els.auth.setAttribute('aria-label', 'Checking the session status.');
+        return;
+      }
+      els.auth.textContent = 'Could not read the session from the extension worker, so this is unknown. '
+        + 'Click here to try again.';
+      els.auth.setAttribute('aria-label', 'Session status unknown: the extension worker did not answer. Activate to try reading it again.');
+      return;
+    }
+    var info = token;
     if (info.badToken === true) {
       els.auth.classList.add('is-bad');
       els.auth.textContent = 'Suno rejected the saved session token. Sign out and back in on suno.com, then retry. No retry will help until you do.';
+      els.auth.setAttribute('aria-label', 'Suno rejected the saved session token. Activate to open suno.com and sign in again.');
       return;
     }
     if (info.hasToken !== true) {
       els.auth.classList.add('is-bad');
       els.auth.textContent = 'Not signed in. Open suno.com in a tab and sign in — click here to open it.';
+      els.auth.setAttribute('aria-label', 'Not signed in. Activate to open suno.com and sign in.');
       return;
     }
     var seconds = Number(info.secondsRemaining);
     if (isFinite(seconds) && seconds <= 0) {
       els.auth.classList.add('is-bad');
       els.auth.textContent = 'Session expired. Sign in again on suno.com — click here to open it.';
+      els.auth.setAttribute('aria-label', 'Session expired. Activate to open suno.com and sign in again.');
       return;
     }
     els.auth.classList.add('is-ok');
     els.auth.textContent = isFinite(seconds)
       ? 'Signed in. Session token valid for about ' + formatDuration(seconds * 1000) + ' more.'
       : 'Signed in. Session token present.';
+    els.auth.setAttribute('aria-label', 'Signed in. Activate to open suno.com.');
   }
 
   function renderLibraryTile() {
@@ -1006,7 +1326,14 @@
 
     els.tileClips.textContent = typeof total === 'number' ? String(total) : '—';
     if (typeof total !== 'number') {
-      els.tileClipsNote.textContent = 'no local library yet';
+      /* "no local library yet" is a claim about the INDEX, and when the boot read
+       * failed the popup knows nothing about the index — it knows it could not ask.
+       * Saying the library does not exist is the other half of the triad this
+       * replaces: "—", "no library" and "not signed in" all at once, none of them
+       * verified. */
+      els.tileClipsNote.textContent = (state.bootAttempted && !state.lastBootOk)
+        ? 'could not read the local index'
+        : 'no local library yet';
     } else if (total === 0) {
       els.tileClipsNote.textContent = 'run a sync to build the index';
     } else {
@@ -1067,7 +1394,7 @@
     }
 
     if (state.syncOrphaned) {
-      setSyncValue('Interrupted', 'bad', 'The extension worker was stopped mid-crawl. Indexed clips are kept — press Sync to resume.');
+      setSyncValue('Interrupted', 'bad', SYNC_VIEW_NOTE.interrupted);
       els.tileSyncNote.textContent = state.syncPagesDone > 0
         ? group(state.syncPagesDone) + (state.syncPagesDone === 1 ? ' page crawled' : ' pages crawled')
           + (state.syncSeen > 0 ? ' · ' + group(state.syncSeen) + ' indexed' : '')
@@ -1075,7 +1402,9 @@
       return;
     }
     if (state.syncRunning) {
-      setSyncValue(state.syncCancelling ? 'Stopping' : 'Syncing', '', 'Crawling your Suno feed. Nothing is downloaded.');
+      // Same two words the progress line and the button use, for one crawl.
+      setSyncValue(state.syncCancelling ? 'Stopping' : 'Syncing', '',
+        state.syncCancelling ? SYNC_VIEW_NOTE.stopping : SYNC_VIEW_NOTE.active);
       // The page cap is PER WORKSPACE and this counter is the RUN total, so
       // "73 of 200 pages" implied a bound the run is not held to. Report the
       // crawl count and name the cap for what it is.
@@ -1226,7 +1555,12 @@
     var fill = els.progressFill;
 
     if (state.activity === 'sync') {
-      label = state.syncCancelling ? 'Stopping the library sync' : 'Syncing library';
+      // The SHARED state word, so the popup, the dock and the panel say the same
+      // thing about the same crawl. It used to be this file's own "Syncing
+      // library" / "Stopping the library sync" while the dock said "running" and
+      // the panel said "Syncing", which is part of why two of them could claim
+      // opposite things about one crawl.
+      label = SYNC_VIEW_WORD[syncView()] || SYNC_VIEW_WORD.idle;
       // `syncMaxPages` is a PER-WORKSPACE cap, while `syncPagesDone` is the
       // run total across every workspace. Pairing them ("page 73 of 200") implied
       // a bound that does not exist — a 20-workspace library can legitimately
@@ -1263,7 +1597,9 @@
         + (state.syncCancelling ? ' · waiting for the current page to finish' : '');
       if (state.syncCancelling) {
         // A cancelling run is not making progress; a live percentage would keep
-        // implying otherwise until the worker actually unwinds.
+        // implying otherwise until the worker actually unwinds. This animation is
+        // allowed to run because `awaitSyncSettled` is watching the worker and
+        // forces a terminal state when its bounded wait runs out.
         els.progressPct.textContent = 'stopping';
         els.progressFill.style.width = '100%';
         fill.classList.add('is-indeterminate');
@@ -1275,6 +1611,20 @@
         els.progressPct.textContent = percent + '%';
         els.progressFill.style.width = percent + '%';
       }
+    } else if (syncView() === 'unconfirmed') {
+      /* TERMINAL, AND DELIBERATELY NOT ANIMATED. A cancel was signalled, the
+       * bounded wait expired and the worker never said the crawl ended. Claiming
+       * "still running" here is how the popup got a permanent indeterminate
+       * "stopping" bar; claiming "stopped" would be a claim the worker has not
+       * made. So it says the one thing that is true — the stop was requested and
+       * unconfirmed — and offers the next step, which is that Sync library
+       * re-checks with the worker before it starts anything. */
+      label = SYNC_VIEW_WORD.unconfirmed;
+      detail = 'The worker has not confirmed the sync stopped. It checks between pages, so it ends after the current page finishes. '
+        + 'Sync library reads the worker before it starts anything.';
+      els.progressPct.textContent = '—';
+      els.progressFill.style.width = '0%';
+      fill.classList.remove('is-done', 'is-indeterminate');
     } else if (state.activity === 'download') {
       label = 'Downloading';
       var current = state.downloadCurrentTitle ? ' · ' + state.downloadCurrentTitle : '';
@@ -1291,9 +1641,19 @@
         if (percent >= 100) fill.classList.add('is-done');
         else fill.classList.remove('is-done');
       }
-    } else {
-      label = 'Idle';
-      detail = ' ';
+} else {
+      /* Nothing in flight. Every settled crawl state is named with the shared word
+       * and its "what happens next" sentence, so this line agrees with the dock and
+       * the panel about an interrupted or just-stopped crawl instead of showing the
+       * flat "Idle" they contradicted. */
+      var settled = syncView();
+      if (settled === 'idle') {
+        label = 'Idle';
+        detail = ' ';
+      } else {
+        label = SYNC_VIEW_WORD[settled] || 'Idle';
+        detail = SYNC_VIEW_NOTE[settled] || ' ';
+      }
       els.progressPct.textContent = '—';
       fill.style.width = '0%';
       fill.classList.remove('is-done', 'is-indeterminate');
@@ -1391,10 +1751,50 @@
       );
     }
 
-    els.btnSync.disabled = state.busy || state.syncRunning;
-    els.btnSync.title = libraryEmpty()
-      ? 'Your library is empty — this will be a first sync of the whole feed.'
-      : 'Resume or extend the crawl of your Suno feed. Nothing is downloaded.';
+    /* NEVER OFFER A START WHILE SOMETHING IS RUNNING, AND ALWAYS SAY WHY.
+     *
+     * Three separate reasons can disable this button and they are not
+     * interchangeable, so each one is spelled out on the control itself — a
+     * disabled button with no explanation is indistinguishable from a broken one:
+     *
+     *   `busy`               another action in this popup owns the worker
+     *   `syncRunning`        a crawl is in flight, quite possibly started from the
+     *                        dock or the side panel. THIS is the reported defect:
+     *                        the popup showed "Syncing" while a sibling surface
+     *                        still offered a live "Sync library", and one click
+     *                        there started a second crawl.
+     *   `!syncStatusKnown`   this popup has not yet been told anything. Offering a
+     *                        start on "I have not been told" is exactly what let a
+     *                        freshly opened popup start a duplicate, so the window
+     *                        before the first `SYNC_STATUS` reply keeps it disabled.
+     */
+    var view = syncView();
+    els.btnSync.disabled = state.busy || state.syncRunning || !state.syncStatusKnown;
+    els.btnSync.textContent = (view === 'active' || view === 'stopping')
+      ? SYNC_VIEW_WORD[view]
+      : 'Sync library';
+    if (state.busy) {
+      els.btnSync.title = 'Another action is using the extension right now.';
+    } else if (state.syncRunning) {
+      els.btnSync.title = SYNC_VIEW_NOTE.active + ' It may have been started from the dock or the side panel. '
+        + 'Press ' + SYNC_CONTROL.stop + ' to end it, or wait for it to finish.';
+    } else if (!state.syncStatusKnown) {
+      els.btnSync.title = 'Asking the worker whether a library sync is already running. '
+        + 'Sync stays unavailable until it answers, so a second crawl cannot be started from here.';
+    } else if (state.syncOrphaned) {
+      els.btnSync.title = SYNC_VIEW_NOTE.interrupted + ' Press ' + SYNC_CONTROL.start + ' to resume.';
+    } else {
+      els.btnSync.title = libraryEmpty()
+        ? 'Your library is empty — this will be a first sync of the whole feed.'
+        : 'Resume or extend the crawl of your Suno feed. Nothing is downloaded.';
+    }
+    /* The button's accessible NAME is its `aria-label`, not its text (popup.html
+     * gives it a static one), so a change of state has to be written here or a
+     * screen reader still reads "Sync the Suno library into the local index" over a
+     * disabled control. Same sentence as the title: one reason, one wording. */
+    els.btnSync.setAttribute('aria-label', els.btnSync.disabled
+      ? ('Sync library, unavailable: ' + els.btnSync.title)
+      : ('Sync library. ' + els.btnSync.title));
     els.btnDownload.disabled = state.busy || state.downloadRunning || libraryEmpty();
     /* An orphaned cursor also needs clearing, so the button stays enabled for it —
      * otherwise the user is shown a frozen "Syncing" with no way to clear it,
@@ -1403,6 +1803,11 @@
     els.btnCancel.textContent = state.downloadRunning
       ? 'Stop batch'
       : (state.syncOrphaned ? 'Clear stale sync' : (state.syncRunning ? 'Stop sync' : 'Cancel'));
+    els.btnCancel.title = state.syncRunning && state.syncCancelling
+      ? SYNC_VIEW_NOTE.stopping
+      : (state.syncOrphaned
+        ? 'Clear the interrupted crawl record. Indexed clips are kept.'
+        : 'Stop the running library sync or download batch.');
     els.btnPanel.disabled = state.busy;
     if (refreshBtn) refreshBtn.disabled = state.busy;
     if (outcomeBtn) outcomeBtn.disabled = state.busy;
@@ -1589,6 +1994,26 @@
     var settings = state.settings || {};
     var maxPages = clampInt(settings.syncMaxPages, 1, 2000, 200);
 
+    /* REFUSE BEFORE THE CONFIRMATION, NOT AFTER IT. This is the cheap local half of
+     * the guard: the authoritative re-read lives in `startSync`, but asking someone
+     * to agree to a multi-minute first crawl and only then saying "a sync is already
+     * running" is a question they should never have been asked. */
+    if (!state.syncStatusKnown) {
+      var unread = 'Asking the worker whether a library sync is already running. Try again in a moment.';
+      addLog('Sync not started: ' + unread, 'warn');
+      toast(unread, 'warn');
+      void refreshSyncStatus().catch(noop);
+      return;
+    }
+    if (state.syncRunning) {
+      var busyNote = state.syncCancelling
+        ? 'A library sync is already stopping. It ends after the current page finishes.'
+        : 'A library sync is already running. Press Stop to end it, or wait for it to finish.';
+      addLog('Sync not started: ' + busyNote, 'warn');
+      toast(busyNote, 'warn');
+      return;
+    }
+
     if (libraryEmpty()) {
       // The first crawl is the longest thing this extension does, and it walks
       // the feed from page 1. Say so before starting it rather than appearing to
@@ -1611,16 +2036,40 @@
     withBusy(async function () {
       var settings = state.settings || {};
       try {
+        /* ASK THE WORKER FIRST, EVERY TIME. The button is disabled while a crawl is
+         * running, but that only knows about what this popup has been told: a crawl
+         * can begin from the dock or the side panel between this paint and this
+         * click. One `SYNC_STATUS` read before `SYNC_START` decides the press on the
+         * worker's own answer rather than on a local guess, and refuses in words
+         * when the answer is "yes, one is running". This is the guard that stops a
+         * duplicate crawl; the worker's own `sync_running` refusal is the backstop
+         * below it, not the first line of defence. */
+        var guard = await guardSyncStart();
+        if (!guard.ok) {
+          addLog('Sync not started: ' + guard.reason, 'warn');
+          toast(guard.reason, 'warn');
+          renderAll();
+          return;
+        }
         var reply = await send('SYNC_START', {
           force: false,
           dislikedMode: settings.dislikedMode,
           maxPages: settings.syncMaxPages
         });
         state.activity = 'sync';
-        state.syncRunning = true;
         state.syncPagesDone = 0;
         state.syncSeen = 0;
         state.syncEtaMs = 0;
+        /* AN ACCEPTED `SYNC_START` IS ITSELF AUTHORITATIVE, and it goes through
+         * the one writer rather than assigning `syncRunning` here. The worker only
+         * answers `ok:true` after attaching a controller — a genuine overlap is
+         * refused with `code:'sync_running'` below — and it broadcasts
+         * `SYNC_STARTED` carrying `running:true` as it does so. Feeding that shape
+         * to `applySyncAuthority` keeps a single place that may claim a crawl is
+         * running, which is the whole point: this assignment used to be one of five
+         * that could disagree with the dock and the side panel. The next
+         * `SYNC_STATUS` poll confirms it. */
+        applySyncAuthority({ running: true, cancelRequested: false });
         // `maxPages` comes from the worker's own reply, so the percentage is
         // measured against the cap that is ACTUALLY being applied.
         state.syncMaxPages = clampInt(reply.maxPages, 0, 100000, 0);
@@ -1630,14 +2079,28 @@
           : 'mode: ' + String(settings.dislikedMode));
         state.summaryIsBad = false;
         state.summaryKind = '';
+        announceSyncView();
         addLog('Sync started: ' + state.syncMaxPages + ' page cap, dislikedMode=' + String(reply.dislikedMode), 'info');
         if (typeof reply.feedPageLimit === 'number') {
           addLog('Worker resolved feedPageLimit=' + reply.feedPageLimit + ' maxPages=' + reply.maxPages, 'info');
         }
         renderAll();
-        toast('Syncing library…', '');
+        toast('Sync active. It indexes your Suno feed and downloads nothing.', '');
         startSyncPoll();
       } catch (err) {
+        /* The worker's own overlap refusal, read as the FACT it is rather than as a
+         * failure. `guardSyncStart` should already have caught it; the window
+         * between that read and this send is narrow but real, and two surfaces
+         * pressing at once is not a user error worth an error toast. */
+        if (err && err.code === 'sync_running') {
+          applySyncAuthority({ running: true, cancelRequested: false });
+          announceSyncView();
+          addLog('A library sync was already running, so this one was not started.', 'warn');
+          toast('A library sync is already running. Press Stop to end it, or wait for it to finish.', 'warn');
+          renderAll();
+          startSyncPoll();
+          return;
+        }
         addLog('Sync failed to start: ' + textOf(err), 'bad');
         renderAll();
         toast('Sync failed: ' + textOf(err), 'bad');
@@ -1779,18 +2242,24 @@
   }
 
   /**
-   * After a cancel request, wait (bounded) for the worker to report the run as
-   * finished, then re-read authoritative state.
+   * After a cancel request, watch the worker until it reports the run finished.
    *
-   * Aborting is cooperative: the crawl only observes the signal where it awaits,
-   * so a run parked in a rate-limit backoff or a page retry keeps going for a
-   * while. The previous version showed "Cancelling the sync…" and then waited
-   * forever for a `SYNC_DONE` push that might never come, with no exit. A
-   * bounded wait plus an authoritative re-read means the popup always resolves to
-   * the truth, and can say plainly when the worker did not stop.
+   * STATE-DRIVEN, WITH A GUARANTEED EXIT. The loop ends when the worker's own
+   * `SYNC_STATUS` says the crawl is no longer running, or when the bounded wait
+   * runs out — and on that second outcome it does NOT simply give up and leave
+   * `syncRunning` true. The old version polled `SYNC_STATUS` into a local variable
+   * and threw the answer away, then cleared `syncCancelling` and left
+   * `state.syncRunning` true, so the popup sat on an animated "stopping" bar with
+   * nothing left that could ever end it. Now the timeout sets
+   * `syncStopUnconfirmed`, which stops the claim of a live crawl and paints a
+   * terminal, non-animated state that names the next step. Either way this
+   * function ends in a state the user can act on.
+   *
+   * Every poll goes through `refreshSyncStatus()`, so the buttons, the tile and the
+   * announcement move with the loop instead of one step behind it.
    *
    * @param {number} [timeoutMs]
-   * @returns {Promise<boolean>} true when the run is confirmed finished
+   * @returns {Promise<boolean>} true when the worker confirmed the run finished
    */
   async function awaitSyncSettled(timeoutMs) {
     var deadline = Date.now() + (timeoutMs || SYNC_CANCEL_WAIT_MS);
@@ -1799,16 +2268,33 @@
     while (Date.now() < deadline) {
       await sleep(400);
       polls += 1;
-      var res = await send('SYNC_STATUS', {});
-      if (res && res.ok && res.running !== true) {
+      var answered = await refreshSyncStatus();
+      // An unreadable status is not a stop. Leaving `syncRunning` alone here is the
+      // point: the bounded wait still has time, and inventing a stop from a failed
+      // read is how a live crawl would be reported as finished.
+      if (answered && !state.syncRunning) {
         settled = true;
         break;
       }
     }
     // Always re-read: `SYNC_DONE` may have landed in between, and the cursor is
     // the only place the final verdict is recorded.
+    if (settled) {
+      state.syncStopped = true;
+      state.syncStopUnconfirmed = false;
+    } else {
+      /* REACH A TERMINAL STATE ANYWAY. The worker has not answered, so this popup
+       * stops asserting that a crawl is in flight and says exactly what it does not
+       * know. Re-enabling Sync library is safe because `guardSyncStart` re-reads
+       * `SYNC_STATUS` before sending anything, so a press here cannot start a second
+       * crawl over an unconfirmed one — it is refused in words instead. */
+      applySyncAuthority({ running: false, interrupted: false });
+      state.syncStopUnconfirmed = true;
+    }
+    announceSyncView();
+    renderAll();
     await refreshBootSafe();
-    addLog('Post-cancel poll: ' + polls + ' queries, settled=' + String(settled), 'info');
+    addLog('Post-cancel poll: ' + polls + ' queries, stopped=' + String(settled), 'info');
     return settled;
   }
 
@@ -1823,23 +2309,29 @@
         }
         var sync = await send('SYNC_CANCEL', {});
         // `running`/`cancelRequested`/`abortAvailable`/`orphanedCursorCleared` are
-        // the worker's contract. The old line read `sync.running` from a reply
-        // that only ever carried `{ok:true}`, so it logged "was running:
-        // undefined" and the user could not tell a real cancel from a no-op.
+        // the worker's contract, and it carries a boolean `running` like every other
+        // authority — so it goes through the one writer rather than being
+        // interpreted here and again in the three push handlers. The old line read
+        // `sync.running` from a reply that only ever carried `{ok:true}`, so it
+        // logged "was running: undefined" and the user could not tell a real cancel
+        // from a no-op.
+        applySyncAuthority(sync);
         if (sync && sync.orphanedCursorCleared === true) {
-          state.syncOrphaned = false;
-          state.syncRunning = false;
-          state.syncCancelling = false;
+          state.syncStopped = false;
+          state.syncStopUnconfirmed = false;
           addLog(sync.stale === true
-            ? 'Cleared a crawl the extension worker had abandoned. Your indexed clips were kept — press Sync to resume.'
+            ? 'Cleared a crawl the extension worker had abandoned. Your indexed clips were kept — press Sync library to resume.'
             : 'Cleared the stale "sync in progress" state. Indexed clips were kept.', 'warn');
           toast('Cleared the stale sync state.', 'warn');
           await refreshBootSafe();
           stopSyncPoll();
+          announceSyncView();
           renderAll();
           return;
         }
         if (sync && sync.running === false) {
+          state.syncStopped = false;
+          announceSyncView();
           addLog('Nothing to cancel — no library sync is running. Re-reading authoritative state.', 'info');
           toast('No sync is running.', '');
           void refreshBootSafe().catch(noop);
@@ -1848,21 +2340,13 @@
           return;
         }
         if (sync && sync.cancelRequested === true) {
-          state.syncCancelling = true;
           state.syncCancelRequestedAt = Date.now();
-          addLog('Cancel signalled. Waiting for the crawl to unwind…', 'warn');
-          toast('Cancelling the sync…', '');
+          announceSyncView();
+          addLog('Cancel signalled. Waiting for the crawl to unwind.', 'warn');
+          toast('Stopping the library sync.', '');
           renderProgress();
-          var settled = await awaitSyncSettled();
-          state.syncCancelling = false;
-          if (settled) {
-            addLog('Sync stopped.', 'info');
-            toast('Sync cancelled — nothing is broken.', '');
-          } else {
-            addLog('The worker has not reported the sync as stopped yet. It is likely waiting on a rate limit; it will stop at the next page boundary. If it does not, reload the extension.', 'warn');
-            toast('Still stopping — the worker is waiting on a rate limit.', 'warn');
-          }
-          renderAll();
+          renderButtons();
+          await awaitSyncSettled();
         }
       } catch (err) {
         addLog('Cancel failed: ' + textOf(err), 'bad');
@@ -1910,17 +2394,41 @@
     })();
   }
 
-  function onAuthClick() {
-    withBusy(async function () {
-      try {
-        await chrome.tabs.create({ url: 'https://suno.com/', active: true });
-        window.close();
-      } catch (err) {
-        addLog('Could not open suno.com: ' + textOf(err), 'bad');
-        toast('Could not open suno.com: ' + textOf(err), 'bad');
+  /**
+ * The session chip.
+ *
+ * TWO ACTIONS, CHOSEN BY WHAT IS KNOWN. When the session is unknown — the worker did
+ * not answer — the chip says "click here to try again" and this retries the READ. It
+ * must not open suno.com in that state: the chip was telling the user to go and sign
+ * in on the strength of a transport failure, which sends a signed-in user to sign in
+ * again for no reason. suno.com is opened only once a real read has said there is no
+ * session (or a bad one), because that is the only case where it is the fix.
+ */
+function onAuthClick() {
+  withBusy(async function () {
+    if (state.token === null) {
+      tokenReadFailures = 0;
+      var known = await refreshToken();
+      if (!known) {
+        // Still nothing. Say so in the same voice, and do not invent a session state.
+        addLog('The extension worker still did not answer the session read. Try again, '
+          + 'or reload the extension if it keeps happening.', 'warn');
+        renderAll();
+        return;
       }
-    })();
-  }
+      addLog('Read the session from the extension worker.', 'info');
+      renderAll();
+      return;
+    }
+    try {
+      await chrome.tabs.create({ url: 'https://suno.com/', active: true });
+      window.close();
+    } catch (err) {
+      addLog('Could not open suno.com: ' + textOf(err), 'bad');
+      toast('Could not open suno.com: ' + textOf(err), 'bad');
+    }
+  })();
+}
 
   function onLogClearClick() {
     while (els.log.firstChild) els.log.removeChild(els.log.firstChild);
@@ -2053,10 +2561,25 @@
 
   /* ---------------------------------------------------------------- pushes */
 
+  /**
+   * `SYNC_PROGRESS` — the fast path for the NUMBERS, and deliberately not for the
+   * answer to "is a crawl in flight".
+   *
+   * This push carries no `running` field at all (the worker sends `state:'running'`
+   * and the counters), so under the rule in `applySyncAuthority` it must not be able
+   * to flip this popup from "not running" to "running". It used to do exactly that,
+   * on the first line of this function: a surface that had missed `SYNC_STARTED`
+   * would decide a crawl existed because a progress push had arrived, which is one
+   * of the ways two surfaces came to disagree.
+   *
+   * A push can still only DOWNGRADE — `SYNC_DONE`, `SYNC_ERROR` and
+   * `SYNC_CANCELLED` are terminal by construction — and anything genuinely live is
+   * established by `SYNC_STATUS`, `SYNC_STARTED` or this popup's own `SYNC_START`.
+   *
+   * @param {object} msg
+   */
   function onSyncProgress(msg) {
     var prevPhase = state.syncPhase;
-    state.syncRunning = true;
-    state.activity = 'sync';
     state.syncPagesDone = clampInt(msg.pagesDone, 0, 1000000, state.syncPagesDone);
     if (isFinite(Number(msg.page)) && Number(msg.page) > 0) {
       state.syncPagesDone = Math.max(state.syncPagesDone, clampInt(msg.page, 0, 1000000, 0));
@@ -2073,35 +2596,42 @@
     if (state.syncPhase !== prevPhase) {
       addLog('sync phase: ' + (state.syncPhase || '?'), 'info');
     }
-    startSyncPoll();
+    // The poll is the correction and it is already armed whenever the popup
+    // believes a crawl is live; arming it from here would mean believing one.
+    scheduleSyncPoll(state.syncRunning);
     renderProgress();
     renderSyncTile();
     renderButtons();
   }
 
   function onSyncStarted(msg) {
-    state.syncRunning = true;
-    state.syncCancelling = false;
-    state.syncOrphaned = false;
-    state.activity = 'sync';
+    /* The worker announces a crawl with `running:true, cancelRequested:false`, so
+     * this push IS authoritative and goes through the one writer. That is why a sync
+     * started from the dock or the side panel reaches this popup as the same fact it
+     * reaches them, instead of as three private opinions. */
+    applySyncAuthority(msg);
     state.syncPagesDone = 0;
     state.syncSeen = 0;
     state.syncEtaMs = 0;
     if (typeof msg.maxPages === 'number') {
       state.syncMaxPages = clampInt(msg.maxPages, 0, 100000, 0);
     }
-    addLog('Library sync started…', 'info');
+    announceSyncView();
+    addLog('Library sync started.', 'info');
     renderAll();
   }
 
   function onSyncCancelRequested(msg) {
-    state.syncRunning = true;
-    state.syncCancelling = true;
+    /* `running:true, cancelRequested:true`: authoritative, and "stopping" rather
+     * than "stopped" — an abort is cooperative and is observed where the crawl
+     * awaits. The bounded wait in `awaitSyncSettled` owns what happens after this. */
+    applySyncAuthority(msg);
     state.syncCancelRequestedAt = Date.now();
+    announceSyncView();
     if (msg.alreadyRequested === true) {
       addLog('The sync was already being stopped.', 'warn');
     } else {
-      addLog('Stopping the sync…', 'warn');
+      addLog('Stopping the library sync.', 'warn');
     }
     renderProgress();
     renderSyncTile();
@@ -2109,15 +2639,13 @@
   }
 
   function onSyncCancelled(msg) {
-    state.syncRunning = false;
-    state.syncCancelling = false;
-    state.syncOrphaned = false;
-    state.activity = 'idle';
-    if (msg.orphanedCursorCleared === true) {
-      addLog('Cleared a stale sync record.', 'warn');
-    } else {
-      addLog('Sync cancelled.', 'info');
-    }
+    /* `running:false`, and the worker only broadcasts this when NO controller was
+     * attached — so nothing will follow it with a `SYNC_DONE`, which makes it
+     * terminal for the crawl and is why the poll stops. It carries no verdict, so
+     * the durable cursor is re-read below rather than guessed at. */
+    applySyncAuthority(msg);
+    state.syncStopped = msg.orphanedCursorCleared !== true;
+    announceSyncView();
     renderAll();
     stopSyncPoll();
     void refreshBootSafe().catch(noop);
@@ -2134,8 +2662,12 @@
    * @param {object} msg
    */
   function onSyncDone(msg) {
-    state.syncRunning = false;
-    state.activity = 'idle';
+    /* Terminal BY CONSTRUCTION, and routed through the one writer rather than
+     * assigned here: the crawl that owned the controller has finished, so there is
+     * nothing left to stop. `SYNC_DONE` carries no `running` field, so this is the
+     * DOWNGRADE path `applySyncAuthority` documents — the only direction a push
+     * without that field is allowed to move the answer in. */
+    applySyncAuthority({ running: false, interrupted: false });
     if (typeof msg.total === 'number') state.libraryTotal = msg.total;
 
     var facts = applySyncReply(msg, { state: msg && typeof msg.state === 'string' ? msg.state : undefined });
@@ -2210,8 +2742,8 @@
   }
 
   function onSyncError(msg) {
-    state.syncRunning = false;
-    state.activity = 'idle';
+    // Terminal for the same reason as `SYNC_DONE`, and through the same writer.
+    applySyncAuthority({ running: false, interrupted: false });
     var message = msg && msg.error ? String(msg.error) : 'unknown sync error';
     // A hard failure IS an incomplete index, so it goes through the SAME
     // `applySyncReply` as `SYNC_DONE` — the tile reads `state.sync`, and the old
@@ -2584,17 +3116,58 @@
 
   /* ------------------------------------------------------------------ boot */
 
-  async function refreshToken() {
-    try {
-      var reply = await send('GET_TOKEN_STATUS', {});
-      state.token = reply.token;
-      renderAuth(state.token);
-    } catch (err) {
-      state.token = { hasToken: false };
-      renderAuth(state.token);
-      dbg('GET_TOKEN_STATUS failed:', textOf(err));
+  /**
+ * `GET_TOKEN_STATUS`, and the difference between "no session" and "no answer".
+ *
+ * A REJECTION IS NOT A CREDENTIAL FACT. The previous version set
+ * `state.token = { hasToken: false }` in the catch, which `renderAuth` then rendered
+ * as the confident "Not signed in. Open suno.com in a tab and sign in". An MV3
+ * worker being torn down mid-request rejects this call, so a perfectly signed-in
+ * user was told to go and sign in — and told it at the same moment the tiles fell
+ * back to "—" and the clips note to "no local library yet". Nothing in that triad
+ * had been verified, and the only trace was a `dbg()` line that is settings-gated
+ * and therefore invisible by default.
+ *
+ * So the catch leaves `state.token` null, which `renderAuth` renders as "unknown,
+ * click to retry", and records it in the ACTIVITY LOG — a `role="status"` live
+ * region, so it is both visible and announced without the debug setting.
+ *
+ * A bounded retry is armed because the dominant cause is transient (the worker is
+ * restarting), and the popup is short-lived enough that three attempts cost nothing.
+ *
+ * @returns {Promise<boolean>} true when the worker answered
+ */
+async function refreshToken() {
+  try {
+    var reply = await send('GET_TOKEN_STATUS', {});
+    state.token = (reply.token && typeof reply.token === 'object') ? reply.token : {};
+    state.tokenReadFailed = false;
+    tokenReadFailures = 0;
+    renderAuth(state.token);
+    return true;
+  } catch (err) {
+    // `null`, not `{hasToken:false}`: see the note above.
+    state.token = null;
+    state.tokenReadFailed = true;
+    renderAuth(state.token);
+    var why = 'Could not read the session from the extension worker: ' + textOf(err)
+      + ' That is a worker that did not answer, not a session that ended — nothing about'
+      + ' your sign-in changed.';
+    addLog(why, 'warn');
+    if (tokenReadFailures < TOKEN_READ_RETRIES) {
+      tokenReadFailures += 1;
+      setTimeout(function () {
+        void refreshToken().catch(noop);
+      }, TOKEN_READ_RETRY_MS);
     }
+    return false;
   }
+}
+
+/** Bounded retries for a failed `GET_TOKEN_STATUS`; see `refreshToken`. */
+var TOKEN_READ_RETRIES = 2;
+var TOKEN_READ_RETRY_MS = 600;
+var tokenReadFailures = 0;
 
   async function refreshSelection() {
     try {
@@ -2629,6 +3202,11 @@
   }
 
   async function refreshBoot() {
+    // Set BEFORE the request, not after it resolves: `boot()` paints synchronously
+    // and then this read is in flight, and a tile that says "could not read the local
+    // index" during that window would be the same unverified claim in the other
+    // direction. `bootAttempted` is what tells the two apart.
+    state.bootAttempted = true;
     try {
       var boot = await send('GET_BOOT', {});
       state.lastBootOk = true;
@@ -2654,7 +3232,14 @@
         if (banner) state.truncFacts = banner;
         else if (bootFacts && bootFacts.hasContract) state.truncFacts = null;
       }
-      if (boot.token) state.token = boot.token;
+      /* `boot.token` is the tokenStatus() OBJECT. The `typeof` test is not paranoia:
+       * `renderAuth` now distinguishes "an object the worker sent" from "nothing",
+       * and a non-object here would be rendered as an unreadable session when the
+       * worker in fact did answer. */
+      if (boot.token && typeof boot.token === 'object') {
+        state.token = boot.token;
+        state.tokenReadFailed = false;
+      }
       if (boot.quota) {
         state.quota = boot.quota;
         renderQuotaTile();
@@ -2667,28 +3252,20 @@
         state.downloadRunning = true;
         state.activity = 'download';
       }
-      if (boot.sync && boot.sync.state === 'running') {
-        state.syncRunning = true;
-        state.activity = 'sync';
-        state.syncPagesDone = clampInt(boot.sync.pagesDone, 0, 1000000, 0);
-        startSyncPoll();
-      }
-      /* AN ORPHANED CRAWL IS NOT A RUNNING ONE.
+      /* THE CURSOR DOES NOT DECIDE WHETHER A CRAWL IS RUNNING.
        *
-       * `boot.sync.state === 'running'` used to be taken as proof that a crawl was
-       * in flight. It is not: the row is durable and the controller that owns it
-       * is not, so after a worker eviction the popup showed "Syncing" forever with
-       * a Stop button that truthfully reported "no library sync is running". The
-       * worker now reconciles that row on read and sets `interrupted`, but the
-       * state is also checked here so an older worker cannot reproduce it. */
-      if (boot.sync && boot.sync.interrupted === true) {
-        state.syncRunning = false;
-        state.syncCancelling = false;
-        state.activity = 'idle';
-        state.syncOrphaned = true;
-      } else if (boot.sync && boot.sync.state === 'running') {
-        state.syncOrphaned = false;
-      }
+       * `boot.sync.state === 'running'` was read here as proof that a crawl was in
+       * flight, and it is not: the row is durable and the controller that owns it is
+       * not, so after a worker eviction the popup showed "Syncing" forever beside a
+       * Stop button that truthfully reported "no library sync is running". Setting
+       * `running` from it was one of five places that could disagree with the dock
+       * and the side panel.
+       *
+       * `SYNC_STATUS` answers the same question from the live controller and
+       * reconciles a stale row to `interrupted` on the way, so the counters below
+       * are still read from the cursor while the RUNNING ANSWER comes from
+       * `refreshSyncStatus()`. `boot.sync.pagesDone` is likewise a counter now, not
+       * a reason to arm the poll. */
       // The clips-seen counter is CUMULATIVE and lives in the cursor, so a
       // reopened popup has to read it back. It previously only ever came from a
       // live `SYNC_PROGRESS` push, which means any popup opened mid-crawl
@@ -2715,11 +3292,6 @@
       if (state.syncSeen <= 0 && state.bootCounts && typeof state.bootCounts.clips === 'number') {
         state.syncSeen = state.bootCounts.clips;
       }
-      // A cancel that landed while this popup was closed is reported by the
-      // cursor; reflect it instead of waiting for a push that already happened.
-      if (state.syncRunning === false) {
-        state.syncCancelling = boot.sync && boot.sync.cancelRequested === true;
-      }
       renderAll();
     } catch (err) {
       state.lastBootOk = false;
@@ -2727,6 +3299,11 @@
       renderAll();
       toast('Could not read the extension state: ' + textOf(err), 'bad');
     }
+    // The authority on "is a crawl running", read once per boot and BEFORE the
+    // batch status, which is the only route that reports `plan.stoppedReason`. The
+    // Sync control stays disabled until this lands, so a popup opened mid-crawl
+    // cannot offer a start it has not checked.
+    await refreshSyncStatus();
     await refreshSelection();
     await refreshToken();
     await refreshQuota(false);
@@ -2749,6 +3326,25 @@
     });
   }
 
+  /**
+   * Re-read the authority whenever this document comes back into view.
+   *
+   * WHY, given that a popup is normally torn down when it closes: a popup that is
+   * rebuilt is a NEW document with `syncStatusKnown:false`, so its boot already
+   * asks. What this covers is the window inside one document's life — the popup
+   * left open and focus moved back to the page, or a previous `SYNC_STATUS` read
+   * failed and left Sync disabled. In both cases the last thing this document
+   * believes about the crawl is stale, and "stale" here is what lets a start be
+   * offered. A visibility change and a focus event can both fire for one return,
+   * so the reads are cheap, idempotent and only ever overwrite with the worker's
+   * answer.
+   */
+  function onSurfaceFocus() {
+    if (document.hidden) return;
+    if (state.busy) return;
+    void refreshSyncStatus().catch(noop);
+  }
+
   function wire() {
     els.btnSync.addEventListener('click', onSyncClick);
     els.btnDownload.addEventListener('click', onDownloadClick);
@@ -2757,11 +3353,17 @@
     els.btnOptions.addEventListener('click', onOptionsClick);
     els.auth.addEventListener('click', onAuthClick);
     els.btnLogClear.addEventListener('click', onLogClearClick);
+    document.addEventListener('visibilitychange', onSurfaceFocus);
+    window.addEventListener('focus', onSurfaceFocus);
   }
 
   function boot() {
     wire();
     ensureRefreshButton();
+    // Painted before anything is read: `syncStatusKnown` is false, so the Sync
+    // control starts DISABLED with the "checking" wording. That is the whole point
+    // of the flag — an enabled Sync on a popup that has not asked the worker yet is
+    // how a duplicate crawl starts.
     renderAll();
     listenForPushes();
     void refreshBootSafe();

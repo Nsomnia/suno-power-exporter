@@ -54,6 +54,17 @@
  *    3 pages" fought over one node. Two lines, one for the result count and one
  *    for the run in flight; neither is a live region, because a progress push
  *    per file must not be read aloud. Announcements go through `announce()`.
+ * L. "IS A SYNC RUNNING?" HAS EXACTLY ONE ANSWER, AND IT IS THE WORKER'S.
+ *    `SYNC_STATUS` answers it from the live controller, and `SYNC_STARTED` /
+ *    `SYNC_CANCEL_REQUESTED` / `SYNC_CANCELLED` and the `SYNC_CANCEL` reply carry
+ *    the same booleans. Every one of them goes through `applySyncAuthority()`,
+ *    which OVERWRITES local state on an explicit boolean `running` and ignores
+ *    anything without one — `SYNC_PROGRESS` carries none, and this file used to
+ *    call `setSyncRunning(true, …)` off exactly that. `syncStatusKnown` is set
+ *    only there, so the Sync control can tell "the worker says nothing is
+ *    running" from "this panel has not been told", and only the former may
+ *    enable a start. `SYNC_VIEW_WORD` / `SYNC_VIEW_NOTE` are the shared wording,
+ *    duplicated alongside `SYNC_REASON_PHRASE` for the same reason.
  * ===========================================================================
  */
 
@@ -104,6 +115,42 @@
   /** Same bounds content/content.js uses after a cancel; the abort is cooperative. */
   var SYNC_STOP_WAIT_MS = 20000;
   var SYNC_STOP_POLL_MS = 500;
+  /** How many times a failed `SYNC_STATUS` read is retried before the panel waits
+   *  for a focus event. Without it a single transport hiccup on open would leave
+   *  Sync disabled with no way back except reloading the panel. */
+  var SYNC_STATUS_RETRIES = 3;
+  var SYNC_STATUS_RETRY_MS = 700;
+
+  /**
+   * The shared sync vocabulary. Every surface shows the crawl in these words, and
+   * each word says what is happening AND what happens next.
+   *
+   * Duplicated byte-for-byte in `popup/popup.js` and `content/content.js` for the
+   * same reason `SYNC_REASON_PHRASE` is (header note G): a content script and an
+   * extension page share no module graph. They must change together.
+   */
+  var SYNC_VIEW_WORD = {
+    checking: 'Checking whether a sync is running',
+    active: 'Sync active',
+    stopping: 'Sync stopping',
+    stopped: 'Sync stopped',
+    interrupted: 'Sync interrupted',
+    unconfirmed: 'Stop requested',
+    idle: 'Sync idle'
+  };
+
+  var SYNC_VIEW_NOTE = {
+    checking: 'Checking with the worker whether a library sync is running. Sync stays unavailable until it answers.',
+    active: 'A library sync is running. It indexes your Suno feed and downloads nothing.',
+    stopping: 'Stopping the library sync. The worker checks for the stop between pages, so it ends after the current page finishes.',
+    stopped: 'The library sync stopped. Nothing is broken and the clips already indexed are kept.',
+    interrupted: 'The extension worker was stopped mid-crawl. Indexed clips are kept.',
+    unconfirmed: 'The worker has not confirmed that the sync stopped. It checks for the stop between pages, so it ends after the current page finishes.',
+    idle: 'No library sync is running.'
+  };
+
+  /** What THIS panel calls its two sync controls. See the note in popup/popup.js. */
+  var SYNC_CONTROL = { start: 'Sync', stop: 'Stop sync' };
 
   var state = {
     clips: [],
@@ -128,6 +175,35 @@
     syncFacts: null,
     syncRunning: false,
     syncCancelling: false,
+    /**
+     * Whether THIS panel document has read an authoritative `SYNC_STATUS` reply.
+     * The Sync control is disabled until it has, so the window between "the panel
+     * opened" and "the worker has answered" cannot offer a start — that window is
+     * how a panel that had not heard about a crawl started by the popup or the dock
+     * could send a second `SYNC_START`.
+     */
+    syncStatusKnown: false,
+    /**
+     * A cancel was signalled and the bounded wait expired without the worker
+     * reporting the run finished. Distinct from `syncCancelling` ("the worker is
+     * unwinding and this panel is watching it"): here nothing is watching, so the
+     * panel stops claiming a crawl is live and says the stop was never confirmed,
+     * rather than leaving an animated "stopping" line with no exit.
+     */
+    syncStopUnconfirmed: false,
+    /**
+     * The last terminal state was a stop the user asked for, so the shared wording
+     * reads "Sync stopped". Cleared when a crawl is authoritative-active again.
+     */
+    syncStopped: false,
+    /**
+     * The stored cursor claimed `running` but no controller owns it — an MV3 worker
+     * eviction, not a crawl. Separate from `syncRunning` because the two need
+     * different wording ("Sync interrupted" rather than "Sync active") and a
+     * different affordance: a live crawl can be stopped, an interrupted record can
+     * only be resumed. Read from the worker's own `interrupted` flag.
+     */
+    syncOrphaned: false,
     syncPhase: '',
     syncPagesDone: 0,
     syncTotalSeen: 0,
@@ -281,11 +357,92 @@
     setText(C.announce, message);
   }
 
-  function setSyncRunning(running, cancelling) {
-    dbg('setSyncRunning', running, cancelling);
-    state.syncRunning = running;
-    state.syncCancelling = cancelling;
+  /**
+   * Which of the seven shared states the panel is in.
+   *
+   * ONE function, because this file previously answered "is a sync running?" from
+   * five places — `refreshSyncStatus`, three push cases, the `SYNC_START` reply and
+   * the `SYNC_CANCEL` reply — each through `setSyncRunning`, and each free to
+   * disagree with the others about one crawl. Everything renders from this, so the
+   * Sync button, the sync line and the announcement cannot tell three stories.
+   *
+   * @returns {'checking'|'active'|'stopping'|'stopped'|'interrupted'|'unconfirmed'|'idle'}
+   */
+  function syncView() {
+    if (state.syncStopUnconfirmed) return 'unconfirmed';
+    if (state.syncOrphaned) return 'interrupted';
+    if (state.syncRunning) return state.syncCancelling ? 'stopping' : 'active';
+    if (state.syncStopped) return 'stopped';
+    if (!state.syncStatusKnown) return 'checking';
+    return 'idle';
+  }
+
+  /**
+   * THE single reader of the worker's authoritative crawl state, in this file.
+   *
+   * `SYNC_STATUS` answers `{ok, running, cancelRequested, cancelling,
+   * interrupted, cursor, …}`, and the `SYNC_STARTED` / `SYNC_CANCEL_REQUESTED` /
+   * `SYNC_CANCELLED` pushes and the `SYNC_CANCEL` reply carry the same booleans, so
+   * all of them come through here. The rule is the whole fix:
+   *
+   *   - an explicit boolean `running` OVERWRITES local state, in both directions;
+   *   - anything WITHOUT one is not evidence about whether a crawl is in flight and
+   *     leaves `syncRunning` alone. `SYNC_PROGRESS` is the case that matters: the
+   *     worker sends it with `state:'running'` and no `running` field, and this file
+   *     used to call `setSyncRunning(true, …)` off exactly that.
+   *
+   * `syncStatusKnown` is set only here, which is what lets the Sync control tell
+   * "the worker says nothing is running" (enable) from "I have not been told" (do
+   * not enable).
+   *
+   * @param {unknown} reply any reply or push that may carry `running`
+   * @returns {boolean} true when the reply was authoritative and was applied
+   */
+  function applySyncAuthority(reply) {
+    if (!reply || typeof reply !== 'object' || typeof reply.running !== 'boolean') return false;
+    var before = syncView();
+    state.syncStatusKnown = true;
+    state.syncRunning = reply.running;
+    state.syncCancelling = reply.running === true
+      && (reply.cancelRequested === true || reply.cancelling === true);
+    if (reply.interrupted === true) {
+      // A stored cursor with no controller behind it: an MV3 eviction, not a crawl.
+      // `running` is the controller test, so the two cannot both be true, and the
+      // wording has to differ: this one can be resumed, not stopped.
+      state.syncRunning = false;
+      state.syncCancelling = false;
+      state.syncOrphaned = true;
+      state.syncStopped = false;
+    } else if (reply.running === true) {
+      state.syncOrphaned = false;
+    }
+    if (reply.running === true) {
+      state.syncStopUnconfirmed = false;
+      state.syncStopped = false;
+    }
+    announceSyncView(before);
     paintSyncStatus();
+    return true;
+  }
+
+  /**
+   * Say the shared sentence for the current state through `announce()`, once per
+   * TRANSITION.
+   *
+   * `#sp-announce` is a `role="status" aria-live="polite"` region, so this is the
+   * route that makes a state change audible at all. The progress line and the
+   * button are explicitly NOT live regions (a per-file `DL_PROGRESS` push must not
+   * be read aloud), which is why every state change has to come through here.
+   *
+   * @param {string} [before] the view before the caller applied its reply
+   */
+  function announceSyncView(before) {
+    var view = syncView();
+    // `checking` is the absence of an answer. The failure path that produced it
+    // says so itself, and an unanswered first read must not repeat itself.
+    if (view === 'checking') return;
+    if (before !== undefined && view === before) return;
+    announce(SYNC_VIEW_NOTE[view]);
   }
 
   /** @param {string} iso @returns {string} */
@@ -753,9 +910,17 @@
    * capped against the cap the worker actually applied.
    */
   function paintSyncStatus() {
-    dbg('paintSyncStatus', state.syncRunning, state.syncPhase, state.syncPagesDone, state.syncTotalSeen);
+    dbg('paintSyncStatus', syncView(), state.syncPhase, state.syncPagesDone, state.syncTotalSeen);
     paintControls();
-    if (!state.syncRunning) {
+    var view = syncView();
+    var inFlight = view === 'active' || view === 'stopping';
+    /* The box is shown for every SETTLED state that the user still needs to read —
+     * stopped, interrupted, stop-unconfirmed — as well as for a live crawl. Hiding it
+     * the moment `syncRunning` went false is why the panel had no word at all for a
+     * crawl that had just been stopped or interrupted, while the popup and the dock
+     * named both. It is hidden only when there is genuinely nothing to report. */
+    var settled = view === 'stopped' || view === 'interrupted' || view === 'unconfirmed';
+    if (!inFlight && !settled) {
       C.syncBox.hidden = true;
       setText(C.syncLine, '');
       setFill(C.syncFill, 0);
@@ -763,13 +928,32 @@
     }
     C.syncBox.hidden = false;
 
+    if (!inFlight) {
+      /* TERMINAL, AND DELIBERATELY AN EMPTY BAR. A bar implies a completeness
+       * somebody measured. None of these three states has one: a stop the worker
+       * never confirmed, a record it abandoned, a stop it confirmed — and the last
+       * of those is reported in full by `paintBanner` from the cursor's own verdict
+       * fields, not by a bar. So each gets the shared word, the sentence that says
+       * what happens next, and nothing else. */
+      var tail = view === 'unconfirmed'
+        ? ' ' + SYNC_CONTROL.start + ' reads the worker before it starts anything.'
+        : ' Press ' + SYNC_CONTROL.start + ' to ' + (view === 'interrupted' ? 'resume' : 'start another') + '.';
+      setText(C.syncLine, SYNC_VIEW_WORD[view] + ' · ' + SYNC_VIEW_NOTE[view] + tail);
+      setFill(C.syncFill, 0);
+      return;
+    }
+
     var parts = [];
-    if (state.syncPhase) parts.push(state.syncPhase);
+    /* The shared state word goes FIRST, so the panel names the crawl the same way
+     * the popup and the dock do. It used to lead with the raw phase slug
+     * (`crawling`) or nothing at all, which is a fourth vocabulary for one event. */
+    parts.push(SYNC_VIEW_WORD[view]);
+    if (state.syncPhase && !state.syncCancelling) parts.push(state.syncPhase);
     parts.push(group(state.syncTotalSeen) + ' ' + plural(state.syncTotalSeen, 'clip') + ' indexed');
     if (state.syncPagesDone) parts.push(state.syncPagesDone + ' ' + plural(state.syncPagesDone, 'page'));
     var eta = humanMs(state.syncEtaMs);
-    if (eta) parts.push(eta);
-    if (state.syncCancelling) parts.push('stopping — this takes effect at the next page');
+    if (eta && !state.syncCancelling) parts.push(eta);
+    if (state.syncCancelling) parts.push('the worker checks between pages, so it ends after the current page finishes');
     setText(C.syncLine, parts.join(' · '));
 
     var facts = state.syncFacts;
@@ -851,10 +1035,58 @@
     var selected = state.selection.size;
     var busy = state.batch.running;
 
-    C.sync.disabled = dead || state.syncRunning;
-    C.syncStop.hidden = !state.syncRunning;
-    C.syncStop.disabled = dead || state.syncCancelling;
-    C.sync.textContent = state.syncRunning ? 'Syncing' : 'Sync';
+    /* NEVER OFFER A START WHILE SOMETHING IS RUNNING, AND ALWAYS SAY WHY.
+   *
+   * Three distinguishable reasons can disable Sync, and a disabled control with no
+   * explanation is indistinguishable from a broken one, so each is spelled out here:
+   *
+   *   `dead`               the panel lost its extension context (the reload notice)
+   *   `state.syncRunning`  a crawl is in flight, quite possibly started from the
+   *                        popup or the in-page dock. THIS is the reported defect:
+   *                        one surface showed "Syncing" while another still offered a
+   *                        live Sync, and one click there started a second crawl.
+   *   `!syncStatusKnown`   this document has not been told anything yet. Enabling on
+   *                        "I have not been told" is precisely how a freshly opened
+   *                        panel could start a duplicate, so the window before the
+   *                        first `SYNC_STATUS` reply keeps it disabled.
+   */
+  var syncViewNow = syncView();
+  C.sync.disabled = dead || state.syncRunning || !state.syncStatusKnown;
+  C.sync.textContent = (syncViewNow === 'active' || syncViewNow === 'stopping')
+    ? SYNC_VIEW_WORD[syncViewNow]
+    : SYNC_CONTROL.start;
+  C.sync.title = dead
+    ? 'The panel lost its connection to the extension worker. Reload the panel to continue.'
+    : (state.syncRunning
+      ? SYNC_VIEW_NOTE.active + ' It may have been started from the popup or the in-page dock. '
+        + 'Press ' + SYNC_CONTROL.stop + ' to end it, or wait for it to finish.'
+      : (!state.syncStatusKnown
+        ? 'Asking the worker whether a library sync is already running. '
+          + 'Sync stays unavailable until it answers, so a second crawl cannot be started from here.'
+        : (state.syncStopUnconfirmed
+          ? SYNC_VIEW_NOTE.unconfirmed + ' ' + SYNC_CONTROL.start + ' reads the worker before it starts anything.'
+          : (state.syncOrphaned
+            ? SYNC_VIEW_NOTE.interrupted + ' Press ' + SYNC_CONTROL.start + ' to resume.'
+            : (state.syncStopped
+              ? SYNC_VIEW_NOTE.stopped + ' Press ' + SYNC_CONTROL.start + ' to start another.'
+              : 'Index your Suno feed into the local index. Nothing is downloaded and no downloads are spent.')))));
+  // The visible text is short and the reason is not, so the accessible name is the
+  // same sentence — otherwise a screen reader reads "Sync active, dimmed" and never
+  // hears why.
+  C.sync.setAttribute('aria-label', C.sync.disabled
+    ? (SYNC_CONTROL.start + ', unavailable: ' + C.sync.title)
+    : (SYNC_CONTROL.start + '. ' + C.sync.title));
+  C.syncStop.hidden = !state.syncRunning;
+  C.syncStop.disabled = dead || state.syncCancelling;
+  // The stop control names the same state the sync line does, so "stopping" is one
+  // word in one place rather than an animation that may or may not be live.
+  C.syncStop.textContent = state.syncCancelling ? 'Stopping' : SYNC_CONTROL.stop;
+  C.syncStop.title = state.syncCancelling
+    ? SYNC_VIEW_NOTE.stopping
+    : 'Ask the worker to end the running library sync. Nothing is downloaded and no downloads are spent.';
+  C.syncStop.setAttribute('aria-label', C.syncStop.disabled && state.syncCancelling
+    ? ('Stopping the library sync. ' + SYNC_VIEW_NOTE.stopping)
+    : ('Stop the running library sync. ' + SYNC_VIEW_NOTE.active));
 
     C.dlSel.disabled = dead || selected === 0 || busy;
     C.dlSel.textContent = selected ? 'Download selected (' + group(selected) + ')' : 'Download selected';
@@ -1797,14 +2029,28 @@
    * places that disagree. What the worker actually applied comes back on the
    * reply and is what the bar is measured against.
    *
+   * The pre-flight read below is the guard that actually closes the duplicate-start
+   * window: the button is disabled while a crawl is running, but that only knows
+   * what THIS panel has been told, and a crawl can begin from the popup or the
+   * in-page dock between the paint and the press.
+   *
    * @returns {Promise<void>}
    */
   async function startSync() {
-    if (state.contextDead || state.syncRunning) return;
+    if (state.contextDead || state.syncRunning || !state.syncStatusKnown) return;
     var settings = state.settings || {};
-    C.sync.disabled = true;
-    setText(C.status, 'Starting a sync…');
+    paintControls();
+    setText(C.status, 'Asking the worker whether a sync is running…');
     try {
+      var guard = await guardSyncStart();
+      if (!guard.ok) {
+        setText(C.status, '');
+        showError(guard.reason);
+        announce(guard.reason);
+        paintControls();
+        return;
+      }
+      setText(C.status, 'Starting a sync…');
       var reply = await send('SYNC_START', {
         force: false,
         dislikedMode: settings.dislikedMode,
@@ -1815,24 +2061,59 @@
       state.syncTotalSeen = 0;
       state.syncPhase = '';
       state.syncEtaMs = 0;
-      setSyncRunning(true, false);
+      /* An accepted `SYNC_START` is itself authoritative — the worker only answers
+       * `ok:true` after attaching a controller, and broadcasts `SYNC_STARTED`
+       * carrying `running:true` as it does — so it goes through the one writer
+       * rather than assigning `syncRunning` here. */
+      applySyncAuthority({ running: true, cancelRequested: false });
       scheduleSyncPoll(true);
       var mode = reply.dislikedMode ? ' (' + String(reply.dislikedMode) + ')' : '';
       announce('Sync started' + mode + (state.syncMaxPages > 0 ? ', page cap ' + group(state.syncMaxPages) : '') + '.');
     } catch (err) {
-      C.sync.disabled = false;
       // `SYNC_START` refuses with `sync_running` when a crawl is already in
       // flight — which is the worker's word for "you are already syncing", so
       // the panel adopts that state instead of reporting a failure the user can
-      // do nothing about.
+      // do nothing about. The pre-flight read should already have caught it; the
+      // window between that read and this send is narrow but real.
       if (err && err.code === 'sync_running') {
-        setSyncRunning(true, false);
+        applySyncAuthority({ running: true, cancelRequested: false });
         scheduleSyncPoll(true);
-        announce('A sync was already running.');
+        announce(SYNC_VIEW_NOTE.active + ' It may have been started from the popup or the in-page dock. '
+          + 'Press ' + SYNC_CONTROL.stop + ' to end it, or wait for it to finish.');
         return;
       }
       paintFailure(err, 'Could not start the sync');
+      paintControls();
     }
+  }
+
+  /**
+   * Ask the worker whether a crawl is in flight BEFORE starting one.
+   *
+   * The button being disabled is a UI fact about what this panel knows; this is the
+   * worker's answer, and only it may enable a start. An unreadable status is a
+   * refusal, not a pass: starting blind is exactly the failure this guards.
+   *
+   * @returns {Promise<{ok: boolean, reason: string}>} `reason` is the plain sentence
+   *   to show when `ok` is false.
+   */
+  async function guardSyncStart() {
+    var known = await refreshSyncStatus();
+    if (!known) {
+      return {
+        ok: false,
+        reason: 'Could not ask the worker whether a library sync is already running, so nothing was started. Close and reopen the panel to retry.'
+      };
+    }
+    if (state.syncRunning) {
+      return {
+        ok: false,
+        reason: state.syncCancelling
+          ? 'A library sync is already stopping. It ends after the current page finishes.'
+          : 'A library sync is already running. Press ' + SYNC_CONTROL.stop + ' to end it, or wait for it to finish.'
+      };
+    }
+    return { ok: true, reason: '' };
   }
 
   /**
@@ -1840,36 +2121,39 @@
    *
    * The reply is a contract and this handler reads it as one:
    * `{running, cancelRequested, abortAvailable, orphanedCursorCleared, stale}`.
-   * An earlier copy of this file had no way to read it, which is why the panel
-   * used to be able to sit on "stopping…" with no exit — an abort is
-   * cooperative and a rate-limit backoff can hold a page open, so the panel
-   * polls `SYNC_STATUS` for a bounded time and then says plainly that the
-   * worker has not stopped yet.
+   * It carries a boolean `running` like every other authority, so it goes through
+   * `applySyncAuthority` rather than being interpreted here and again in the three
+   * push cases. An earlier copy of this file had no way to read it, which is why the
+   * panel used to be able to sit on "stopping…" with no exit.
    */
   async function stopSync() {
     if (state.contextDead || !state.syncRunning) return;
     try {
       var reply = await send('SYNC_CANCEL', {});
+      applySyncAuthority(reply);
       if (reply && reply.orphanedCursorCleared === true) {
         // Nothing was running; the press cleared a crawl the worker had
         // abandoned after an eviction. Indexed clips were kept — saying so
         // matters, because "cancel" reads like "I lost my library".
-        setSyncRunning(false, false);
+        state.syncStopped = false;
+        state.syncStopUnconfirmed = false;
         stopSyncPoll();
         announce(reply.stale === true
           ? 'Cleared a crawl the extension worker had abandoned. Indexed clips were kept.'
           : 'Cleared the stale sync state. Indexed clips were kept.');
         void refreshSyncStatus().catch(function (err) { dbg('SYNC_STATUS after cancel failed:', textOf(err)); });
+        paintControls();
         return;
       }
       if (reply && reply.running === false) {
-        setSyncRunning(false, false);
+        state.syncStopped = false;
         stopSyncPoll();
         announce('No sync was running.');
+        paintControls();
         return;
       }
-      setSyncRunning(true, true);
-      announce('Stopping the sync. The worker checks for the cancel between pages, so a rate-limit wait delays it.');
+      announce(SYNC_VIEW_NOTE.stopping);
+      paintControls();
       await waitForSyncToStop(SYNC_STOP_WAIT_MS);
     } catch (err) {
       paintFailure(err, 'Could not stop the sync');
@@ -1877,23 +2161,43 @@
   }
 
   /**
-   * Wait for `SYNC_STATUS` to report the crawl settled, then report the
-   * authoritative state either way. Never rejects: the timeout is a legitimate
-   * outcome, and the poll keeps running so the panel corrects itself when the
-   * worker finally does stop.
+   * Watch `SYNC_STATUS` until it reports the crawl finished, then reach a terminal
+   * state either way.
+   *
+   * STATE-DRIVEN, WITH A GUARANTEED EXIT. The loop ends on the worker's own answer
+   * or when the bounded wait runs out, and on that second outcome it does NOT leave
+   * `syncRunning` true: the old version watched `state.syncRunning` (which only the
+   * poll could move), timed out, and said "Still stopping" while the line kept
+   * rendering as a live crawl with nothing left able to end it. Now the timeout sets
+   * `syncStopUnconfirmed`, which stops the claim of a live crawl and paints a
+   * terminal, static line that names the next step. Re-enabling Sync is safe
+   * because `guardSyncStart` re-reads `SYNC_STATUS` before sending anything.
+   *
+   * Never rejects: the timeout is a legitimate outcome.
    *
    * @param {number} timeoutMs
-   * @returns {Promise<void>}
+   * @returns {Promise<boolean>} true when the worker confirmed the run finished
    */
   async function waitForSyncToStop(timeoutMs) {
     var deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await sleep(SYNC_STOP_POLL_MS);
-      if (!state.syncRunning) return;
+      var answered = await refreshSyncStatus();
+      // An unreadable status is not a stop; leave the claim alone and keep waiting
+      // while the bounded wait still has time.
+      if (answered && !state.syncRunning) {
+        state.syncStopped = true;
+        state.syncStopUnconfirmed = false;
+        announce(SYNC_VIEW_NOTE.stopped);
+        paintSyncStatus();
+        return true;
+      }
     }
-    if (state.syncRunning) {
-      announce('Still stopping. The worker is waiting on a rate limit and will stop at the next page boundary.');
-    }
+    applySyncAuthority({ running: false, interrupted: false });
+    state.syncStopUnconfirmed = true;
+    announce(SYNC_VIEW_WORD.unconfirmed + '. ' + SYNC_VIEW_NOTE.unconfirmed);
+    paintSyncStatus();
+    return false;
   }
 
   /** @param {number} ms @returns {Promise<void>} */
@@ -2172,17 +2476,26 @@
             applyDlError(msg);
             break;
           case 'SYNC_STARTED':
+            // Authoritative: the worker sends `running:true, cancelRequested:false`.
+            // A crawl started from the popup or the in-page dock reaches the panel as
+            // the same fact they received it as, not as a panel-side guess.
             dbg('SYNC_STARTED', msg);
-            setSyncRunning(true, false);
             state.syncPhase = '';
             state.syncPagesDone = 0;
             state.syncTotalSeen = 0;
             state.syncEtaMs = 0;
             if (typeof msg.maxPages === 'number') state.syncMaxPages = msg.maxPages;
+            applySyncAuthority(msg);
             scheduleSyncPoll(true);
-            announce('Library sync started.');
             break;
           case 'SYNC_PROGRESS':
+            /* THE COUNTERS ONLY. This push carries no `running` field, so under the
+             * rule in `applySyncAuthority` it must not be able to put this panel from
+             * "not running" into "running". It used to call
+             * `setSyncRunning(true, msg.state === 'cancelling')` on exactly that
+             * evidence, which is one of the ways two surfaces came to disagree about
+             * one crawl. The counters are still read here — they are the fast path —
+             * and the running ANSWER comes from `SYNC_STATUS`. */
             dbg('SYNC_PROGRESS', msg.phase, msg);
             if (msg.phase && msg.phase !== state.syncPhase) {
               dbg('sync phase changed to', msg.phase);
@@ -2192,35 +2505,40 @@
             state.syncTotalSeen = typeof msg.totalSeen === 'number' ? msg.totalSeen : (typeof msg.seen === 'number' ? msg.seen : state.syncTotalSeen);
             if (typeof msg.etaMs === 'number') state.syncEtaMs = msg.etaMs;
             if (msg.note) state.syncNote = msg.note;
-            setSyncRunning(true, msg.state === 'cancelling');
-            scheduleSyncPoll(true);
+            // Arming the poll means believing a crawl is live, so it follows the
+            // authority rather than this push.
+            scheduleSyncPoll(state.syncRunning);
             paintSyncStatus();
             break;
           case 'SYNC_CANCEL_REQUESTED':
+            // `running:true, cancelRequested:true`: authoritative, and "stopping"
+            // rather than "stopped" — an abort is cooperative.
             dbg('SYNC_CANCEL_REQUESTED', msg);
-            setSyncRunning(true, true);
-            announce('Stopping the library sync.');
-            paintSyncStatus();
+            applySyncAuthority(msg);
             break;
           case 'SYNC_CANCELLED':
+            /* `running:false`, and the worker only broadcasts this when NO controller
+             * was attached, so nothing will follow it with a `SYNC_DONE`: it is
+             * terminal for the crawl and the poll stops. It carries no verdict, so
+             * the durable cursor is re-read below rather than guessed at. */
             dbg('SYNC_CANCELLED', msg);
-            setSyncRunning(false, false);
+            applySyncAuthority(msg);
+            state.syncStopped = msg.orphanedCursorCleared !== true;
             stopSyncPoll();
             if (msg.orphanedCursorCleared === true) {
-              announce('Sync cancelled. Orphaned cursor was cleared.');
-            } else {
-              announce('Sync cancelled.');
+              announce('Cleared a crawl the extension worker had abandoned. Indexed clips were kept.');
             }
             applySyncReply(msg);
             void runQuery(false).catch(reportUnexpected);
             break;
           case 'SYNC_DONE':
-            // The index changed under us, so the banner has to be re-read from the
-            // message: this is the ONLY push that carries `completed`,
-            // `stopReason` and `expectedTotal` together. The previous copy keyed
-            // on `truncated` and announced the same sentence for every short walk.
+            /* Terminal BY CONSTRUCTION and routed through the one writer. The index
+             * changed under us, so the banner has to be re-read from the message:
+             * this is the ONLY push that carries `completed`, `stopReason` and
+             * `expectedTotal` together, and the verdict is the worker's — nothing
+             * here re-derives it. */
             stopSyncPoll();
-            setSyncRunning(false, false);
+            applySyncAuthority({ running: false, interrupted: false });
             applySyncReply(msg);
             var syncFacts = state.syncFacts;
             var syncWarn = bannerFacts(syncFacts);
@@ -2233,9 +2551,10 @@
             break;
           case 'SYNC_ERROR':
             // A hard failure leaves an incomplete index too, so it gets the same
-            // banner rather than an error strip with nothing under it.
+            // banner rather than an error strip with nothing under it. Terminal for
+            // the same reason as `SYNC_DONE`.
             stopSyncPoll();
-            setSyncRunning(false, false);
+            applySyncAuthority({ running: false, interrupted: false });
             applySyncReply({
               completed: false,
               stopReason: msg && msg.stopReason ? msg.stopReason : 'page_failed',
@@ -2275,35 +2594,87 @@
   }
 
   /**
-   * Read the sync completeness contract from the worker.
+   * Read the sync state from the worker — BOTH the running/cancelling answer and
+   * the completeness contract.
    *
    * `GET_CLIPS` / `GET_FACETS` only know whether the index was truncated; the
    * cursor in `SYNC_STATUS` is what carries `completed`, `stopReason`, `error`
    * and `expectedTotal`, so this is the one read that lets the banner name the
    * real cause instead of asserting a page cap that may never have been hit.
+   * `readSyncFacts` reads the top level first and `cursor` as the fallback for
+   * every field, and this reply carries the contract in BOTH places.
    *
-   * Best-effort by design: the panel is fully usable without it, so a failure
-   * is logged for debugging and nothing else. It never rejects.
+   * It RETURNS whether it got an authoritative answer, and that is the point of
+   * rewriting it: `syncStatusKnown` stays false on a failure, so the Sync control
+   * cannot be enabled by an unanswered question. The previous version caught every
+   * error and reported nothing, which left a panel that believed nothing was
+   * running after a failed read — and enabled Sync on that belief.
    *
-   * @returns {Promise<void>}
+   * Never rejects: a dead context becomes the reload notice, and anything else is
+   * one bounded retry away from `onSurfaceFocus`.
+   *
+   * @returns {Promise<boolean>} true when the worker answered
    */
   async function refreshSyncStatus() {
+    var reply = null;
     try {
-      var reply = await send('SYNC_STATUS', {});
-      if (reply && reply.running === true) {
-        setSyncRunning(true, reply.cancelling === true);
-      } else if (state.syncRunning) {
-        setSyncRunning(false, false);
-        announce('Sync ended.');
-      }
-      // `readSyncFacts` reads the top level first and `cursor` as the fallback for
-      // every field, and this reply carries the contract in BOTH places, so one
-      // call covers the whole thing and repaints the banner.
-      applySyncReply(reply);
-      scheduleSyncPoll(!!(reply && reply.running));
+      reply = await send('SYNC_STATUS', {});
     } catch (err) {
+      if (isDeadContext(err)) {
+        showContextNotice();
+        return false;
+      }
       dbg('SYNC_STATUS failed:', textOf(err));
+      // Retry a bounded number of times before giving up on this pass. A single
+      // transport hiccup on open must not leave the panel with a permanently
+      // disabled Sync and nothing to click.
+      if (syncStatusRetries < SYNC_STATUS_RETRIES && !state.contextDead) {
+        syncStatusRetries += 1;
+        setTimeout(function () {
+          void refreshSyncStatus().catch(reportUnexpected);
+        }, SYNC_STATUS_RETRY_MS);
+      } else {
+        showError('Could not read the sync status, so ' + SYNC_CONTROL.start
+          + ' stays unavailable: ' + textOf(err));
+        announce('Could not read the sync status, so ' + SYNC_CONTROL.start
+          + ' stays unavailable. Reopen the panel or click it to try again.');
+        paintControls();
+      }
+      return false;
     }
+    syncStatusRetries = 0;
+    var wasRunning = state.syncRunning;
+    applySyncAuthority(reply);
+    // The contract is folded on every read, and `mergeSyncFacts` keeps whichever
+    // reply knew more — the banner's gate is still `completed === false`, so a
+    // sparse poll cannot invent or retire a verdict.
+    applySyncReply(reply);
+    scheduleSyncPoll(state.syncRunning);
+    paintSyncStatus();
+    if (wasRunning && !state.syncRunning) {
+      // A crawl that ended between two pushes has only been reported by this read.
+      void runQuery(false).catch(reportUnexpected);
+    }
+    return true;
+  }
+
+  /** Bounded retries left for the current failing `SYNC_STATUS` pass. */
+  var syncStatusRetries = 0;
+
+  /**
+   * Re-read the authority when this document comes back into view.
+   *
+   * A side panel is long-lived, so this is the case that matters: the panel can sit
+   * for minutes with a `syncRunning` answer from minutes ago, and a crawl started
+   * from the popup or the in-page dock in between is invisible to it until a push
+   * arrives. Chrome also throttles timers in a panel the user is not looking at, so
+   * the poll itself may not have run. Both events are cheap, idempotent and only
+   * ever overwrite with the worker's answer.
+   */
+  function onSurfaceFocus() {
+    if (document.hidden || state.contextDead) return;
+    syncStatusRetries = 0;
+    void refreshSyncStatus().catch(reportUnexpected);
   }
 
   /**
@@ -2339,7 +2710,13 @@
     wireSearch();
     wireActions();
     listenForPushes();
+    /* Sync is DISABLED from this first paint: `syncStatusKnown` is false, so the
+     * control says it is checking and cannot start anything. This is the fix for
+     * the panel's half of the reported defect — it used to paint an enabled "Sync"
+     * and stay that way until a push or a poll happened to arrive. */
     paintControls();
+    document.addEventListener('visibilitychange', onSurfaceFocus);
+    window.addEventListener('focus', onSurfaceFocus);
     await loadSettings();
     // The selection is read BEFORE the first query so the ticks are correct on
     // the rows' first paint rather than flipping a moment later. It is
