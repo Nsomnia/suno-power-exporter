@@ -10548,27 +10548,58 @@ function onRuntimeMessage(message, sender, sendResponse) {
   // `undefined` (not `false`) is the documented way to decline to respond.
   if (!routed) return undefined;
 
-  let result;
-  try {
-    result = routed.run();
-  } catch (syncErr) {
-    log('error', 'router.handler_threw', { type: message && message.type, error: describeError(syncErr) });
-    safeSend(sendResponse, errorReply(syncErr));
-    return undefined;
-  }
-
-  if (!result || typeof result.then !== 'function') {
-    safeSend(sendResponse, result);
-    return undefined;
-  }
-
-  result.then(
-    (reply) => safeSend(sendResponse, reply),
-    (err) => {
-      log('error', 'router.handler_threw', { type: message && message.type, error: describeError(err) });
-      safeSend(sendResponse, errorReply(err));
+  /* THE BOOTSTRAP GATE, AND WHY IT IS HERE RATHER THAN IN EACH HANDLER.
+   *
+   * The worker can be evicted at any await, and bootstrap runs `void` at module
+   * scope, so on a cold wake `routed.run()` could execute while `bootstrap()` was
+   * still opening the database. Handlers that touch storage then failed against an
+   * unopened DB, and the symptom was indistinguishable from real emptiness: the
+   * popup rendered the placeholder triad — "Not signed in", tiles at `—`, and "no
+   * local library yet" — for an account with a fully populated index.
+   *
+   * Two handlers already awaited `ensureBootstrapped()` themselves. Two out of
+   * ~28 is not a convention, it is a race with a low sample size, and it fails on
+   * exactly the cold wake a user hits after closing the browser overnight.
+   *
+   * `ensureBootstrapped()` resolves even when bootstrap ITSELF failed — it
+   * catches and logs its own failure, and `bootstrap()` returns EARLY if
+   * `DB.open()` fails rather than throwing. So this gate guarantees bootstrap has
+   * FINISHED, not that the database opened. A genuinely broken DB still surfaces
+   * as a handler error, which is correct: that is a real fault worth reporting,
+   * unlike a cold wake that merely needed to wait a moment.
+   *
+   * The cost is one-time. `bootstrapPromise` is memoised, so every message after
+   * the first awaits an already-resolved promise — a microtask, not a DB open. The
+   * alternative is paying a spurious failure on every cold wake. */
+  ensureBootstrapped().then(() => {
+    let result;
+    try {
+      result = routed.run();
+    } catch (syncErr) {
+      log('error', 'router.handler_threw', { type: message && message.type, error: describeError(syncErr) });
+      safeSend(sendResponse, errorReply(syncErr));
+      return;
     }
-  );
+
+    if (!result || typeof result.then !== 'function') {
+      safeSend(sendResponse, result);
+      return;
+    }
+
+    result.then(
+      (reply) => safeSend(sendResponse, reply),
+      (err) => {
+        log('error', 'router.handler_threw', { type: message && message.type, error: describeError(err) });
+        safeSend(sendResponse, errorReply(err));
+      }
+    );
+  });
+  /* `true` for every routed message now, including handlers that answer
+   * synchronously: the response can no longer arrive in this turn, because the
+   * bootstrap gate put a microtask between here and `routed.run()`. Returning
+   * `undefined` for those would close the channel before the reply was sent,
+   * which is precisely the "message port closed" failure this function exists to
+   * avoid. Holding the channel is the safe side of that trade. */
   return true;
 }
 
