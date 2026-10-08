@@ -165,7 +165,13 @@ importScripts(
   '../lib/drm.js',
   '../lib/tagger.js',
   '../lib/lyrics.js',
-  '../lib/audio.js'
+  '../lib/audio.js',
+  /* Sections extracted out of this file. Each part declares its own top-level
+   * functions and publishes them on a single SMU-prefixed global. This list
+   * runs before the monolith's own declarations are evaluated, so a part must
+   * not CALL into the monolith at load time, only at call time.
+   * scripts/check-build.sh enforces the load-order and reference rules. */
+  './parts/15-quota.js'
 );
 
 /**
@@ -220,6 +226,21 @@ if (!SunoTagger) MISSING_LIBS.push('lib/tagger.js (SunoTagger) — files will be
 
 const TAGGER_AVAILABLE = !!(SunoTagger && typeof SunoTagger.tagAudioFile === 'function');
 const FILTER_AVAILABLE = !!(SunoFilter && typeof SunoFilter.apply === 'function');
+
+/* Extracted sections, and whether they actually loaded. Each part is an
+ * `importScripts` entry above, so a part that fails to parse — or a path typo —
+ * leaves its names undefined and every call site below throws on first use.
+ * That is a loud enough failure, but it surfaces as a mid-session error on a
+ * route rather than as "the file is missing" at wake, so it is checked here
+ * where the other load-time health checks already live.
+ *
+ * The names are read off the global deliberately and never re-bound: see the
+ * export note at the bottom of `background/parts/15-quota.js` for why a
+ * top-level `const` with one of these names throws in a classic worker. */
+const MISSING_PARTS = [];
+if (!globalThis.SMUQuota || typeof globalThis.SMUQuota.quotaView !== 'function') {
+  MISSING_PARTS.push('background/parts/15-quota.js (quotaView)');
+}
 
 /* ==========================================================================
  * 1. CONSTANTS
@@ -9140,111 +9161,18 @@ async function readSelectionIds() {
 
 /* ==========================================================================
  * 15. QUOTA
+ *
+ * MOVED to `background/parts/15-quota.js`, loaded by `importScripts` near the
+ * top of this file. This signpost stays so a reader scanning the numbered
+ * sections still finds where quota lives.
+ *
+ * Extracted first because it is the smallest section with NO load-time
+ * dependency on anything defined below it: everything it needs from the
+ * monolith (`log`, `OpError`, `describeError`, `classifyAuthFailure`,
+ * `STORAGE_KEYS`, `SunoAPIClient`, `SunoAPI`) is referenced at CALL time, so
+ * the split cannot trip the hoisting hazard `importScripts` introduces. See
+ * the header comment in the part itself.
  * ======================================================================== */
-
-/**
- * A flat quota view for every consumer.
- *
- * `downloads` and `credits` are deliberately SEPARATE objects: credits are a
- * different resource from the download meter, and conflating them is how the
- * old badge cheerfully reported plenty of headroom while downloads were
- * exhausted. The scalar aliases exist because the page UI reads several
- * spellings; they all carry the SAME number.
- *
- * @param {object} quota a `SunoAPIClient.quota()` result
- * @returns {object}
- */
-function quotaView(quota) {
-  if (!quota) return null;
-  const remaining = quota.unlimited === true
-    ? null
-    : (typeof quota.effectiveRemaining === 'number' ? quota.effectiveRemaining : quota.remaining);
-  const view = {
-    used: typeof quota.used === 'number' ? quota.used : null,
-    limit: typeof quota.limit === 'number' ? quota.limit : null,
-    remaining,
-    effectiveRemaining: typeof quota.effectiveRemaining === 'number' ? quota.effectiveRemaining : null,
-    additionalRemaining: typeof quota.additionalRemaining === 'number' ? quota.additionalRemaining : null,
-    unlimited: quota.unlimited === true,
-    resetsOn: quota.resetsOn || null,
-    plan: quota.plan || null,
-    canBulkDownload: quota.canBulkDownload === undefined ? null : quota.canBulkDownload,
-    // Aliases. Identical values, spelled so no consumer has to guess.
-    left: remaining,
-    available: remaining,
-    downloadsRemaining: remaining,
-    total: typeof quota.limit === 'number' ? quota.limit : null,
-    resetsAt: quota.resetsOn || null,
-    resetAt: quota.resetsOn || null,
-    resetDate: quota.resetsOn || null,
-    fetchedAt: quota.fetchedAt || Date.now(),
-  };
-  return view;
-}
-
-/**
- * The DOWNLOAD quota. Credits are a DIFFERENT resource and are reported in a
- * separate field, never merged — the old badge showed credits.
- * @param {{refresh?:boolean}} payload
- * @returns {Promise<object>}
- */
-async function getQuota(payload) {
-  if (!SunoAPIClient || typeof SunoAPIClient.quota !== 'function') {
-    throw new OpError('no_quota', 'lib/api.js did not register.');
-  }
-  let quota;
-  try {
-    quota = await SunoAPIClient.quota({ force: payload.refresh === true });
-  } catch (quotaErr) {
-    const info = describeError(quotaErr);
-    if (info.code === 'unauthorized' || info.code === 'bad_token' || info.code === 'missing_token') {
-      const auth = classifyAuthFailure(quotaErr);
-      throw new OpError(auth.code, auth.message, { badToken: auth.badToken });
-    }
-    throw new OpError(info.code, info.message);
-  }
-  try {
-    await chrome.storage.local.set({ [STORAGE_KEYS.QUOTA]: { at: Date.now(), quota } });
-  } catch (cacheErr) {
-    log('warn', 'quota.cache_write_failed', { error: describeError(cacheErr) });
-  }
-  await paintQuotaBadge(quota);
-  return {
-    ok: true,
-    // `quota` is the flat, alias-rich download view every UI reads.
-    quota: quotaView(quota),
-    downloads: quotaView(quota),
-    // Credits are NOT downloads. Kept in their own field on purpose.
-    credits: {
-      monthly: quota.monthlyCredits,
-      total: quota.totalCredits,
-    },
-    creditPacks: Array.isArray(quota.raw && quota.raw.download_credit_packs)
-      ? quota.raw.download_credit_packs
-      : [],
-    semantics: SunoAPI && SunoAPI.QUOTA_SEMANTICS ? SunoAPI.QUOTA_SEMANTICS.rules : null,
-    fetchedAt: quota.fetchedAt,
-  };
-}
-
-/**
- * Paint the toolbar badge with DOWNLOADS REMAINING, not credits.
- * @param {object} quota
- * @returns {Promise<void>}
- */
-async function paintQuotaBadge(quota) {
-  if (!chrome.action || typeof chrome.action.setBadgeText !== 'function') return;
-  try {
-    let text = '';
-    if (quota.unlimited) text = '∞';
-    else if (typeof quota.effectiveRemaining === 'number') text = String(Math.max(0, quota.effectiveRemaining));
-    else if (typeof quota.remaining === 'number') text = String(Math.max(0, quota.remaining));
-    await chrome.action.setBadgeText({ text });
-    await chrome.action.setBadgeBackgroundColor({ color: '#8b5cf6' });
-  } catch (badgeErr) {
-    log('debug', 'quota.badge_failed', { error: describeError(badgeErr) });
-  }
-}
 
 /* ==========================================================================
  * 16. ROUTER
@@ -9431,6 +9359,7 @@ const ROUTES = {
           lyrics: !!SunoLyrics,
           offscreen: !!(chrome.offscreen && chrome.offscreen.hasDocument),
           missingLibs: MISSING_LIBS,
+          missingParts: MISSING_PARTS,
           // Main-world capability, stated as capability rather than as outcome:
           // the content script uses these to drive the page, and a build that
           // cannot inject cannot patch `MediaSource` or read the auth tap.
@@ -9488,6 +9417,7 @@ const ROUTES = {
       drm: SunoDRM && typeof SunoDRM.stats === 'function' ? SunoDRM.stats() : null,
       audioWarnings: SunoAudio && typeof SunoAudio.getWarnings === 'function' ? SunoAudio.getWarnings() : [],
       missingLibs: MISSING_LIBS,
+      missingParts: MISSING_PARTS,
       rateLimiter: SunoAPIClient && SunoAPIClient.rateLimiter
         ? SunoAPIClient.rateLimiter.stats()
         : null,
@@ -10273,6 +10203,9 @@ async function bootstrap() {
   if (MISSING_LIBS.length) {
     log('error', 'bootstrap.missing_libs', { missing: MISSING_LIBS });
   }
+  if (MISSING_PARTS.length) {
+    log('error', 'bootstrap.missing_parts', { missing: MISSING_PARTS });
+  }
   await loadSettings();
 
   try {
@@ -10334,6 +10267,7 @@ async function bootstrap() {
 
   log('info', 'bootstrap.ready', {
     missingLibs: MISSING_LIBS,
+    missingParts: MISSING_PARTS,
     filter: FILTER_AVAILABLE,
     tagger: TAGGER_AVAILABLE,
   });

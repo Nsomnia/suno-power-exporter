@@ -59,6 +59,7 @@ lib/audio.js
 lib/api.js
 lib/suno.js
 background/background.js
+background/parts/15-quota.js
 content/content.js
 popup/popup.js
 options/options.js
@@ -513,6 +514,81 @@ for i, cs in enumerate(m.get("content_scripts") or []):
 for i, w in enumerate(m.get("web_accessible_resources") or []):
     for j, p in enumerate(w.get("resources") or []):
         add("web_accessible_resources[%d].resources[%d]" % (i, j), p)
+
+# The worker loads the extracted `background/parts/*.js` sections through
+# `importScripts`, which the manifest cannot express. Without this, a renamed or
+# deleted part is invisible here and fails at runtime instead — as a route that
+# throws the first time it is used, minutes into a session.
+worker = (m.get("background") or {}).get("service_worker")
+if isinstance(worker, str) and os.path.exists(worker):
+    import re as _re
+    wtext = open(worker, encoding="utf-8").read()
+
+    # Quote/backslash characters come from chr() so this file's shell quoting is
+    # not entangled with the python heredoc's: a stray apostrophe in prose here
+    # silently changes how the heredoc is parsed and makes bash report a syntax
+    # error hundreds of lines away from the real cause.
+    CH, Q1, Q2, BS = chr(92), chr(39), chr(34), chr(92)
+
+    def _strip_js_comments(src):
+        """Blank out // and /* */ comments, preserving length and newlines.
+
+        Necessary before any regex over this file: the importScripts call carries
+        a block comment explaining the load-order rule, and inside prose an
+        apostrophe looks exactly like a string delimiter to a regex. Scanning the
+        raw text therefore reads English as a path.
+        """
+        out = list(src)
+        i, n = 0, len(src)
+        while i < n:
+            c = src[i]
+            if c == Q1 or c == Q2 or c == BS:
+                i += 1
+                while i < n and src[i] != c:
+                    i += 2 if src[i] == BS else 1
+                i += 1
+                continue
+            if src[i:i + 2] == "//":
+                while i < n and src[i] != chr(10):
+                    out[i] = " "
+                    i += 1
+                continue
+            if src[i:i + 2] == "/*":
+                end = src.find("*/", i + 2)
+                end = n if end < 0 else end + 2
+                for k in range(i, end):
+                    if out[k] != chr(10):
+                        out[k] = " "
+                i = end
+                continue
+            i += 1
+        return "".join(out)
+
+    def _import_scripts_paths(src):
+        """Yield every string argument of every `importScripts(...)` call."""
+        clean = _strip_js_comments(src)
+        for mm in _re.finditer(r"\bimportScripts\s*\(", clean):
+            i, depth = mm.end(), 1
+            while i < len(clean) and depth:
+                c = clean[i]
+                if c == Q1 or c == Q2:
+                    q, i = c, i + 1
+                    start = i
+                    while i < len(clean) and clean[i] != q:
+                        i += 2 if clean[i] == BS else 1
+                    yield clean[start:i]
+                    i += 1
+                    continue
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                i += 1
+
+    for lit in _import_scripts_paths(wtext):
+        # importScripts paths are relative to the worker's own directory.
+        resolved = os.path.normpath(os.path.join(os.path.dirname(worker), lit))
+        refs.append(("background.service_worker importScripts", resolved))
 
 missing = [(label, p) for label, p in refs if not os.path.exists(p)]
 
