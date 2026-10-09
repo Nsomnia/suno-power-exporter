@@ -70,7 +70,7 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
   },
-  "version": "6.2.1",
-  "version_name": "6.2.1 - sync completes: stale-error fix, real resume, bounded auto-resume, behavioural test harness",
+  "version": "6.3.0",
+  "version_name": "6.3.0 - working/refactor branch: SIP decomposition, facet filters, batch fixes",
   "minimum_chrome_version": "116"
 }

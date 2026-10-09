@@ -6,6 +6,106 @@
 
 # Items To Complete
 
+- [ ] **[UI — P1] Sidebar stats should be clickable filter chips.** The sidebar's
+  stats block currently reads as passive text:
+  ```
+  total 5951
+  matched 5951
+  liked 2103
+  instrumental 60
+  v5 2192
+  v5.5 1300
+  v4.5 873
+  v6 558
+  v4.5+ 347
+  v4 286
+  ```
+  Make each line a TOGGLE BUTTON (chip) that filters what the download buttons
+  will act on, composing with each other and with the search box:
+  - `total` / `matched` are scope selectors (everything indexed / everything the
+    current query matches); `liked` and `instrumental` are boolean facets;
+    the model-version lines (`v5`, `v5.5`, `v4.5`, `v6`, `v4.5+`, `v4`) are
+    single-select-with-multiples (click to include, click again to exclude or
+    clear — the interaction should be obvious from the chip's own styling).
+  - The chips must state what a download will act on: the count on the chip
+    should become "X selected" while a filter is active, so a user can never
+    fire a 2,000-file batch believing it was 55.
+  - The facets already exist server-side — `GET_FACETS` computes them over the
+    whole index (`side_panel.js` renders them at ~:1150), and the worker's
+    QUERY engine already filters by model/liked/instrumental. This is wiring,
+    not new engine work.
+  - Regression to avoid: the triplicated dock state machine (the P2 refactor
+    item below) means every surface must agree what "filtered" means — extract
+    the shared filter-state core BEFORE adding a second consumer of it, or the
+    sidebar will disagree with the popup the way the sync dock once did.
+
+- [ ] **[UI — P1] Per-row download controls are nearly unusable.** Each row in
+  the user's library view has two controls: a tri-state mark (blank → check →
+  'x' → blank) and a per-row download icon. Reported behaviour, in the user's
+  words: selecting multiple tracks with the overlay UI buttons is "quite
+  clunky", it "appeared to not be working" but then downloaded at least some of
+  the selection, and — worst — rows that finished downloading did not change
+  state, so the user could not tell what was done or what was still pending.
+  Fix as one item:
+  - a row's download state must be VISIBLE and LIVE: pending / in-flight /
+    done / failed, driven off the DL_ITEM pushes the worker already sends
+    (`state.batch.items` in the content script already tracks per-clip state —
+    the grid just does not render it);
+  - the tri-state mark needs a single, obvious meaning (mark-for-download vs
+    mark-to-exclude is not discoverable) and must not silently change meaning
+    between surfaces;
+  - multi-select needs shift/ctrl range selection and a visible running tally
+    ("12 of 40 selected · 8 queued");
+  - the appearance of failure-then-download must be explained: either the
+    drawer was showing a stale stop notice (`renderBatchStop`) or the selection
+    model diverged from what was sent — reproduce under the harness before
+    touching the DOM.
+
+- [ ] **[TESTING — P1] The download batch path is untested.** The sync crawl now
+  has a behavioural harness (`tests/`, 13/13); the download batch driver has
+  nothing. Before adding the facet-filter work above, extend the harness to
+  cover the batch: plan → DOWNLOAD_START → DL_PROGRESS/DL_ITEM pushes →
+  DL_DONE for the four terminal outcomes (`complete`, `cancelled`, `quota`,
+  `ladder_exhausted`), plus a resumable batch interrupted by eviction and
+  resumed by a fresh worker (the same shape as sync test (b)). The quota
+  preflight refusal (stopped:'quota' with quotaShortfall, no batch started)
+  must be pinned too — the popup's `reportQuotaShortfall` depends on its exact
+  reply shape. The fake server already stubs media URLs; it needs a
+  `downloads.onChanged` stub in `chrome-stub.js` to reconcile what the browser
+  "did".
+
+- [ ] **[PERF — P2] Search works but should get a local query/index layer.**
+  Search is functional and not painfully slow today, but every query round-trips
+  the worker, which filters over IndexedDB. Investigate a local index (an
+  in-worker inverted index over the facets the QUERY engine already computes —
+  model, liked, instrumental, workspace, date — with the full row fetched by
+  id on hit) so a 6,000-clip library answers filter queries without a table
+  scan. NOTE: Suno's own page console noise (Statsig multi-instance warnings,
+  Stripe.js double-load, ably.net SSE drops, `blob:` 404s, and the 401 burst
+  from `studio-api-prod.suno.com/*`) is the SITE's own traffic, not the
+  extension's — do not chase it as part of this item; the 401 cluster is
+  suno.com's page session expiring, which the extension's MAIN-world token tap
+  handles independently.
+
+- [ ] **[REFACTOR — P0] The SIP refactor program.** Every JS file in this
+  project is a monolith — `background/background.js` ~11.3k lines,
+  `content/content.js` ~5.1k, `popup/popup.js` ~3.4k, `lib/api.js` ~4.4k,
+  `lib/db.js` ~2.9k, `side_panel.js` ~2.8k — which has produced exactly the
+  failure mode the user describes: feature creep to the max, bugs that live in
+  the seam between 4,000 lines of unrelated code, and users who cannot begin
+  to report problems beyond "this UI element does this". This item is the
+  program header; the P1/P2/P3 items below are its execution order:
+  1. `[REFACTOR — P1]` decompose `background/background.js` (parts list below),
+  2. `[REFACTOR — P2]` the triplicated sync-dock core, then
+     `[REFACTOR — P2]` decompose `content/content.js`,
+  3. `[REFACTOR — P3]` decompose `lib/`.
+  THE GATE, non-negotiable: `npm run verify` (98 structural checks + the
+  13-test behavioural harness) must be green after EVERY extraction, one part
+  per commit, behaviour-preserving only. The harness is what makes this
+  refactor verifiable rather than another unverifiable rewrite — the exact
+  mistake that produced 20+ unverified fix iterations is to refactor without
+  it.
+
 - [ ] **[REFACTOR — P2] Triplicate sync-dock logic across three surfaces.** The same
   sync state machine is hand-written three times: `content/content.js` (the in-page
   overlay), `popup/popup.js` (toolbar mini-window), and `side_panel.js` (full panel).
