@@ -8,15 +8,25 @@ this is a document about working inside them.
 
 ## 📁 File map
 
-Line counts from `wc -l` at time of writing.
+Line counts from `wc -l` at time of writing. **A line count in this table is a
+size, not an address** — nothing in this document navigates by it. Where a claim
+depends on a specific line, it is quoted as `file:line` **next to the text it
+belongs to**, and the code's own comments are the authority; several of them
+describe *why* a line must stay where it is. `scripts/check-build.sh` locates its
+own targets by content for the same reason — a check anchored to a line number
+silently stops checking anything the moment anything above it is edited.
 
 | File | Lines | Responsibility |
 |---|---:|---|
 | `manifest.json` | 82 | MV3 declaration, permissions, host permissions, CSP |
-| `background/background.js` | 8284 | **the only orchestrator** — 18 numbered sections + §5b |
-| `content/content.js` | 3939 | the in-page dock: filters, results, batch drawer, row checkboxes, token **status** panel, the incompleteness banner |
+| `background/background.js` | 11060 | **the only orchestrator** — 18 numbered sections + §5b, four of which now live in `background/parts/` |
+| `background/parts/02-diagnostics.js` | 170 | §2 verbatim: the single `log()` + ring buffer. See § the parts mechanism |
+| `background/parts/03-errors.js` | 182 | §3 verbatim: redaction, typed failures, classification. Five exports, read by 16 of the remaining sections |
+| `background/parts/06-messaging.js` | 101 | §6 verbatim: `broadcast` + `validateSender`. 19 call sites, so the part mechanism's real stress test |
+| `background/parts/15-quota.js` | 159 | §15 verbatim: the flat quota view, the fetch behind it, the toolbar badge. **Read this one first** — its header is the authoritative statement of how parts load |
+| `content/content.js` | 5105 | the in-page dock: filters, results, batch drawer, row checkboxes, token **status** panel, the incompleteness banner |
 | `content/content.css` | 980 | dock styling, loaded as a web-accessible resource |
-| `lib/api.js` | 3743 | the only HTTP client; **24** verified routes, `RateLimiter`, typed errors, the `/api/feed/v3` cursor walk |
+| `lib/api.js` | 4351 | the only HTTP client; **24** verified routes, `RateLimiter`, typed errors, the `/api/feed/v3` cursor walk |
 | `lib/audio.js` | 2037 | decode / resample / interleave / BPM primitives (pure math) |
 | `lib/crypto.js` | 1234 | AES-GCM unwrap, chunked AES-CTR, counter arithmetic, container sniffing |
 | `lib/db.js` | 2964 | the **only** thing allowed to open `suno-library`; 5 stores, schema v3 |
@@ -26,30 +36,30 @@ Line counts from `wc -l` at time of writing.
 | `lib/tagger.js` | 2126 | ID3 / MP4 metadata writing, container detection |
 | `offscreen/offscreen.js` | 1607 | Web Audio + `createObjectURL` + the WAV renderer **and both vendored encoders** |
 | `offscreen/offscreen.html` | 38 | the offscreen page; `default-src 'none'` |
-| `options/options.js` | 1609 | the settings page |
-| `options/options.html` | 605 | ladder editor, pacing, naming, tags, conversion, quota guard, import/export |
+| `options/options.js` | 1898 | the settings page |
+| `options/options.html` | 612 | ladder editor, pacing, naming, tags, conversion, quota guard, import/export |
 | `options/options.css` | 563 | |
-| `popup/popup.js` | 2303 | the toolbar popup: boot, tiles, progress, activity log, the three-way sync verdict |
+| `popup/popup.js` | 3376 | the toolbar popup: boot, tiles, progress, activity log, the three-way sync verdict |
 | `popup/popup.html` | 82 | |
 | `popup/popup.css` | 401 | |
-| `side_panel.js` | 1083 | the browse/search surface; 50-row paging from the local index, the same sync verdict |
-| `side_panel.html` | 372 | |
+| `side_panel.js` | 2741 | the browse/search surface; 50-row paging from the local index, the same sync verdict |
+| `side_panel.html` | 625 | |
 | `vendor/lame.all.js` | 530,087 B | **third-party**: lamejs 1.2.1, **LGPL-3.0**, SHA-256 `026bd888…fea3b` |
 | `vendor/OggVorbisEncoder.js` | 2,358,493 B | **third-party**: `higuma/ogg-vorbis-encoder-js` @ `7a87242`, **MIT** wrapper + **Xiph BSD** C, SHA-256 `5a9f749a…179b` |
 | `vendor/LICENSE-lamejs.txt` | 424 B | the LAME FAQ answer shipped in the npm tarball, verbatim — see the caveat below |
 | `vendor/LICENSE-OggVorbisEncoder.txt` | 1,078 B | the upstream **MIT** licence, © 2015 Yuji Miyane, verbatim |
 | `vendor/README.md` | 10,327 B | provenance, pinned version/commit, both SHA-256s, licence positions, API notes |
 | `.gitattributes` | 109 | `* text=auto eol=lf` plus `vendor/** -text` — see § why the encoders are vendored |
-| `scripts/check-build.sh` | 588 | the pre-flight gate: **77 checks**, including SHA-256 of both encoders |
+| `scripts/check-build.sh` | 951 | the pre-flight gate: **92 checks**, including SHA-256 of both encoders, cross-surface `stopReason` parity, and the parts collision/probe guards |
 | `run` | 18 | a bash loop that opens `urls.lst` in Brave. Handy, not part of the build. |
 | `urls.lst` | 85 | URL list for `run` |
 | `icons/icon16.png` | 400 B | |
 | `icons/icon48.png` | 3.6 KB | |
 | `icons/icon128.png` | 18 KB | |
 
-38,242 lines across the JS/HTML/CSS files in this table, **plus 2,888,580 bytes of
-vendored third-party JavaScript** that is deliberately *not* counted there — see
-§ why the encoders are vendored.
+46,684 lines across the JS/HTML/CSS files in this table (including the four
+extracted parts), **plus 2,888,580 bytes of vendored third-party JavaScript** that
+is deliberately *not* counted there — see § why the encoders are vendored.
 
 ### The boundary rule
 
@@ -71,12 +81,12 @@ The 18 sections, in order (`background/background.js:10-28`):
 ```
  0  Bootstrap            importScripts + global resolution
  1  Constants            storage keys, alarm names, ladder definition
- 2  Diagnostics          the single log() + ring buffer
- 3  Errors               redaction, typed failures, classification
+ 2  Diagnostics          the single log() + ring buffer            -> parts/02-diagnostics.js
+ 3  Errors               redaction, typed failures, classification -> parts/03-errors.js
  4  Settings             in-memory cache with write-behind
  5  Auth                 Clerk JWT minted from the page, never from cookies
  5b MAIN-world           the six page-side operations + the RUN_MAIN_WORLD route
- 6  Messaging            broadcast, sender validation, router scaffolding
+ 6  Messaging            broadcast, sender validation, router     -> parts/06-messaging.js
  7  Offscreen            blob URLs + Web Audio (worker has neither)
  8  Filenames            hard sanitisation + path templates
  9  Saving bytes         data: URL vs offscreen blob URL
@@ -84,9 +94,9 @@ The 18 sections, in order (`background/background.js:10-28`):
       download-route, wav-official, zip, hls), each with a cost class
 11  Tagging              tag + sidecar pipeline
 12  Batch driver         resumable, isolated failures, quota-aware
-13  Library sync         per-workspace cursor crawl, an oracle, and a verdict
+13  Library sync         resumable crawl, no silent truncation, and §13c's run record
 14  Query + selection    filter/sort/page server-side, explicit id list
-15  Quota                DOWNLOAD quota, never credits
+15  Quota                DOWNLOAD quota, never credits             -> parts/15-quota.js
 16  Router               the request table
 17  Lifecycle            install / startup / alarms / download events
 ```
@@ -96,9 +106,118 @@ The 18 sections, in order (`background/background.js:10-28`):
 >
 > **§5b is not in the header list at `background/background.js:10-28`.** It was
 > added after that list was written and the header was not updated, so the list
-> reads as 18 sections while the file carries 19. This is a documentation nit in the
-> source, not a code defect — `MAIN_WORLD_OPS` and `runMainWorldOp` are real, and
-> everything below cites them at their actual lines.
+> reads as 18 sections while the file carries 19. This is a documentation nit in
+> the source, not a code defect — `MAIN_WORLD_OPS` (`background.js:2719`) and
+> `runMainWorldOp` are real, and everything below cites them at their actual lines.
+>
+> **The four arrows are a newer split.** §§2, 3, 6 and 15 have been extracted into
+> `background/parts/*.js` as classic scripts loaded by `importScripts`; the
+> numbered signpost comment for each one stays in the worker so a reader scanning
+> the section list still finds where the code went. The mechanism, and the three
+> rules that break silently when it is violated, are in
+> [§ the parts mechanism](#the-parts-mechanism-backgroundpartsjs).
+>
+> The header's own list still describes all four sections as if they were inline,
+> which is the same class of documentation nit as §5b — deliberately left in place
+> rather than silently corrected, because the signposts do point at the truth.
+
+### 🧩 The parts mechanism (`background/parts/*.js`)
+
+The worker is 11,060 lines and splitting it is the only way it gets smaller
+without an 11,000-line class. Four sections have moved out. The authoritative
+statement of the mechanism is the header comment of the **first** part extracted,
+`background/parts/15-quota.js:1-28`, and this section is downstream of it — read
+that file if the two ever disagree.
+
+`manifest.json` declares no `"type": "module"`, so the worker is a **classic**
+worker and `importScripts` (`background/background.js:168-186`) evaluates in the
+**same global scope** as the monolith. Each part therefore declares its own
+top-level `function`s, which *are* the worker's bindings, and the worker calls
+them as bare globals — exactly as it called them when they lived inline. Nothing
+is imported; nothing is namespaced at the binding level.
+
+Each part also publishes **one namespaced global** for discovery and load-time
+health-checking:
+
+| part | publishes | probed by |
+|---|---|---|
+| `background/parts/02-diagnostics.js` | `globalThis.SMUDiagnostics` (`:167`) | `MISSING_PARTS` at `background/background.js:252-254` |
+| `background/parts/03-errors.js` | `globalThis.SMUErrors` (`:179`) | `:255-257` |
+| `background/parts/06-messaging.js` | `globalThis.SMUMessaging` (`:100`) | `:258-260` |
+| `background/parts/15-quota.js` | `globalThis.SMUQuota` (`:158`) | `:261-263` |
+
+`MISSING_PARTS` is a **load-time** check, alongside `MISSING_LIBS`, because a part
+that fails to parse or a path typo leaves its names undefined and the failure
+otherwise surfaces as a mid-session error on one route rather than as "the file is
+missing" at wake.
+
+#### The three rules, and the regression each one prevents
+
+These are the constraints that break **silently**, which is why they are written
+down rather than left to a code review.
+
+1. **A part must not CALL into the monolith at load time, only at call time.**
+   `importScripts` runs near the top of the worker, long before the monolith's own
+   declarations are evaluated. Everything a part needs from the monolith —
+   `log`, `OpError`, `describeError`, `classifyAuthFailure`, `STORAGE_KEYS`,
+   `SunoAPIClient`, `SunoAPI`, `TRUSTED_PAGE_PATTERNS`, `findSunoTabs` — is
+   referenced inside function bodies, never while the part is being evaluated. A
+   load-time reference would throw on **every worker wake**, not on a rare path.
+   *Regression prevented:* an `importScripts` list reorder turning one keystroke of
+   load order into a dead worker. Note that the `02 ↔ 03` cycle (`log` calls
+   `redactText`; `redactText` is used by `log`) is safe **because both references
+   are call-time**, so the order between those two files is genuinely irrelevant —
+   they are listed in numeric order for readability only.
+
+2. **A part must NOT re-bind its exports at the top level of the worker.**
+   `const { quotaView } = SMUQuota;` in the worker throws
+   `SyntaxError: Identifier 'quotaView' has already been declared`. A top-level
+   `function` declaration occupies the global **lexical** scope that a top-level
+   `const` also claims; wrapping it in a block only moves the error into a scope
+   that cannot be used. That is why the worker reads the exported names **off the
+   global deliberately and never re-binds them** (`background.js:248-250`,
+   `MISSING_PARTS` reads `globalThis.SMUDiagnostics` rather than destructuring).
+   *Regression prevented:* "cleaning up" the export contract into something that
+   looks more idiomatic and takes the whole worker down at load.
+
+3. **A top-level `function` in a part whose name the monolith also declares
+   SILENTLY REPLACES the monolith's.** No error, no warning, and `node --check`
+   still passes — it validates each file in isolation and cannot see that two files
+   claim one global name. Every call site in the worker then quietly starts
+   calling the part's version. (`const` behaves differently and worse-looking but
+   better-caught: two parts declaring the same `const` throws `SyntaxError` at
+   load. It is the `function` case that is invisible, and it is the only one worth
+   guarding.)
+   *Regression prevented:* this is what `scripts/check-build.sh` § 4c exists for —
+   it extracts every column-0 `function` / `const` / `let` / `var` / `class`
+   declaration from the worker and from every part and **fails on any overlap**,
+   because the symptom it prevents is that logging (or whatever else a part
+   shadows) behaves wrong in a way nothing points at.
+
+A fourth asymmetry is worth knowing before anyone "fixes" a report: `function`
+declarations become **properties** of the global object; `class` and `const`
+declarations do **not** — they become bindings in the global *lexical* environment,
+which is shared across classic scripts but is not reachable as a property. So after
+`03-errors.js` loads, `globalThis.describeError` is a function, `globalThis.OpError`
+is `undefined`, and a bare `OpError` reference works fine. **The worker must
+reference the class export as a bare global.** Only the `globalThis.` form is
+wrong, and only for the class.
+
+#### What the build enforces
+
+| check | what it prevents |
+|---|---|
+| every part is listed in `BUILD_FILES` (`scripts/check-build.sh:62-65`) | a part that exists on disk but is never `node --check`ed, so a parse error in it ships silently. The manifest/`importScripts` check proves the path *exists*; nothing proved it was *built* |
+| every `MISSING_PARTS` probe names a symbol its part **actually exports** | a health check that reports healthy on a broken part — the same failure shape as the parity-check bug below, one level up |
+| every `importScripts` path resolves **relative to the worker's own directory** | a renamed or moved part failing at runtime with no build-time complaint |
+| no column-0 name is declared by both the worker and a part, or by two parts | rule 3 above |
+
+Note that the parity check that first shipped in § 4b **had its own bug and
+silently passed an injected drift**: it brace-balanced the map's span, and the
+entries contain no braces, so the scan stopped after the first key — comparing one
+trivial key across three files and passing however far they had drifted. It now
+reads **consecutive entry lines**. It is in this document because a check that has
+been wrong in exactly that way is worth knowing about the second time.
 
 ---
 
@@ -223,14 +342,58 @@ This is the constraint that shaped the most code.
 
 | Rule | Where |
 |---|---|
-| Nothing authoritative lives in a module-scope variable | `background/background.js:59-60` |
-| All durable state in IndexedDB + `chrome.storage.session` | `STORAGE_KEYS` at `background/background.js:228-236` |
-| Settings are a **cache**, re-derived on every wake | `settingsCache` at `background/background.js:1125`, `loadSettings` at `:1365` |
-| Crawl cursors written after **every page** | `afterPage` → `DB.syncState.set('feed', cursor)` at `background/background.js:6793` (and after every workspace at `:6838`, and at `:7187`, `:7258`, `:7293`) |
-| Batch plans persisted so an evicted worker can rebuild them | `persistPlan`, `background/background.js:4826-4839` |
-| An append-only journal per batch | `DB.journal.append` throughout; trimmed at `background/background.js:5540` |
-| A 30-second alarm is the only reliable wake | `KEEPALIVE_PERIOD_MINUTES = 0.5`, `background/background.js:261` |
-| `bootstrap()` is idempotent and re-entrant | `background/background.js:8076` |
+| **Nothing authoritative lives in a module-scope variable — with one qualified exception, below** | `background/background.js:59-68` |
+| All durable state in IndexedDB + `chrome.storage.session` | `STORAGE_KEYS` at `background/background.js:269-287` |
+| Settings are a **cache**, re-derived on every wake | `settingsCache`, `loadSettings` — both located by name; the declaration lines move with every extraction |
+| Crawl cursors written after **every page** | `afterPage` → `DB.syncState.set('feed', cursor)` at `background/background.js:7249` (and after every workspace at `:7294`) |
+| **The RUN is recorded in `chrome.storage.session`, not in a module binding** | `STORAGE_KEYS.SESSION_SYNC_RUN` = `suno.syncRun.session` at `:286`; the six scalars it holds are declared in `coerceSyncRun`'s `@returns` at `:8324-8326` |
+| Batch plans persisted so an evicted worker can rebuild them | `persistPlan` at `background/background.js:4777` |
+| An append-only journal per batch | `DB.journal.append` throughout |
+| A 30-second alarm is the only reliable wake | `KEEPALIVE_PERIOD_MINUTES = 0.5` |
+| `bootstrap()` is idempotent and re-entrant | `background/background.js:10778` |
+
+#### 🚨 The module-scope rule is real, and it was FALSE here until §13c existed
+
+This document used to assert *"Nothing authoritative lives in a module-scope
+variable"* with a flat citation to two lines of the worker's header. **That
+statement was not merely imprecise — the code was violating it, and two live bugs
+came out of the violation.** Both were user-visible, and both looked like the UI
+lying:
+
+1. **A dead crawl reported itself as running.** `SYNC_STATUS.running` ORed in
+   *"the stored heartbeat is younger than 90 seconds"* (`SYNC_STALE_MS`). A
+   heartbeat written by a worker that has since been **evicted** stays fresh for
+   ninety seconds, so every poll in that window was told a crawl was in flight when
+   nothing could cancel it and no page would ever commit. There is exactly one
+   worker at a time, so **"no controller" cannot mean "a different worker owns
+   this"** — `running` is now `!!syncController` and nothing else
+   (`background/background.js:10039-10049`).
+2. **`cancelling:true` became permanent.** The stored `cancelRequested` was written
+   on the press and **cleared nowhere**, and `DB.syncState.set` **merges**, so one
+   cancel in a browser session made every later `SYNC_STATUS` report a cancellation
+   still in progress — for every subsequent run, forever. It is now cleared at the
+   run's verdict, at the §13c reconciliation (`background/background.js:8587-8596`),
+   and `cancelling` is gated on a live run (`:10050-10057`).
+
+**The honest version of the rule is the one the code now follows**, and it is
+stated in the worker's own invariants block (`background/background.js:59-68`):
+
+> a module-scope binding may be a cache or a handle, never the only copy of a fact
+> a surface needs.
+
+`syncController` and `syncCancelRequested` remain module-scope **deliberately**:
+they are the things that *die* with the worker, because they describe the crawl
+*this* worker is running, and after an eviction there is no such crawl to describe.
+§13c keeps the part that must outlive the worker — *"a crawl is in flight, started
+at T, and a Stop was requested"* — in `chrome.storage.session`, which survives
+eviction and is cleared on browser close. **Two stores, two questions, one writer
+each**: `DB.syncState` holds the **crawl** (how far the walk got, and does it
+satisfy the oracle); `chrome.storage.session` holds the **run** (is a crawl in
+flight right now).
+
+The full argument, including why the run record is not simply a column on the
+cursor row, is in § the state machine below and in the source at
+`background/background.js:8256-8301`.
 
 **Invariant B** (`background/background.js:38-39`) is the sharp edge:
 
@@ -506,20 +669,25 @@ Note that `vendor/** text eol=lf` would **not** be enough: `eol=lf` also rewrite
 a *lone* CR, and `vendor/OggVorbisEncoder.js` is an asm.js bundle whose byte-exact
 content is load-bearing. `-text` is the correct rule.
 
-**What enforces it.** `scripts/check-build.sh` runs **77 checks**, up from 63. The
-new ones matter most:
+**What enforces it.** `scripts/check-build.sh` runs **92 checks**, up from 63. The
+ones that matter most:
 
 | check | what it does |
 |---|---|
-| SHA-256 of both encoders | verifies each bundle against the digest **parsed out of `vendor/README.md`** — never restated in the script, so the record and the bytes cannot drift apart. A missing section, a missing `\| SHA-256 \|` row or an unparseable digest is a **FAILURE**, not a silent skip. Also compares the recorded byte size. (`scripts/check-build.sh:322-415`) |
-| existence + byte audit + UTF-8 over all five `vendor/` files | the byte audit, the Chrome-strict non-character gate and the `iconv`/`python3` validity pass used to **skip** `vendor/`, which meant the largest JavaScript in the package was the only JavaScript nobody checked (`scripts/check-build.sh:147-320`) |
-| `node --check` on both bundles | **tolerated, not failed**: `OggVorbisEncoder.js` parses but V8 prints *"Invalid asm.js: Expected shift of word size"* on stderr while still exiting 0 — a compiled-mode advisory about one shift inside libvorbis, not a syntax error and not a sign the bytes changed. Failing on upstream code we are forbidden to patch would be failing on the wrong thing (`scripts/check-build.sh:433-466`) |
+| SHA-256 of both encoders | verifies each bundle against the digest **parsed out of `vendor/README.md`** — never restated in the script, so the record and the bytes cannot drift apart. A missing section, a missing `\| SHA-256 \|` row or an unparseable digest is a **FAILURE**, not a silent skip. Also compares the recorded byte size. (`scripts/check-build.sh:326-420`) |
+| existence + byte audit + UTF-8 over all five `vendor/` files | the byte audit, the Chrome-strict non-character gate and the `iconv`/`python3` validity pass used to **skip** `vendor/`, which meant the largest JavaScript in the package was the only JavaScript nobody checked (`scripts/check-build.sh:151-325`) |
+| `node --check` on both bundles | **tolerated, not failed**: `OggVorbisEncoder.js` parses but V8 prints *"Invalid asm.js: Expected shift of word size"* on stderr while still exiting 0 — a compiled-mode advisory about one shift inside libvorbis, not a syntax error and not a sign the bytes changed. Failing on upstream code we are forbidden to patch would be failing on the wrong thing (`scripts/check-build.sh:721-754`) |
+| **duplicated `stopReason` maps are byte-identical** | the sync `stopReason` → English map is deliberately duplicated in `popup/popup.js:648-660`, `side_panel.js:483-495` and `content/content.js:2055-2067` — content scripts and extension pages share no module graph, so there is nowhere to put one copy all three can read. Nothing but discipline kept them equal, and a reason added to one file and forgotten in the other two produces two surfaces describing the same failure differently. **This check has been wrong exactly once and passed an injected drift**: it brace-balanced the map's span, and the entries contain no braces, so the scan stopped after the first key. It now reads consecutive entry lines (`scripts/check-build.sh:421-524`) |
+| **no global name collision between parts and the monolith** | rule 3 of [§ the parts mechanism](#the-parts-mechanism-backgroundpartsjs): a part declaring a top-level `function` the worker also declares silently replaces it, with no error and `node --check` still passing. The check extracts every column-0 `function`/`const`/`let`/`var`/`class` name from the worker and from every part and fails on any overlap (`scripts/check-build.sh:525-617`) |
+| **every part is registered in `BUILD_FILES` and its `MISSING_PARTS` probe is honest** | a part on disk but absent from `BUILD_FILES` is never syntax-checked, and a probe naming a symbol the part does not export reports healthy on a broken part. Both are asserted (`scripts/check-build.sh:618-704`) |
+| **`importScripts` paths resolve** | resolved **relative to the worker's own directory**, because the manifest cannot express them at all — so nothing else in the build would notice a renamed or moved part until a worker wake (`scripts/check-build.sh:812-885`) |
 
 > **`vendor/` is in `AUDIT_FILES`, deliberately *not* in `BUILD_FILES`.** None of
 > those five paths appear in `manifest.json` (the offscreen page injects the
 > `<script>` at runtime), so the manifest path check cannot police them, and
 > `BUILD_FILES` is documented as the list to keep in sync with the manifest
-> (`scripts/check-build.sh:79-101`).
+> (`scripts/check-build.sh:51-81`, the declaration and its comment). **A part
+> belongs in it**, and there is now a check for that — see the parts table above.
 
 ### Other MV3 details the code handles
 
@@ -618,7 +786,7 @@ thing in the protocol, and it exists because a crawl that died on page 20 once s
 |---|---|
 | `completed` | **authoritative.** `true` only when the crawl reached the end of its own walk **and**, where the oracle is valid, met it |
 | `truncated` | the compatibility flag, derived as **`!completed`** — never only the `max_pages` case |
-| `stopReason` | the machine-readable cause; one of `complete \| page_failed \| empty_page \| stuck_cursor \| no_new_ids \| max_pages \| expected_total \| aborted` |
+| `stopReason` | the machine-readable cause; one of `complete \| page_failed \| empty_page \| stuck_cursor \| no_new_ids \| max_pages \| expected_total \| suspected_truncation \| interrupted \| aborted` (rows from older builds may also carry `cursor_missing` — a cursor-less page now completes by omission, so no new row can) |
 | `error` | redacted text. **Never dropped on the failure path**, and `SYNC_STATUS` also carries it as `error` beside the cursor's own `lastError` |
 | `expectedTotal` | the sum of every project's `clip_count` — the oracle. **`0` is the "Suno reported no count" sentinel** and every surface treats it as *unknown* rather than as zero |
 | **`totalSeen`** | **UNIQUE clips indexed** — what "5,501 of ~5,500" has to mean |
@@ -711,28 +879,82 @@ during an explicitly confirmed HLS capture. Everything else is a read.
 
 ### Push types (worker → everyone)
 
-8 types, frozen at `background/background.js:808-812`. **The router ignores all of
-them**, so a broadcast can never re-enter the router and be answered with
-"unknown message type" (invariant E, `background/background.js:46-47`; the router
-explicitly ignores its own push types at `:8319-8325`).
+**11 types**, frozen in one `Object.freeze`d `Set` named `PUSH_TYPES`
+(`background/background.js:911-916`). **The router ignores all of them**, so a
+broadcast can never re-enter the router and be answered with "unknown message type"
+(invariant E, `background/background.js:46-47`; the router's own check is
+`if (PUSH_TYPES.has(message.type)) return null;` at `:10460`).
 
 | Type | payload |
 |---|---|
-| `SYNC_PROGRESS` | `{page, pagesDone, seen, added, etaMs, state, workspace, workspacesDone, expectedTotal, totalSeen, uniqueSeen, completed, truncated}` — `truncated:true` because a run in progress is by definition not a finished library (`background/background.js:6794-6820`) |
-| `SYNC_DONE` | the **whole contract** (`background/background.js:7204-7218`) plus `{total, projects, durationMs, projectList, projectFeed, dislikedCount, dislikedApproximate}`. The abort path is the same reply (`:7265-7275`) |
-| `SYNC_ERROR` | the **same key set as `SYNC_DONE`**, `completed:false` (`background/background.js:7303-7310`, outer net `:5763-5783`) — `error` is the **accumulated** `lastError`, not the tail of the failure list |
-| `DL_PROGRESS` | `{batchId, done, total, ok, failed, skipped, currentTitle, bytes, etaMs}` |
-| `DL_ITEM` | `{batchId, clipId, variant, state, filename, source, error, bytes}` |
-| `DL_DONE` | `{batchId, ok, failed, skipped, durationMs, stoppedReason, quotaPolls, remainingItems, quotaStop, quotaAfter}` |
-| `DL_ERROR` | `{error, code?}` |
-| `TOKEN_CHANGED` | `{expiresAt}` |
+| `SYNC_STARTED` | `{state:'running', running:true, cancelRequested:false, force, dislikedMode, maxPages, feedPageLimit, total, heartbeatAt}` (`background/background.js:5755-5766`). **Authoritative**: it is the worker's own statement that a crawl exists, and all three surfaces route it through their one authority writer rather than inferring liveness |
+| `SYNC_PROGRESS` | `{page, pagesDone, seen, added, etaMs, state, workspace, workspacesDone, expectedTotal, totalSeen, uniqueSeen, completed, truncated}` — `truncated:true` because a run in progress is by definition not a finished library (`background/background.js:7250-7276`). The phase-reporting path broadcasts the **same type** with `{phase, phasePagesDone, phaseJoined, phaseItems, note, total}` and `etaMs:null` (`:8102-8118`) — one type, two shapes, which is why `SYNC_PROGRESS` alone never establishes liveness on a surface |
+| `SYNC_DONE` | the **whole contract** (`...syncContractView(cursor)`, `background/background.js:7791-7805`) plus `{total, projects, durationMs, projectList, projectFeed, dislikedCount, dislikedApproximate}`. The abort path is the **same reply** (`:7858-7868`) — an abort is still a `SYNC_DONE`, because the reply a user sees after pressing cancel has to say the same things every other reply says |
+| `SYNC_ERROR` | the **same key set as `SYNC_DONE`**, `completed:false` (`background/background.js:7902-7909`, outer nets at `:5781-5790` and `:5810+`) — `error` is the **accumulated** `lastError`, not the tail of the failure list |
+| `SYNC_CANCEL_REQUESTED` | `{state:'cancelling', running:true, cancelRequested:true, alreadyRequested, heartbeatAt}` (`:8225-8232`). "Stopping", **not** "stopped": an abort is cooperative and the crawl unwinds at its next `await` |
+| `SYNC_CANCELLED` | `{state, running:false, cancelRequested:false, orphanedCursorCleared, stale, heartbeatAt}` (`:8174-8182` cleared an orphan; `:8203-8211` nothing was running; `:8648-8658` the §13c wake reconciliation). `running:false` and **no verdict rides on it** — a surface must re-read the cursor, which is what makes it safe as the reconciliation's terminal push |
+| `DL_PROGRESS` | `{batchId, done, total, ok, failed, skipped, currentTitle, bytes, etaMs}` (`:5218`) |
+| `DL_ITEM` | `{batchId, clipId, variant, state, filename, source, error, bytes}` (`:5233`) |
+| `DL_DONE` | `{batchId, ok, failed, skipped, durationMs, stoppedReason, quotaPolls, remainingItems, quotaStop, quotaAfter}` (`:5494`) |
+| `DL_ERROR` | `{error, code?}` (`:3495`) |
+| `TOKEN_CHANGED` | `{expiresAt}` (`:1580`, and `:10001` on the `SET_TOKEN` route). `expiresAt: null` means **"unknown"**, not "none" |
+
+#### Handling is per-surface, and the three sync-lifecycle pushes were the gap
+
+**Handling is not universal, and it was not — it is worth being precise about which
+push went missing where, because the symptom was silent and one of the three was a
+dropped verdict rather than a dropped pixel.**
+
+`SYNC_STARTED`, `SYNC_CANCEL_REQUESTED` and `SYNC_CANCELLED` are the **three
+sync-lifecycle pushes**. All three are in `PUSH_TYPES`, and all three surfaces now
+handle all three — but the in-page dock **did not**, at the time this document was
+written:
+
+| surface | listener | the three lifecycle cases |
+|---|---|---|
+| popup | `popup/popup.js:3096-3106` | `:3099-3101` |
+| side panel | `side_panel.js:2463-2570` | `:2478`, `:2513`, `:2519` |
+| in-page dock | `content/content.js:4917-5085` | `:4939`, `:4957`, `:4971` — **added**; they used to fall through to `default:` and vanish |
+
+The dock's three cases carry the reason they exist in place
+(`content/content.js:4932-4938`): a sync started from the popup or the side panel
+left the dock idle — no running dot, no phase, no poll armed — and a cancellation
+started elsewhere was never reflected at all. **The dock is the surface that
+reports the crawl's completeness**, so a dropped push there is a dropped verdict,
+not a cosmetic gap.
+
+Two related facts the same fix depends on, and which a reader should not
+reconstruct by accident:
+
+- **`SYNC_PROGRESS` cannot put a surface from "not running" into "running."** It
+  carries no `running` field, and arming a poll means believing a crawl is live.
+  Both the dock and the side panel enforce that in their `applySyncProgress`
+  handlers (`content/content.js:4922-4926`, `side_panel.js:2492-2498`) — the side
+  panel used to call `setSyncRunning(true, …)` on exactly that evidence, which was
+  one of the ways two surfaces came to disagree about one crawl. **The running
+  answer comes from `SYNC_STATUS`, `SYNC_STARTED`, or the surface's own
+  `SYNC_START`.**
+- **An unhandled push type is not silently swallowed on the dock.** `default:`
+  tallies it into `unknownPushes` and logs a count under `settings.debug`
+  (`content/content.js:5069-5085`), because a push type the switch does not know
+  is either a worker that grew one — and the dock is then behind the contract — or
+  a message that should never have been sent. The side panel's `default:` is a bare
+  `break` (`side_panel.js:2568-2569`), so it is the dock that carries that tally.
+
+> **No push may carry a completeness verdict.** `broadcast` is the fan-out for
+> every push type, and the contract that says whether a crawl is complete is
+> `syncContractView` in §13. A second surface inventing its own answer from a push
+> is exactly the drift the completeness contract exists to prevent — which is why
+> `SYNC_CANCELLED` deliberately carries no verdict and each surface re-reads the
+> durable cursor instead.
 
 `stoppedReason` is the one field that must never collapse: it is
 `'complete' | 'quota' | 'ladder_exhausted' | 'cancelled'`
-(`background/background.js:4819`, computed at `:5491-5495`), and both UIs branch
-on it rather than on `failed` — a batch that halted on the monthly allowance is a
-warning, not a success and not a failure (`popup/popup.js:42-46`,
-`content/content.js:2743-2762`).
+(`background/background.js:4756`, computed by the ternary at `:5428-5432`), and
+both UIs branch on it rather than on `failed` — a batch that halted on the monthly
+allowance is a warning, not a success and not a failure (invariant H,
+`popup/popup.js:42-48`; the dock renders four distinct outcomes from it at
+`content/content.js:3480`).
 
 Note the two `stoppedReason` vocabularies, which are easy to confuse: **`DL_DONE`
 carries the batch reason; `SYNC_DONE` carries `stopReason`.** They are unrelated
@@ -856,10 +1078,10 @@ broadcast SYNC_DONE / SYNC_ERROR with the whole contract
 | **method + path** | `POST /api/feed/v3` (`lib/api.js:1100`) |
 | **first request** | `cursor: null` in the body |
 | **every later request** | that response's `next_cursor` verbatim. `''`, `0` and `{}` are treated as the same empty value (`lib/api.js:474-509`) |
-| **`limit`** | **100** by default, **clamped to 100** — the confirmed server maximum. Larger values are rejected (`lib/api.js:149-153`, `:2267-2270`) |
+| **`limit`** | `settings.feedPageLimit` (**100** by default — the confirmed server maximum, larger rejected; **20** is the site's own page size and the minimum sensible value), **clamped to 1–100** (`lib/api.js:149-153`, `:2267-2270`). A page size the server caps lower cannot truncate the walk — the cursor chain, not the page size, decides where it ends |
 | **`filters`** | `trashed`, `disliked`, `fromStudioProject:{presence}`, `stem:{presence}`, `stemComplement`, `sort:{sortBy, sortDirection}`, `workspace:{presence, workspaceId}` (`lib/api.js:2300-2308`) |
 | **tri-states** | `BooleanFilter` values are the **strings** `"True"` / `"False"` / `"Any"`, **never booleans** (`lib/api.js:167-179`, `:444-459`) |
-| **response** | `{clips:[…], next_cursor}`; the client also accepts `nextCursor` (`lib/api.js:495-509`) |
+| **response** | `{clips:[…], next_cursor}`; the client also accepts `nextCursor` (`lib/api.js:495-509`). **The terminal signal is either spelling**: `next_cursor` present and null, or the field absent entirely — the same stop the shipped client makes (`nextCursor: l.data?.next_cursor || null` → `getNextPageParam`), published by this client as `cursorOmitted` with the envelope evidence retained |
 | **`startPage`** | **ignored, with a warning.** Cursor pagination makes "resume at page N" inexpressible (`lib/api.js:2280-2286`) |
 
 The whole filter object is the bundle's own
@@ -996,45 +1218,167 @@ feed is wrong, and the summary says so (`lib/api.js:2469-2481`,
 fires when the worker actually handed `iterateFeed` a count — i.e. only when
 `oracleApplied` was `true`.
 
-#### ✅ The state machine — completion is positive
+#### ✅ The state machine — completion is the feed's own terminal signal
 
-A walk is `completed` **only** when the envelope is ok, `next_cursor` is null, and
-at least one page arrived. That check runs **first**
-(`lib/api.js:2414-2423`), because a null cursor is the *terminal* value, not a
-repeated one — the walk's own first request also carries a null cursor, so a repeat
-check that ran earlier would flag every finished walk as stuck.
+A walk is `completed` **only** when the envelope is ok and the feed says "no
+more" — which it says two ways, both verified against the shipped web client's
+own bundle (`out/chunks/1r1sqgyc3uj2o.js`): a `next_cursor` that is **present
+and null**, or a cursor field that is **absent entirely** (the site's
+`getNextPageParam` receives null for `l.data?.next_cursor || null` either way,
+and every walk on a live account ends on the omission spelling — mid-walk pages
+carry the cursor, only the final partial page omits it). An omission-completion
+is published as `cursorOmitted:true` with the envelope's key list retained on
+the summary, so a short one stays diagnosable and the automatic probe can
+re-request the exact page.
 
-Everything else, in strict order (`lib/api.js:2424-2481`):
+The terminal check runs **first** (`lib/api.js`), because a null cursor is the
+*terminal* value, not a repeated one — the walk's own first request also
+carries a null cursor, so a repeat check that ran earlier would flag every
+finished walk as stuck.
+
+Everything else, in strict order:
 
 | # | condition | `stopReason` | `completed` |
 |---|---|---|:--:|
-| — | ok page, `next_cursor === null`, ≥1 page | `complete` | ✅ |
+| — | ok page, `next_cursor` present and null, ≥1 page | `complete` | ✅ |
+| — | ok page, **no cursor field at all** (end-of-feed by omission, `cursorOmitted:true`) | `complete` | ✅ |
 | 1 | `!envelope.ok` after the page's 5 retries — 429/5xx/401 included. A **first-page** failure is **thrown**, because nothing was indexed | `page_failed` | ❌ |
 | 1a | the caller aborted (checked **before** `page_failed`, so a cancel is never a fault) | `aborted` | ❌ |
 | 2 | 0 clips arrived while a cursor is still offered — **the feed is unreadable from here, not finished** | `empty_page` | ❌ |
 | 3 | a `next_cursor` the walk already followed — checked **before** the no-new-ids rule, because a stuck cursor usually also repeats rows | `stuck_cursor` | ❌ |
 | 4 | a page that added **0 new clip ids** while the cursor advanced | `no_new_ids` | ❌ |
 | 5 | `maxPages` reached with a cursor outstanding | `max_pages` | ❌ |
-| 6 | `next_cursor === null` **but** `totalSeen < expectedTotal` — **only when the worker handed the client a count**, i.e. `oracleApplied === true` | `expected_total` | ❌ |
+| 6 | the feed said "no more" **but** `totalSeen < expectedTotal` — **only when the worker handed the client a count**, i.e. `oracleApplied === true` | `expected_total` | ❌ |
 
-`truncated` is defined as **`!completed`** (`lib/api.js:2493`), so the pre-existing
+`truncated` is defined as **`!completed`**, so the pre-existing
 `summary.truncated` read in `background.js` keeps meaning *"do not tell the user we
-synced everything"* for every incomplete case, not only the `max_pages` one. And the
+synced everything"* for every incomplete case, not only for the `max_pages` one. And the
 invariant *"`completed` may never be true next to a truncation or an error"* is
-**asserted at the end**, not assumed (`lib/api.js:2514-2519`).
+**asserted at the end**, not assumed.
 
 > **This is the rule the previous build broke in the crudest way possible:** two
 > empty pages, a short page, or a counter running out were all read as "end of
-> library". None of them is evidence of the end of the library.
+> library". None of them is evidence of the end of the library. The omission
+> reading is not that bug back: it is the server's OWN signal (the same one the
+> shipped client stops on), taken as-is from an `ok` page and published with its
+> evidence — never inferred from page fill, and never reachable from a page that
+> failed, repeated its cursor, or ran out of page budget.
+
+#### 🧾 §13c — the run record, and what an evicted worker leaves behind
+
+The cursor row answers *"how far did the walk get"*. It does **not** answer *"is a
+crawl in flight right now"*, and conflating the two is what produced the two bugs
+described in [§ workers get evicted](#-3-workers-get-evicted-at-30-s-idle). §13c
+is the second store that does answer it.
+
+| | `DB.syncState` (`feed`) | `chrome.storage.session` (`suno.syncRun.session`) |
+|---|---|---|
+| question | how far the walk got; does it satisfy the oracle | **is a crawl in flight right now** |
+| writer | `afterPage` / `persist` / the verdict | `writeSyncRun`, one place |
+| lifetime | disk-resident; **outlives a browser restart** | survives worker **eviction**; **cleared on browser close** |
+| read by | every surface, as the verdict | `syncEvictionVerdict`, as evidence of liveness |
+
+Six scalars, no clip content, no cursor, no oracle numbers, no token material:
+`{running, startedAt, cancelRequested, cancelRequestedAt, phase, heartbeatAt,
+epoch}`. `epoch` is `SYNC_RUN_EPOCH`
+(`background/background.js:8314`), regenerated on every wake and stamped on every
+write and never taken from the caller — so a record can only ever claim the worker
+that wrote it, and **a record carrying a different epoch was written by a worker
+that no longer exists, which is an eviction by definition.** That is the one piece
+of sync state that is still module-scope, and it is deliberately the useless half:
+a process identity, not a run.
+
+Three write sites, and the order of the first one is load-bearing:
+
+- `startSync` writes the record **before the crawl is announced**
+  (`background/background.js:5718-5731`). `syncController` is created on the line
+  above and dies with the worker, so if the record is not on disk before the first
+  `await` inside `runSync`, there is a window in which a wake sees a cursor
+  claiming a run that no record corroborates and no controller owns — exactly the
+  disagreement this record exists to prevent.
+- the per-page heartbeat, **throttled** to `SYNC_RUN_HEARTBEAT_FLOOR_MS` (5 s,
+  `:7240-7243`), and the phase reporter's own heartbeat (`:8094`).
+- `cancelSync` writes the same intent to the **cursor first** and the record second
+  (`:8239-8252`), so a failure in the record degrades to the cursor-only path rather
+  than to a run claiming a stop the crawl never saw.
+
+`clearSyncRun` runs on **every terminal path** — normal verdict, thrown crawl,
+orphan-clearing press, no-op press, and the reconciliation itself — so its absence
+is the normal steady state and never means something went wrong.
+
+#### The eviction signature, and the reconciliation
+
+Stated once, because the rule is what makes the reconciliation safe:
+
+> persisted "a crawl is in flight" **AND** no `syncController` in **this** worker
+
+Only `startSync` ever writes the first half, and it also creates the controller.
+The second half is true on every worker except the one that started the run, and
+only one worker exists at a time — **so a mismatch cannot be a race between two of
+them.** `syncEvictionVerdict` (`background/background.js:8442-8501`) computes it,
+plus an `epochMismatch` flag and the `ageSource` (`controller` / `run-record` /
+`cursor-row` / `none`) so the log says which half of the evidence it had.
+
+Two floors, and the difference between them is deliberate:
+
+- **`cursorOnly`** — no record claimed a crawl, so the row is the sole evidence: a
+  browser restart (session storage went with it), an install from a build that
+  predates the record, or a failed record write. It gets the **same 90-second
+  grace** (`SYNC_STALE_MS`) the read paths already give it, because with no record
+  there is nothing to compare an epoch against and being late is better than
+  reconciling a crawl that started seconds ago (`:8482-8491`).
+- **record present** — a 5-second floor (`SYNC_RUN_HEARTBEAT_FLOOR_MS`) is enough,
+  and generous for the same reason the 90 s one is: a page can be held for a long
+  rate-limit backoff, and calling a live crawl dead is the same over-confident
+  report as the bug being fixed.
+
+`reconcileSyncRunOnWake` (`:8541-8660`) then does three things, and **only ever
+says "incomplete"** — an eviction is not evidence of completeness, and the
+completeness contract is explicit that a wrong answer in the cautious direction is
+still a wrong answer:
+
+1. **re-reads the row before writing** (`:8549`). `reconcileStaleCursor` merges, so
+   a row that changed underneath it would come back carrying a live crawl's
+   progress with `state:'interrupted'` written over the top. Cheap next to getting
+   it wrong, and it is the only thing standing between this and a crawl declared
+   dead while it is still running.
+2. **heals the row** through the existing `reconcileStaleCursor` wording, so the
+   sentence the user reads is the same one `GET_BOOT` / `SYNC_STATUS` will show
+   afterwards — plus the one addition there was no wording for before: a stop that
+   was asked for and then **lost with the worker** is neither "you cancelled" nor
+   "the crawl broke", and reporting it as the latter sends the user off to debug a
+   fault they did not cause (`:8581-8584`). It **clears `cancelRequested`** here,
+   which is the second half of the stuck-"Stopping" bug.
+3. **broadcasts `SYNC_CANCELLED`** (`:8648-8658`). **The push is the point.** Every
+   terminal push in §13 is emitted from memory, so a surface that only *listens*
+   never learns the run ended — the popup kept an indeterminate "Stopping" slider
+   and the dock a live bar, because the last thing either was told was
+   `SYNC_CANCEL_REQUESTED`. `SYNC_CANCELLED` is the one push all three surfaces
+   already treat as terminal-with-no-verdict, and **carrying no verdict is a
+   feature here**: a push cannot be a second source of truth about completeness,
+   and the row each surface then re-reads is the one true one.
+
+Then it clears the record, which makes the whole thing **idempotent in the strong
+sense**: after it runs there is no record and the row is no longer `running`, so
+every later wake sees nothing to reconcile. No tombstone, no marker, no risk of a
+duplicate terminal push.
+
+`reconcileSyncRunOnBootstrap` (`:8698-8736`) is the wake-time entry point, called
+from `bootstrap` **after** the batch resume and the download reconciliation —
+both reconcile "the previous worker left something running", and ordering it after
+them means it runs late rather than never, and never races `runBatch` for the
+database. It reads the run record and the cursor **concurrently** and judges them
+from the same snapshot, because this is the one place that must not re-read and
+re-race. It **never throws**: a failed reconciliation has to degrade to "the next
+read reconciles it".
 
 #### 💾 Resume — and what it costs
 
 `syncState.feed` is written after **every page**
-(`background/background.js:6793`), so an evicted worker resumes instead of
+(`background/background.js:7249`), so an evicted worker resumes instead of
 restarting. Resume is honoured only when the
 **whole plan agrees**: schema marker, `state === 'running'`, mode, page cap, the
-project list itself, and a finite `stored.examined`
-(`background/background.js:6432-6466`; the project-list half at `:6576-6583`).
+project list itself, and a finite `stored.examined`.
 
 Granularity is the honest part: **`iterateFeed` accepts no `startCursor`.** It
 accepts and explicitly ignores `startPage`, so **the workspace that was in flight
@@ -1359,6 +1703,11 @@ written**, not by the declaration.
 | `suno.selection.session` | the in-flight selection |
 | `suno.activeDownloads.session` | `[[downloadId, info], …]` — the observed-completion bookkeeping |
 | `suno.registeredTabs.session` | the last 50 Suno tabs |
+| `suno.syncRun.session` | **§13c's run record** — six scalars saying whether a crawl is in flight and when it started. Survives worker eviction, cleared on browser close. Not clip content, not a cursor, no token material. See §13c above |
+
+`STORAGE_KEYS` is at `background/background.js:269-287`; the run-record comment
+that explains why this key exists is at `:277-286` and the record's own shape is in
+`coerceSyncRun`'s `@returns` at `:8324-8326`.
 
 > **Invariant G** (`background/background.js:50-51`): *No token or key material is
 > ever logged, or written outside `chrome.storage.session`.* `SENSITIVE_KEY_RE`

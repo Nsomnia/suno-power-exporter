@@ -13,7 +13,7 @@
  *     this part references from the monolith — `log`, `OpError`,
  *     `describeError`, `classifyAuthFailure`, `STORAGE_KEYS`, `SunoAPIClient`,
  *     `SunoAPI` — is referenced at CALL time, never at load time. `importScripts`
- *     runs at `background.js:160`, long before those are defined, so a
+ *     runs at `background.js:168`, long before those are defined, so a
  *     load-time reference here would throw on every worker wake. Call-time is
  *     what makes the split safe.
  *   - Keep it that way: no top-level code in a part may CALL into the monolith.

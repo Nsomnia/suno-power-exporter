@@ -1,0 +1,10 @@
+{
+  "name": "suno-master-utility-browser-extension",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test tests/sync-crawl.test.js",
+    "check": "sh scripts/check-build.sh",
+    "verify": "npm run check && npm test"
+  }
+}

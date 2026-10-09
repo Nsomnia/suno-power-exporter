@@ -69,6 +69,7 @@
     savenote: document.getElementById('sm-savenote'),
 
     syncMaxPages: document.getElementById('opt-sync-max-pages'),
+    feedPageLimit: document.getElementById('opt-feed-page-limit'),
     dislikedMode: document.getElementById('opt-disliked-mode'),
     autoSync: document.getElementById('opt-auto-sync'),
     syncInterval: document.getElementById('opt-sync-interval'),
@@ -448,6 +449,10 @@
     state.settings = s;
 
     C.syncMaxPages.value = String(s.syncMaxPages);
+    /* The worker clamps this to [1, SunoAPI.LIMITS.feedPageLimit] on every
+     * write, so the painted value is always one the crawl can actually use —
+     * the input's own min/max only save the worker the rounding. */
+    C.feedPageLimit.value = String(s.feedPageLimit);
     C.dislikedMode.value = s.dislikedMode;
     setDisabled(C.autoSync, false);
     C.autoSync.checked = s.autoSync === true;
@@ -1104,6 +1109,10 @@
     return {
       /* ---- library sync ---- */
       syncMaxPages: Math.round(numberOf(C.syncMaxPages, 200)),
+      /* The page size the crawl asks /api/feed/v3 for. Clamped here in the
+       * same pass that reads it so an out-of-range number is corrected in the
+       * form the user is looking at; the worker clamps again on write. */
+      feedPageLimit: clampInt(numberOf(C.feedPageLimit, 100), 1, 100, 100),
       dislikedMode: ['include', 'exclude', 'both'].indexOf(C.dislikedMode.value) >= 0 ? C.dislikedMode.value : 'exclude',
       autoSync: C.autoSync.checked === true,
       syncIntervalMinutes: Math.round(numberOf(C.syncInterval, 60)),
@@ -1788,10 +1797,26 @@
     if (syncWired) return;
     syncWired = true;
 
-    C.syncNowStart.addEventListener('click', function () {
-      state.syncNote = 'starting…';
+    C.syncNowStart.addEventListener('click', function (ev) {
+      /* ANY modifier on the click means FULL RE-SYNC — the documented escape
+       * hatch for a cache suspected stale. The worker's `force:true` ignores
+       * the membership cache and the workspace cache-skip gate, re-walks every
+       * page, and REPLACES the index atomically when the crawl completes, so
+       * it deserves its own confirm and its own status line. */
+      var force = !!(ev && (ev.shiftKey || ev.altKey || ev.metaKey || ev.ctrlKey));
+      if (force) {
+        var go = window.confirm(
+          'Full re-sync?\n\n'
+          + 'Every cache is ignored and every feed page is re-walked, which takes about as long '
+          + 'as the first sync you ever ran. When the crawl completes, the local index is '
+          + 'REPLACED in one atomic transaction; if it does not complete, the existing index '
+          + 'is left untouched.\n\nStart it?'
+        );
+        if (!go) return;
+      }
+      state.syncNote = force ? 'starting a full re-sync…' : 'starting…';
       paintSyncState();
-      send('SYNC_START', {}).then(
+      send('SYNC_START', { force: force }).then(
         function () { /* the SYNC_STARTED push does the rest */ },
         function (err) {
           state.syncRunning = false;

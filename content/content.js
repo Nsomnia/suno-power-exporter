@@ -949,7 +949,12 @@
 
     ui.countLabel = h('span', { class: 'sm-count', text: 'no clips loaded' });
 
-    ui.syncBtn = btn('Sync', () => startSync(), 'primary');
+    // Shift/Alt/Cmd/Ctrl on the press = full re-sync (see `startSync`, which the
+    // `ui.syncForce` checkbox also drives); a plain click leaves the checkbox
+    // in charge, so `undefined` — not `false` — is what a plain press passes.
+    ui.syncBtn = btn('Sync', (ev) => startSync(
+      ev && (ev.shiftKey || ev.altKey || ev.metaKey || ev.ctrlKey) ? true : undefined
+    ), 'primary');
     ui.filterBtn = btn('Filters', () => togglePanel());
     ui.batchBtn = btn('Batch', () => toggleDrawer('batch'));
     ui.settingsBtn = btn('Settings', () => toggleDrawer('settings'));
@@ -1073,7 +1078,9 @@
         // from the worker's answer; they used to be created and forgotten, which is
         // why the dock could sit on an enabled "Start sync" through a crawl it did
         // not know about.
-        ui.syncStartBtn = btn('Start sync', () => startSync(), 'primary'),
+        ui.syncStartBtn = btn('Start sync', (ev) => startSync(
+          ev && (ev.shiftKey || ev.altKey || ev.metaKey || ev.ctrlKey) ? true : undefined
+        ), 'primary'),
         // Renamed from "Cancel": "Stop sync" is what the other two surfaces call it
         // and what it does. The old label next to "Start sync" read as cancelling
         // the whole operation rather than ending the running crawl.
@@ -2908,6 +2915,19 @@ function scheduleSyncPoll() {
     const s = state.sync;
     const verdict = syncVerdict();
     const view = syncView();
+    /* FUNCTION SCOPE, NOT BLOCK SCOPE.
+     *
+     * This was declared `const counts = verdict.counts` INSIDE the `else` branch
+     * below and read again further down, in the `.sm-trunc-detail` block that
+     * lives OUTSIDE that branch. A `const` is block-scoped, so the read was a
+     * guaranteed `ReferenceError: counts is not defined` — which is exactly what
+     * Brave reported from content/content.js:3039. It fired on every render in
+     * which the truncation banner existed, i.e. on exactly the INCOMPLETE syncs
+     * the banner is there to explain, so the overlay threw while reporting the
+     * failure and the dock froze on its last good paint.
+     *
+     * Hoisted next to `verdict`, which is the only thing it derives from. */
+    const counts = verdict.counts;
     /* THE SHARED STATE WORD, FIRST. This line used to open with a bare
      * `s.running ? 'running' : (s.state || 'idle')`, which meant three things at
      * once: it printed the worker's lifecycle slug while a crawl was live, it
@@ -2959,7 +2979,6 @@ function scheduleSyncPoll() {
       // the single most valuable string this dock can show: it makes a broken sync
       // obvious at a glance, with no log and no inference, because the index can
       // never be more complete than the smaller of the two numbers.
-      const counts = verdict.counts;
       if (s.total) {
         parts.push(counts ? (s.total + ' indexed · Suno reports ' + counts) : (s.total + ' indexed'));
       } else if (counts) {

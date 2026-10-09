@@ -1990,9 +1990,25 @@
     return !(typeof state.libraryTotal === 'number' && isFinite(state.libraryTotal) && state.libraryTotal > 0);
   }
 
-  function onSyncClick() {
+  function onSyncClick(ev) {
     var settings = state.settings || {};
     var maxPages = clampInt(settings.syncMaxPages, 1, 2000, 200);
+    /* ANY modifier on the press means FULL RE-SYNC — the documented escape
+     * hatch for the caches the worker keeps between syncs (the membership map
+     * and the workspace skip gate). The worker's `force:true` re-walks every
+     * page and REPLACES the index atomically on completion, so it gets its
+     * own confirm, and it never rides on a plain click. */
+    var force = !!(ev && (ev.shiftKey || ev.altKey || ev.metaKey || ev.ctrlKey));
+    if (force) {
+      var goFull = window.confirm(
+        'Full re-sync?\n\n'
+        + 'Every cache is ignored and every feed page is re-walked, which takes about as long '
+        + 'as your first sync. When the crawl completes, the local index is REPLACED in one '
+        + 'atomic transaction; if it does not complete, the existing index is left untouched.\n\n'
+        + 'Start it?'
+      );
+      if (!goFull) return;
+    }
 
     /* REFUSE BEFORE THE CONFIRMATION, NOT AFTER IT. This is the cheap local half of
      * the guard: the authoritative re-read lives in `startSync`, but asking someone
@@ -2029,10 +2045,10 @@
       );
       if (!go) return;
     }
-    startSync();
+    startSync(force);
   }
 
-  function startSync() {
+  function startSync(force) {
     withBusy(async function () {
       var settings = state.settings || {};
       try {
@@ -2052,7 +2068,7 @@
           return;
         }
         var reply = await send('SYNC_START', {
-          force: false,
+          force: force === true,
           dislikedMode: settings.dislikedMode,
           maxPages: settings.syncMaxPages
         });
@@ -2073,14 +2089,15 @@
         // `maxPages` comes from the worker's own reply, so the percentage is
         // measured against the cap that is ACTUALLY being applied.
         state.syncMaxPages = clampInt(reply.maxPages, 0, 100000, 0);
-        state.summaryLines = ['Sync started'];
+        state.summaryLines = [force === true ? 'Full re-sync started' : 'Sync started'];
         state.summaryQuotaText = (settings.dislikedMode === 'both'
           ? 'indexing disliked and non-disliked (two walks of the feed) — roughly double the time'
           : 'mode: ' + String(settings.dislikedMode));
         state.summaryIsBad = false;
         state.summaryKind = '';
         announceSyncView();
-        addLog('Sync started: ' + state.syncMaxPages + ' page cap, dislikedMode=' + String(reply.dislikedMode), 'info');
+        addLog((force === true ? 'Full re-sync started (caches ignored): ' : 'Sync started: ')
+          + state.syncMaxPages + ' page cap, dislikedMode=' + String(reply.dislikedMode), 'info');
         if (typeof reply.feedPageLimit === 'number') {
           addLog('Worker resolved feedPageLimit=' + reply.feedPageLimit + ' maxPages=' + reply.maxPages, 'info');
         }

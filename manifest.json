@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Suno Master Utility - AI Music Hub & Downloader",
-  "description": "Bulk-export Suno: Liked/Workspace/model/date/search filters, resumable batch downloads, M4A/WAV with cover art, BPM and LRC lyrics.",
-  "author": "曲元 & Antigravity",
+  "name": "Suno Master Util + Power Exporter",
+  "description": "Bulk-export Suno tracks. Like/Workspace/model/date/search filters, resumable, formats, cover art, BPM and LRC lyrics.",
+  "author": "https://github.com/Nsomnia/suno-power-exporter",
   "permissions": [
     "storage",
     "downloads",
@@ -70,7 +70,7 @@
   "content_security_policy": {
     "extension_pages": "script-src 'self'; object-src 'self'"
   },
-  "version": "6.2.0",
-  "version_name": "6.2.0 - Library crawl rebuilt on the real POST /api/feed/v3 cursor API, per-workspace, with a scoped clip_count oracle: incomplete syncs can no longer report Up to date, and complete ones can no longer report Incomplete",
+  "version": "6.2.1",
+  "version_name": "6.2.1 - sync completes: stale-error fix, real resume, bounded auto-resume, behavioural test harness",
   "minimum_chrome_version": "116"
 }

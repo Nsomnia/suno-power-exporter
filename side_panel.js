@@ -2036,9 +2036,24 @@
    *
    * @returns {Promise<void>}
    */
-  async function startSync() {
+  async function startSync(force) {
     if (state.contextDead || state.syncRunning || !state.syncStatusKnown) return;
     var settings = state.settings || {};
+    /* ANY modifier on the press means FULL RE-SYNC. The worker's `force:true`
+     * ignores the membership cache and the workspace cache-skip gate, re-walks
+     * every page, and REPLACES the index atomically on completion — a
+     * multi-minute operation, so it gets its own confirm and never rides on a
+     * plain click. */
+    if (force === true) {
+      var goFull = window.confirm(
+        'Full re-sync?\n\n'
+        + 'Every cache is ignored and every feed page is re-walked, which takes about as '
+        + 'long as your first sync. When the crawl completes, the local index is REPLACED '
+        + 'in one atomic transaction; if it does not complete, the existing index is left '
+        + 'untouched.\n\nStart it?'
+      );
+      if (!goFull) return;
+    }
     paintControls();
     setText(C.status, 'Asking the worker whether a sync is running…');
     try {
@@ -2052,7 +2067,7 @@
       }
       setText(C.status, 'Starting a sync…');
       var reply = await send('SYNC_START', {
-        force: false,
+        force: force === true,
         dislikedMode: settings.dislikedMode,
         maxPages: settings.syncMaxPages
       });
@@ -2068,7 +2083,9 @@
       applySyncAuthority({ running: true, cancelRequested: false });
       scheduleSyncPoll(true);
       var mode = reply.dislikedMode ? ' (' + String(reply.dislikedMode) + ')' : '';
-      announce('Sync started' + mode + (state.syncMaxPages > 0 ? ', page cap ' + group(state.syncMaxPages) : '') + '.');
+      announce((force === true ? 'Full re-sync started' : 'Sync started') + mode
+        + (state.syncMaxPages > 0 ? ', page cap ' + group(state.syncMaxPages) : '')
+        + (force === true ? '. Every cache is ignored; every page is re-walked.' : '.'));
     } catch (err) {
       // `SYNC_START` refuses with `sync_running` when a crawl is already in
       // flight — which is the worker's word for "you are already syncing", so
@@ -2416,8 +2433,10 @@
    * "Download everything".
    */
   function wireActions() {
-    C.sync.addEventListener('click', function () {
-      void startSync().catch(reportUnexpected);
+    C.sync.addEventListener('click', function (ev) {
+      /* Shift/Alt/Cmd/Ctrl = full re-sync; see `startSync`. */
+      var force = !!(ev && (ev.shiftKey || ev.altKey || ev.metaKey || ev.ctrlKey));
+      void startSync(force).catch(reportUnexpected);
     });
     C.syncStop.addEventListener('click', function () {
       void stopSync().catch(reportUnexpected);

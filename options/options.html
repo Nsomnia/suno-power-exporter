@@ -44,6 +44,19 @@
       </div>
 
       <div class="sm-row">
+        <label class="sm-lbl" for="opt-feed-page-limit">Feed page size (tracks per page)</label>
+        <input class="sm-num" id="opt-feed-page-limit" type="number" min="1" max="100" step="1"
+               aria-describedby="opt-feed-page-limit-h">
+        <p class="sm-hint" id="opt-feed-page-limit-h">
+          Clips requested per <code>/api/feed/v3</code> page (1&ndash;100). <strong>20</strong> is what
+          Suno&rsquo;s own site pages at; <strong>100</strong> is the API&rsquo;s documented maximum and
+          makes a full crawl roughly 5&times; fewer requests (faster, kinder to rate limits). The walk
+          always follows the server&rsquo;s cursor, so a page size the server caps lower cannot
+          truncate the library &mdash; it only changes how many requests the crawl spends.
+        </p>
+      </div>
+
+      <div class="sm-row">
         <label class="sm-lbl" for="opt-disliked-mode">Downvoted (disliked) clips</label>
         <select class="sm-sel" id="opt-disliked-mode" aria-describedby="opt-disliked-mode-h">
           <option value="include">Ignore &mdash; one pass</option>
@@ -83,9 +96,15 @@
     <div class="sm-actions" id="opt-sync-now">
       <p class="sm-status" id="opt-sync-state" role="status" aria-live="polite">Never synced</p>
       <p class="sm-hint" id="opt-sync-detail"></p>
-      <button id="opt-sync-now-start" class="sm-btn" type="button" aria-label="Start a library sync now">Sync now</button>
+      <button id="opt-sync-now-start" class="sm-btn" type="button" aria-label="Start a library sync now"
+              title="Hold Shift, Alt, Cmd or Ctrl while clicking for a FULL re-sync: every cache is ignored, every page is re-walked, and the index is replaced on completion.">Sync now</button>
       <button id="opt-sync-now-stop" class="sm-btn" type="button" aria-label="Stop the running sync">Stop</button>
       <button id="opt-sync-now-refresh" class="sm-btn" type="button" aria-label="Refresh the current sync status">Refresh status</button>
+      <p class="sm-hint">
+        Hold <strong>Shift</strong> (or Alt/Cmd/Ctrl) while clicking <em>Sync now</em> for a
+        <strong>full re-sync</strong>: the workspace cache and the membership cache are ignored, every
+        page is re-walked, and the index is replaced atomically when the crawl completes.
+      </p>
     </div>
   </section>
 

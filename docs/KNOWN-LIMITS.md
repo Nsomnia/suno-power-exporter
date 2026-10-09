@@ -205,9 +205,19 @@ at 100 — and the crawl no longer has to guess whether it reached the end:
 
 - `POST /api/feed/v3` with `{cursor, limit, filters}` and `limit: 100`
   (`lib/api.js:149-153`, `:2331-2340`). A 5,500-clip library is ~55 pages, not 275.
-- **Completion is positive.** A walk is complete only on a null `next_cursor`
-  after at least one page (`lib/api.js:2414-2423`), and every other outcome carries
-  one of eight `stopReason` values. The full table is in
+  The page size is a SETTING (`settings.feedPageLimit`, options page → "Feed page
+  size", 1–100): 20 is what Suno's own site pages at, 100 is the server maximum
+  and ~5× fewer requests.
+- **Completion is the feed's own terminal signal, in either of its two verified
+  spellings.** A walk is complete when the envelope says "no more": a `next_cursor`
+  that is present and null, OR one that is **absent entirely** — which is the same
+  stop the shipped web client makes (`nextCursor: l.data?.next_cursor || null`
+  fed to `getNextPageParam`, recon `out/chunks/1r1sqgyc3uj2o.js`), and the shape
+  every walk on a live account ends on. The omission is published
+  (`cursorOmitted` + the envelope's key list on the summary), never swallowed, and
+  every other outcome — a failed page, a stuck cursor, a page that added nothing,
+  the page cap, a shortfall against a comparable count — still carries one of the
+  `stopReason` values. The full table is in
   [`ARCHITECTURE.md` § the state machine](ARCHITECTURE.md).
 - **`truncated` is now `!completed`** (`lib/api.js:2493`), not a `maxPages`-only
   flag, and it rides `SYNC_DONE`, `SYNC_ERROR`, `GET_BOOT.sync` and `SYNC_STATUS`.
@@ -897,6 +907,30 @@ A workspace whose `clipCount` is `null` — `default` forced into a plan whose
 project list arrived without a count (`background/background.js:5946-5948`) — gets
 `oracleApplied:false` and **no oracle at all**. It used to report
 `completed:true` with no check whatsoever.
+
+### 2026-10-08: the rule was restored in the worker, with ONE carve-out
+
+Between the table above and 2026-10-08, the worker quietly contradicted it twice:
+a workspace short of its `clip_count` failed **unconditionally**
+(`crawlWorkspace`'s shortfall block), and the run-level `!totalsMet` failed
+**every filtered sync** on any account that trashes or dislikes anything — the
+"permanent INCOMPLETE on a finished crawl" failure, reproduced. Both are now back
+on the §26 rule, with one carve-out each that keeps the historic guard whole:
+
+- **Row level:** a short workspace keeps `completed:true` only when its walk ended
+  on the feed's **own terminal signal** (`walkStopReason:'complete'` — an explicit
+  null cursor or end-of-feed by omission). A walk that broke and is also short
+  still fails, with its own reason leading.
+- **Run level:** a filtered run is failed by a shortfall only in the
+  **truncation shape**: every comparable workspace short, every walk ended on the
+  feed's own signal, and the gaps too large for the filter accounting
+  (`unexplainedShortfall`, reported as `suspected_truncation`). That is the exact
+  signature of a feed that lied about ending, and it stays fatal.
+
+The 10-20%-truncation scenario cannot slip through: such a crawl either has
+workspaces that did not end on their own signal (→ `everyWorkspaceCompleted` is
+false), or every walk "ended" while short everywhere by a wide margin (→ the
+carve-out fails it loudly).
 
 ### 🚨 The guarantee this gives up, stated as a loss
 

@@ -58,6 +58,19 @@ Four grades, per `lib/api.js:1074-1083`:
 > third-party extensions — **evidence-backed, not live-verified.** See
 > [`KNOWN-LIMITS.md`](KNOWN-LIMITS.md).
 
+> **2026-10-08 UPDATE — the v3 end-of-feed signal, now live-verified by
+> behaviour.** The shipped caller in `out/chunks/1r1sqgyc3uj2o.js:5` reads
+> `nextCursor: l.data?.next_cursor || null` and stops paging when
+> `getNextPageParam` returns that null — so **an ABSENT `next_cursor` is the same
+> terminal fact as a present-and-null one**, and the site's own clip browser
+> defaults to `limit: 20` (`useClipBrowser(…, T=20, …)`). A ~6,000-clip account
+> synced with `limit:100` ends EVERY workspace walk on exactly the omission
+> shape (mid-walk pages all carry the cursor; only the final partial page omits
+> it), and treats the omitted cursor as the end — matching the shipped client
+> byte for byte. `lib/api.js` now completes on both spellings and publishes
+> `cursorOmitted` + the envelope evidence; see KNOWN-LIMITS §26 for what that
+> does and does not claim.
+
 #### CONFIRMED LIVE, known refusal contract — 2
 
 | route | behaviour |

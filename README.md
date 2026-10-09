@@ -128,11 +128,17 @@ authenticated capture proving `clip_count` excludes trashed and disliked rows. �
 
 **"Up to date" is now unfalsifiable over an incomplete library — and "Incomplete"
 over a complete one.** There is no code path that produces either. A crawl is
-complete only when the server's own cursor says so, and every other outcome
-carries a named cause: a page failed, a page came
-back empty, the cursor repeated itself, a page added nothing new, the per-workspace
-page cap was hit, or Suno's clip count disagrees with what was found **where that
-count can be compared against an unfiltered walk**.
+complete only when the server's own cursor says so — a `next_cursor` that is
+present and null, **or one the envelope omits entirely**, which is the same stop
+Suno's own web client makes (`nextCursor: l.data?.next_cursor || null` fed to its
+page loop) and the shape every walk really ends on. An omitted cursor completes
+the walk **loudly**: `cursorOmitted` and the envelope's key list ride the summary,
+so a short walk that ended that way still fires the probe and still faces the
+clip-count oracle. Every other outcome carries a named cause: a page failed, a
+page came back empty while offering a cursor, the cursor repeated itself, a page
+added nothing new, the per-workspace page cap was hit, or Suno's clip count
+disagrees with what was found **where that count can be compared against an
+unfiltered walk**.
 
 The same rule covers the awkward cases people usually leave out:
 
@@ -211,9 +217,24 @@ press *Refresh token*. → [KNOWN-LIMITS §21, §23](docs/KNOWN-LIMITS.md)
 ## ⚡ 60-second start
 
 1. **Sync library** — popup → *Sync library*. Walks **every workspace** on
-   `POST /api/feed/v3`, following a server cursor 100 clips at a time, and writes
-   each page into IndexedDB as it lands. If a workspace fails, the others still
-   finish and the failed one is named.
+   `POST /api/feed/v3`, following a server cursor, and writes each page into
+   IndexedDB as it lands. If a workspace fails, the others still finish and the
+   failed one is named. The page size is the **Feed page size** setting
+   (options page, 1–100): 100 is the API maximum and means ~5× fewer requests
+   than Suno's own site default of 20.
+
+   Repeat syncs are **cached two ways**: the clip→workspace membership walk
+   (~200 requests on a 6,000-clip library) resumes from the last complete map and
+   stops once it re-sees only known pages, and a workspace whose last walk
+   completed, whose project row is unchanged, and in which the membership walk
+   found nothing new is served from its stored row instead of re-walked.
+
+   **Hold Shift, Alt, Cmd or Ctrl while clicking *Sync library* (or *Sync now*,
+   or the panel's *Sync*) for a FULL RE-SYNC**: every cache is ignored, every
+   page is re-walked, and the index is replaced atomically when the crawl
+   completes. That is the escape hatch whenever a cache is suspected stale —
+   a clip moved between workspaces, or un-trashed, is the one change the skip
+   gate cannot see.
 
    **Then read the two numbers next to the sync state.** They are the whole point
    of the honesty guarantee:
