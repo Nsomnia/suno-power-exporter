@@ -726,6 +726,105 @@ test('(b5) a resumed run that re-skips cached workspaces counts each row ONCE', 
 });
 
 /* ======================================================================== *
+ * (e) THE HAS_MORE CONTRADICTION — the renamed-cursor shape, caught live
+ * ======================================================================== */
+
+/**
+ * GUARDS: the `has_more` truncation guard in `iterateFeed` (lib/api.js).
+ *
+ * T1 captures (2026-09-24 corpus) and a second shipped implementation both
+ * say the same thing: every NON-final `POST /api/feed/v3` page carried a
+ * usable cursor AND `has_more:true`, and only the final page omitted the
+ * cursor. So a page carrying `has_more:true` with NO readable cursor is not
+ * an end-of-feed — it is the renamed-cursor failure the omission rule is
+ * armoured against, arriving in the one shape that used to defeat it: the
+ * walk would "complete" on that page and report a truncated library as
+ * complete, leaving the truth to a post-hoc shortfall probe.
+ *
+ * The fake's `HAS_MORE_CONTRADICTION` end-of-feed mode emits exactly that
+ * shape on every final page. The guard must refuse to complete on it.
+ */
+test('(e) a final page with has_more:true and NO cursor is a TRUNCATION, not an end', async (t) => {
+  const TOTAL_CLIPS = 120;
+  const PAGE_SIZE = 100;
+  const { server, db, chrome, worker } = await setup({
+    server: {
+      totalClips: TOTAL_CLIPS,
+      serverMaxPageSize: PAGE_SIZE,
+      endOfFeed: END_OF_FEED.HAS_MORE_CONTRADICTION,
+    },
+  });
+  t.after(() => worker.dispose());
+
+  const push = await runSync(worker);
+  const v = verdictOf(push);
+
+  assert.equal(push.type, 'SYNC_DONE', 'the run still reaches a verdict. ' + JSON.stringify(v));
+  assert.equal(v.completed, false,
+    'a page claiming has_more:true with no readable cursor must NOT complete the walk. ' + JSON.stringify(v));
+  assert.equal(v.stopReason, 'cursor_missing',
+    'the stop names the one thing that happened: the cursor was unreadable while the feed said more exists. '
+    + JSON.stringify(v));
+  assert.ok(String(v.error).indexOf('has_more') >= 0,
+    'the error sentence names has_more, so the renamed-field signature is diagnosable '
+    + 'from the verdict alone: ' + JSON.stringify(v));
+  /* The seeded settings walk at `feedPageLimit: 40`, so this 120-clip library
+   * is THREE pages, and every page that arrived COMMITTED before the final
+   * page's contradiction refused completion. The index holds all 120 clips
+   * while the verdict refuses to PROVE completeness — which is the entire
+   * point: "complete" is a claim about the FEED having no more, not about
+   * bytes on disk, and a page saying has_more:true is the feed contradicting
+   * that claim. */
+  assert.equal(db.clipIds().length, TOTAL_CLIPS,
+    'every page that arrived committed — the refusal is about proof, not bytes');
+});
+
+/* ======================================================================== *
+ * (f) NON-CLIP ROWS — type:"video" counted, not silently dropped
+ * ======================================================================== */
+
+/**
+ * GUARDS: the non-clip-row counter in `fetchProjectFeed` (lib/api.js).
+ *
+ * Real `/api/project/feed` pages carry `type:"video"` rows with NO `clip` key
+ * — proven on a live 162 KB capture, where the first two rows of a real page
+ * were exactly this shape. The walk used to drop them with a bare `continue`:
+ * no counter, no log, indistinguishable from "a feed that stopped early".
+ * Now they are counted and typed, published on the cursor's `projectFeed`
+ * record, and the walk still completes — a video row is not a clip and never
+ * was joinable, so its presence is an explanation the surfaces can show, not
+ * a failure of the join.
+ */
+test('(f) type:"video" rows are COUNTED, not silently dropped, and do not fail the join', async (t) => {
+  const TOTAL_CLIPS = 120;
+  const { server, db, chrome, worker } = await setup({
+    server: { totalClips: TOTAL_CLIPS, serverMaxPageSize: 100 },
+  });
+  /* The fake's `orphanItemOffset` injects one `type:'video'` row — a `video`
+   * object, no `clip` key — onto the project/feed page at that offset. It is
+   * the exact captured shape. */
+  server.orphanItemOffset = 0;
+  t.after(() => worker.dispose());
+
+  const push = await runSync(worker);
+  const v = verdictOf(push);
+
+  assert.equal(v.completed, true, 'a video row is not a join failure. ' + JSON.stringify(v));
+  assert.equal(v.totalSeen, TOTAL_CLIPS, 'every CLIP is still mapped. ' + JSON.stringify(v));
+  assert.equal(v.missing, 0, JSON.stringify(v));
+
+  const row = db.feedCursor();
+  const pf = row.projectFeed || {};
+  assert.equal(pf.nonClipRows, 1,
+    'the cursor record publishes the count so a surface can eventually say '
+    + '"N rows were videos, not clips". projectFeed: ' + JSON.stringify(pf));
+  assert.equal((pf.nonClipTypes || {}).video, 1,
+    'typed as video: ' + JSON.stringify(pf.nonClipTypes));
+  assert.deepEqual(db.clipIds(), server.expectedIds(),
+    'the video row is not in the index — it is not a clip, and the library is exactly the clips');
+});
+
+/* ======================================================================== *
  * (c) TRANSIENT FAILURES — a 429 and a dropped connection must not be fatal
  * ======================================================================== */
 

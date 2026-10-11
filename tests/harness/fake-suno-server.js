@@ -58,6 +58,13 @@ const END_OF_FEED = Object.freeze({
   EMPTY_CURSOR: 'empty-cursor', // next_cursor: null
   OMITTED_CURSOR: 'omitted-cursor', // no cursor field at all
   EMPTY_STRING: 'empty-string', // next_cursor: ''  (api.js:521 treats '' as unusable)
+  /* NOT a terminal signal — a CONTRADICTION. The final page omits the cursor
+   * (exactly like OMITTED_CURSOR) but carries `has_more:true`, the shape that
+   * T1 captures show on every NON-final page and that the `has_more` guard in
+   * `iterateFeed` exists to catch: before the guard, a walk against this shape
+   * "completed" on the final page and reported a truncated library as
+   * complete. The guard must refuse to complete on it. */
+  HAS_MORE_CONTRADICTION: 'has-more-contradiction',
 });
 
 /** Failure kinds this server can inject. */
@@ -735,6 +742,14 @@ function applyTerminalSignal(envelope, mode) {
       break;
     case END_OF_FEED.EMPTY_STRING:
       envelope.next_cursor = '';
+      break;
+    case END_OF_FEED.HAS_MORE_CONTRADICTION:
+      // No cursor field (same as OMITTED_CURSOR) AND the page says more exists.
+      // `has_more:true` beside the omission IS the entire contradiction — the
+      // renamed-cursor shape the `iterateFeed` guard exists to catch, where the
+      // pre-guard walk would have "completed" and reported a truncated library
+      // as complete.
+      envelope.has_more = true;
       break;
     case END_OF_FEED.EMPTY_CURSOR:
     default:

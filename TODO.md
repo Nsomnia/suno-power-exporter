@@ -6,6 +6,42 @@
 
 # Items To Complete
 
+- [ ] **[REFACTOR — P0 · TOP PRIORITY] The SIP refactor program.** Every JS
+  file in this project is a monolith — `background/background.js` ~11.4k lines,
+  `content/content.js` ~5.1k, `lib/api.js` ~4.4k, `popup/popup.js` ~3.4k,
+  `lib/db.js` ~2.9k, `side_panel.js` ~2.8k — and it is now the single largest
+  obstacle to both human and AGENT productivity: nobody can hold one part in
+  context without four thousand lines of unrelated code riding along, bugs live
+  in seams between sections that will never be read together, and the user
+  cannot begin to report problems beyond "this UI element does this".
+  Decompose into single-intent parts (SIP) so each file has one job, one reason
+  to change, and one thing to test.
+
+  PRIOR ATTEMPT, FOR THE RECORD: the remote branch `refact/monolith-destroyer`
+  was created for exactly this and never actually started — its tip was
+  byte-identical to the rewrite base (`f2e236e`), it contained zero unique
+  commits, and it was deleted in the 2026-10-10 branch cleanup with nothing
+  lost. The program starts fresh on `refactor/6.3.0-sip`.
+
+  PROOF THE PATTERN SHIPS: Suno Explorer 5.1.1 (≈2,000 store users, updated
+  2026-09-24) is built as 30+ single-intent `primitives/*` modules with
+  dependency-injected factories — `WavQueue.create({apiFetch, apiPost,
+  downloadFile, broadcastProgress})` — each unit-testable without Chrome. That
+  is the architecture this program prescribes, proven in a shipping competitor.
+
+  EXECUTION ORDER (the P1/P2/P3 items below are the parts list):
+  1. `[REFACTOR — P1]` decompose `background/background.js` (parts list below),
+  2. `[REFACTOR — P2]` the triplicated sync-dock core, then
+     `[REFACTOR — P2]` decompose `content/content.js`,
+  3. `[REFACTOR — P3]` decompose `lib/`.
+  THE GATE, non-negotiable: `npm run verify` (98 structural checks + the
+  15-test behavioural harness) must be green after EVERY extraction, one part
+  per commit, behaviour-preserving only. The harness is what makes this
+  refactor verifiable rather than another unverifiable rewrite — the exact
+  mistake that produced 20+ unverified fix iterations is to refactor without
+  it. Highest-value split first: the sync crawl / contract / heal / keepalive
+  quartet, whose stale-`error` bug lived in a seam 4,000 lines wide.
+
 - [ ] **[UI — P1] Sidebar stats should be clickable filter chips.** The sidebar's
   stats block currently reads as passive text:
   ```
@@ -38,6 +74,26 @@
     item below) means every surface must agree what "filtered" means — extract
     the shared filter-state core BEFORE adding a second consumer of it, or the
     sidebar will disagree with the popup the way the sync dock once did.
+  Capabilities the recon surfaced that this item should fold in:
+  - **A server-side `liked` filter exists on `POST /api/feed/v3`**
+    (T1-captured 2026-09-24: `filters.liked:"True"/"False"` in 23 real
+    requests). If verified (see the [API] checklist item), a liked-chip
+    download can ask the server for ONLY liked rows instead of walking
+    everything and filtering locally — the same string tri-state vocabulary
+    our `disliked` filter already uses, and self-verifying: response rows
+    carry `is_liked`.
+  - **Model labels**: Suno Explorer's mapping is worth adopting for chip
+    wording — `chirp-fenix → v5.5`, `chirp-crow|carp → v5`,
+    `chirp-ahi|auk|bluejay|bass → v4.5+`, `chirp-v4 → v4`, reading
+    `major_model_version` first with `metadata.model_badges` ("4.5" ⇒
+    `v4.5+`) as override.
+  - **Lineage/version-grouping fields** (if grouping is ever wanted): the
+    most complete parentage map in the corpus is Explorer's —
+    `parent_id`, `continue_clip_id`,
+    `metadata.{upsample,edited,source,concat,inpaint,cover,remix}_clip_id`,
+    `metadata.history[]`, `metadata.concat_history[]`,
+    `metadata.mashup_clip_ids[]`, `metadata.playlist_clip_ids[]`, plus
+    server-side `GET /api/clips/parent?clip_id=` for un-indexed parents.
 
 - [ ] **[UI — P1] Per-row download controls are nearly unusable.** Each row in
   the user's library view has two controls: a tri-state mark (blank → check →
@@ -62,7 +118,7 @@
     touching the DOM.
 
 - [ ] **[TESTING — P1] The download batch path is untested.** The sync crawl now
-  has a behavioural harness (`tests/`, 13/13); the download batch driver has
+  has a behavioural harness (`tests/`, 15/15); the download batch driver has
   nothing. Before adding the facet-filter work above, extend the harness to
   cover the batch: plan → DOWNLOAD_START → DL_PROGRESS/DL_ITEM pushes →
   DL_DONE for the four terminal outcomes (`complete`, `cancelled`, `quota`,
@@ -72,7 +128,76 @@
   must be pinned too — the popup's `reportQuotaShortfall` depends on its exact
   reply shape. The fake server already stubs media URLs; it needs a
   `downloads.onChanged` stub in `chrome-stub.js` to reconcile what the browser
-  "did".
+  "did". Pins the recon work says the harness must cover:
+  - **assertSaved-style byte check** (the sharpest pattern in the competitor
+    corpus): a download the browser reports `complete` with
+    `max(bytesReceived, fileSize) === 0` is ERASED and thrown as a failure —
+    pin "the browser said complete but nothing landed" as a testable outcome,
+    not a silent success.
+  - **The per-item job-record shape**: `results[id] ∈ {'run','ok','err','skip'}`
+    with `failures[]` and `current{phase}` persisted in storage so the panel
+    is a pure view and a mid-batch SW restart loses nothing — and `'skip'`
+    for quota-remainder rows so unattempted is never confused with failed
+    (the same distinction the sync quota work pinned).
+  - **The ladder against the live-verified flow** (suno-cli
+    `API_INTELLIGENCE.md`, refreshed 2026-09-28): authorize is
+    `POST /api/download/authorize {item_id, item_type:'clip'}` for locked
+    clips, then `GET /api/download/clip/{id}?format=` — the prepared URL is
+    short-lived and is re-PREPARED on expiry, never re-authorized; the studio
+    rung polls `processing → ready` and must treat `rate_limited` as a
+    first-class poll outcome; the WAV flow (`convert_wav` → `wav_file`
+    polling) is corroborated.
+  - **Entitlement cross-check**: suno-manager is built entirely around
+    `GET /api/billing/info/` now carrying
+    `download_usage.current_period_downloads_limit/used` and
+    `additional_download_remaining` — while our popup shows "∞ / no monthly
+    cap", which may be a stale entitlement picture. Verify our §15 quota
+    part reads these fields.
+  - **Cross-extension hazard** (diagnostics note): any other extension
+    registering `chrome.downloads.onDeterminingFilename` (suno-manager does)
+    silently renames files we download and can discard the `filename` we pass
+    to `downloads.download()` — if our filenames ever come out wrong for a
+    user running multiple Suno extensions, this is suspect #1.
+
+- [ ] **[API — P1] Capture-verification checklist — four one-shot captures that
+  unlock real features.** Each is a single authenticated request on our own
+  account, self-verifying from its own response, promoted to CONFIRMED LIVE in
+  `lib/api.js`'s route table on success (the repo's evidence-grade discipline:
+  401/405/422 prove existence, never a body):
+  1. `POST /api/feed/v3` with `filters.liked:'True'` — assert every returned
+     row has `is_liked === true` (unlocks the liked-chip server-side download;
+     see the chips item). Composes with `disliked`; counts must be stable
+     across pages.
+  2. `GET /api/session/` — read `user.total_clips` and compare against our
+     summed per-project `clip_count` oracle; a disagreement diagnoses the
+     shared-clip double-count / filtered-lower-bound problem KNOWN-LIMITS
+     §27-28 documents. Note: our standing bias against `/api/session/`
+     applies to its stale `models[]`, not to the user object.
+  3. `GET /api/gen/{id}/aligned_lyrics/v2/` (v2 spelling, T1 shape
+     `aligned_words[] {word,start_s,end_s}`) vs our registered v3 spelling —
+     then add `aligned_words` to `LINE_CONTAINER_KEYS` (lib/lyrics.js:286)
+     so a v2-shaped body parses. v2 ≠ v3 — do not alias the spellings.
+  4. `GET /api/clips/get_songs_by_ids` — settle the request spelling: our CSV
+     `?ids=a,b` vs the manifest's repeated `?ids=a&ids=b`. One call each
+     settles which the server accepts.
+
+- [ ] **[SYNC — P2] Cheap no-op syncs and leaner ingest.** Our most common sync
+  ("nothing changed") still pays the full plan: `/api/project/me` plus the
+  membership walk (~216 pages on a 6,287-clip library) before it can prove
+  idleness. Two competitor-proven tricks to adopt:
+  - **3-consecutive-all-known-pages early stop** (Suno Explorer): the feed is
+    newest-first, so "nothing new" is provable in ≤3 requests. Our
+    `fetchProjectFeed` already has the machinery (`knownIds` +
+    `stopAfterKnownPages`); the FEED phase lacks the same rule — add it so an
+    unchanged library syncs in a handful of requests. Keep the completeness
+    oracle honest: the early stop must still count as "walked what exists"
+    only when the stop rule genuinely proves it.
+  - **Server-side stem/studio filters** on `POST /api/feed/v3`: our filter
+    object already carries `fromStudioProject:{presence:'False'}` and
+    `stem:{presence:'False'}` — verify they are actually being sent and
+    accepted, so the walk does not ingest rows the defaults then drop. Bounded
+    by the same caveat as the disliked filter: whatever the filters hide,
+    the oracle must account for (KNOWN-LIMITS §27).
 
 - [ ] **[PERF — P2] Search works but should get a local query/index layer.**
   Search is functional and not painfully slow today, but every query round-trips
@@ -86,25 +211,6 @@
   extension's — do not chase it as part of this item; the 401 cluster is
   suno.com's page session expiring, which the extension's MAIN-world token tap
   handles independently.
-
-- [ ] **[REFACTOR — P0] The SIP refactor program.** Every JS file in this
-  project is a monolith — `background/background.js` ~11.3k lines,
-  `content/content.js` ~5.1k, `popup/popup.js` ~3.4k, `lib/api.js` ~4.4k,
-  `lib/db.js` ~2.9k, `side_panel.js` ~2.8k — which has produced exactly the
-  failure mode the user describes: feature creep to the max, bugs that live in
-  the seam between 4,000 lines of unrelated code, and users who cannot begin
-  to report problems beyond "this UI element does this". This item is the
-  program header; the P1/P2/P3 items below are its execution order:
-  1. `[REFACTOR — P1]` decompose `background/background.js` (parts list below),
-  2. `[REFACTOR — P2]` the triplicated sync-dock core, then
-     `[REFACTOR — P2]` decompose `content/content.js`,
-  3. `[REFACTOR — P3]` decompose `lib/`.
-  THE GATE, non-negotiable: `npm run verify` (98 structural checks + the
-  13-test behavioural harness) must be green after EVERY extraction, one part
-  per commit, behaviour-preserving only. The harness is what makes this
-  refactor verifiable rather than another unverifiable rewrite — the exact
-  mistake that produced 20+ unverified fix iterations is to refactor without
-  it.
 
 - [ ] **[REFACTOR — P2] Triplicate sync-dock logic across three surfaces.** The same
   sync state machine is hand-written three times: `content/content.js` (the in-page
@@ -331,15 +437,30 @@ fake Suno server with opaque cursors:
 
 **STILL OPEN — smaller, each separable:**
 
-- [ ] **`syncLiveness`'s false positive still exists.** The caller guards close
-  the poisoning, and the wake path now auto-resumes, but any FUTURE reader of
-  `syncLiveness` inherits it: a stall that commits no page for >90 s reads as
-  dead even though the worker is alive. Fixing the rule (e.g. honouring the run
-  record's heartbeat, which the alarm DOES refresh) removes the class rather
-  than the instance.
-- [ ] **`/api/project/feed` `type:"video"` rows are dropped silently** — no
-  `clip` key, and `lib/api.js` discards them with a bare `continue`, so they are
-  indistinguishable from "a feed that stopped early". Count and surface them.
+- [x] **`syncLiveness`'s false positive is FIXED.** The rule now honours BOTH
+  clocks: `cursor.heartbeatAt` ("a page landed") and the run record's
+  `heartbeatAt` ("the alarm saw the worker alive" — `SYNC_RUN` refreshes it
+  every ~30 s for exactly as long as the run lives). A row is stale only when
+  the FRESHEST evidence from either clock is older than `SYNC_STALE_MS`, so a
+  rate-limit backoff no longer reads as death; a genuinely dead worker stops
+  both clocks and is still caught inside the same 90 s. All four read paths
+  (cancelSync, the wake healer, SYNC_STATUS, GET_BOOT) pass the run record,
+  and the heal sentence reports the page clock (`pageAgeMs`) so it never lies
+  about which clock it read. This removes the class, not the instance: any
+  future reader of `syncLiveness` inherits the honest rule.
+- [x] **`/api/project/feed` `type:"video"` rows are COUNTED, not dropped.**
+  `fetchProjectFeed` counts them by `type` (`nonClipRows` / `nonClipTypes`),
+  publishes both on the summary and the cursor's `projectFeed` record, and the
+  worker logs them — so a short-looking workspace is explainable instead of
+  indistinguishable from "a feed that stopped early". Verified by harness
+  test (f).
+- [x] **NEW — the `has_more` truncation guard.** T1 captures show every
+  non-final v3 page carried BOTH a usable cursor and `has_more:true`, and only
+  the final page omitted the cursor; a second shipped implementation keys its
+  walk on `has_more` too. A page with `has_more:true` and no readable cursor
+  is therefore the renamed-cursor shape, and the walk now REFUSES to complete
+  on it (`stopReason:'cursor_missing'`, the walk detail naming has_more in the
+  verdict sentence). Verified by harness test (e).
 - [ ] **Resume is workspace-granular, not cursor-granular.** `iterateFeed`
   accepts and ignores `startCursor`/`startPage` even though the worker records
   `cursor.cursors[projectId]` at each workspace end, so the IN-FLIGHT workspace

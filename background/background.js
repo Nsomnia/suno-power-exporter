@@ -7265,6 +7265,15 @@ async function runSync(opts) {
       incremental: result.incremental === true,
       newIds: Number.isFinite(result.newIds) ? result.newIds : 0,
       cachedAt: membershipCacheAt,
+      /* Rows the membership walk dropped for carrying no `clip` key — the
+       * `type:'video'` shape proven on a live 162 KB capture, previously
+       * invisible. Published as data so a short-looking workspace can be told
+       * apart from a walk that lost rows, and so a surface can eventually say
+       * "N rows were videos, not clips" instead of showing a silent gap. */
+      nonClipRows: Number.isFinite(result.nonClipRows) ? result.nonClipRows : 0,
+      nonClipTypes: result.nonClipTypes && typeof result.nonClipTypes === 'object'
+        ? result.nonClipTypes
+        : {},
       /* THE BUDGET THIS PHASE RAN UNDER, published as DATA. Three reasons, all
        * load-bearing:
        *   1. `stopReason` is now `MEMBERSHIP_BUDGET_STOP_REASON` when the budget
@@ -7293,6 +7302,17 @@ async function runSync(opts) {
         joined: membershipsAll.size,
       });
     }
+    /* Rows the walk could not map because they are not clips — videos,
+     * uploads, malformed entries — are now counted by the walk itself. Logged
+     * here so a workspace that looks short carries an explanation that is not
+     * "rows were lost": the join is exactly as complete as the feed allows. */
+    if (Number.isFinite(result.nonClipRows) && result.nonClipRows > 0) {
+      log('info', 'sync.project_feed_non_clip_rows', {
+        nonClipRows: result.nonClipRows,
+        types: result.nonClipTypes || null,
+        joined: membershipsAll.size,
+      });
+    }
     if (!result.completed) {
       log('warn', 'sync.project_feed_incomplete', {
         stopReason: projectFeed.stopReason,
@@ -7301,6 +7321,7 @@ async function runSync(opts) {
         maxPages: projectFeed.maxPages,
         budgetDerived: projectFeed.budgetDerived,
         neededPages: projectFeed.budgetNeededPages,
+        nonClipRows: projectFeed.nonClipRows || 0,
         /* THE ONE LINE THAT SEPARATES "ATTRIBUTION INCOMPLETE" FROM
          * "LIBRARY INCOMPLETE", and it is worth being unable to confuse them.
          * A membership budget stop leaves every indexed clip on disk and
@@ -8176,9 +8197,17 @@ async function runSync(opts) {
          * walk stopped where it could not read the next page. */
         const missed = workspaces.find((row) => row.walkStopReason === 'cursor_missing');
         stopReason = 'cursor_missing';
+        /* The row's own `error` carries the walk's diagnosis, and when the
+         * `has_more` guard refused the completion it names the contradiction —
+         * the page SAID more clips exist while omitting the cursor, which is
+         * the renamed-field signature. Appending it lets one read of the
+         * verdict tell "the field was renamed and the feed still has more"
+         * apart from "the field is absent and the feed is silent", before
+         * anybody runs PROBE_FEED. */
         error = `workspace ${missed ? missed.projectId : '(unknown)'} stopped: the feed response carried no `
           + 'cursor field this client recognises, so the walk could not be continued and the library '
-          + 'cannot be proven indexed. Run PROBE_FEED to see what the envelope actually calls it';
+          + 'cannot be proven indexed. Run PROBE_FEED to see what the envelope actually calls it'
+          + (missed && missed.error ? ` (walk detail: ${missed.error})` : '');
       } else if (failed.length) {
         stopReason = failed[0].stopReason || 'page_failed';
         error = `workspace ${failed[0].projectId} (${failed[0].name}) stopped: ${failed[0].stopReason}`
@@ -8539,29 +8568,71 @@ const SYNC_WALL_CLOCK_MS = 45 * 60 * 1000;
  * @returns {{live:boolean, stale:boolean, heartbeatAt:number, ageMs:number|null,
  *   reason:string|null}}
  */
-function syncLiveness(cursor) {
+function syncLiveness(cursor, run) {
   const row = cursor && typeof cursor === 'object' ? cursor : null;
   const claimsRunning = !!row && row.state === 'running';
   const at = row ? Number(row.heartbeatAt) : NaN;
-  const ageMs = Number.isFinite(at) && at > 0 ? Math.max(0, Date.now() - at) : null;
+  const hasPageBeat = Number.isFinite(at) && at > 0;
+  /* THE RUN RECORD IS LIVENESS EVIDENCE TOO, AND IT IS THE ONE THE ALARM
+   * KEEPS FRESH. `cursor.heartbeatAt` means "a page committed", and it is
+   * written only by a page commit or a phase report — so a crawl parked in a
+   * long rate-limit backoff commits nothing and its cursor heartbeat goes
+   * stale WHILE THE WORKER IS PROVABLY ALIVE: the `SYNC_RUN` alarm fires every
+   * ~30 s for exactly as long as the run lives and refreshes
+   * `run.heartbeatAt` on purpose (§13d). The original rule read only the page
+   * clock, which is how one poll during a backoff could declare a running
+   * crawl dead. The rule is now: stale only when the FRESHEST evidence from
+   * EITHER clock is older than `SYNC_STALE_MS`. A live worker keeps its alarm
+   * heartbeat fresh, so a backoff no longer reads as death; a genuinely dead
+   * worker stops both clocks, so an eviction is still caught inside the same
+   * 90 s.
+   *
+   * `heartbeatAt` in the RESULT stays the cursor's own page clock — the healed
+   * row publishes it, and "no page for Ns" is a claim about pages. The caller
+   * gets both clocks separately (`pageAgeMs`, `runHeartbeatAt`) plus the
+   * `ageMs` the decision was actually made on, so no sentence has to lie
+   * about which clock it read. */
+  const runRow = run && typeof run === 'object' ? run : null;
+  const runAt = runRow && runRow.running === true
+    && Number.isFinite(Number(runRow.heartbeatAt)) && Number(runRow.heartbeatAt) > 0
+    ? Number(runRow.heartbeatAt)
+    : null;
+  const freshestAt = runAt !== null && (!hasPageBeat || runAt > at) ? runAt : (hasPageBeat ? at : null);
+  const ageMs = freshestAt !== null ? Math.max(0, Date.now() - freshestAt) : null;
+  const pageAgeMs = hasPageBeat ? Math.max(0, Date.now() - at) : null;
   if (!claimsRunning) {
-    return { live: false, stale: false, heartbeatAt: Number.isFinite(at) ? at : 0, ageMs, reason: null };
+    return {
+      live: false, stale: false, heartbeatAt: hasPageBeat ? at : 0,
+      ageMs, pageAgeMs, runHeartbeatAt: runAt, reason: null,
+    };
   }
-  // No heartbeat at all means the row predates this field, or the worker died
-  // before its first page landed. Either way it cannot be shown as live.
+  // No heartbeat at all — on EITHER clock — means the row predates these
+  // fields, or the worker died before its first page landed and before a
+  // single alarm tick. Either way it cannot be shown as live.
   if (ageMs === null) {
-    return { live: false, stale: true, heartbeatAt: 0, ageMs: null, reason: 'the crawl never reported a page' };
+    return {
+      live: false, stale: true, heartbeatAt: 0, ageMs: null,
+      pageAgeMs, runHeartbeatAt: runAt, reason: 'the crawl never reported a page',
+    };
   }
   if (ageMs > SYNC_STALE_MS) {
     return {
       live: false,
       stale: true,
-      heartbeatAt: at,
+      heartbeatAt: hasPageBeat ? at : 0,
       ageMs,
-      reason: 'no page was committed for ' + Math.round(ageMs / 1000) + 's, so the crawl is not running any more',
+      pageAgeMs,
+      runHeartbeatAt: runAt,
+      reason: 'no page was committed for '
+        + (pageAgeMs === null ? '—' : Math.round(pageAgeMs / 1000) + 's')
+        + (runAt !== null ? ' and no worker heartbeat for ' + Math.round(ageMs / 1000) + 's' : '')
+        + ', so the crawl is not running any more',
     };
   }
-  return { live: true, stale: false, heartbeatAt: at, ageMs, reason: null };
+  return {
+    live: true, stale: false, heartbeatAt: hasPageBeat ? at : 0,
+    ageMs, pageAgeMs, runHeartbeatAt: runAt, reason: null,
+  };
 }
 
 /**
@@ -8619,7 +8690,11 @@ async function reconcileStaleCursor(row, live) {
     // is owned by the verdict and cleared by it, so a healed row stays recoverable:
     // the next run's verdict overwrites it whether that run succeeds or fails.
     lastError: 'the extension worker was stopped mid-crawl'
-      + (live.ageMs !== null ? ' (no page for ' + Math.round(live.ageMs / 1000) + 's)' : '')
+      /* `pageAgeMs`, NOT `ageMs`: the sentence is a claim about PAGES, and the
+       * decision's `ageMs` may have been measured off the alarm clock — which
+       * is exactly what keeps this heal from firing on a live backoff, but
+       * would make the sentence lie about which clock it read. */
+      + (live.pageAgeMs !== null ? ' (no page for ' + Math.round(live.pageAgeMs / 1000) + 's)' : '')
       + ' — press Sync to resume; indexed clips are kept',
     completed: false,
     truncated: true,
@@ -8736,7 +8811,11 @@ async function reportSyncPhase(phase, detail, ctx) {
  */
 async function cancelSync() {
   const stored = await DB.syncState.get('feed', null).catch(() => null);
-  const live = syncLiveness(stored);
+  /* The run record is liveness evidence too (see `syncLiveness`): a crawl
+   * parked in a rate-limit backoff has a stale page clock but a live alarm
+   * heartbeat, and a Stop press must not mistake that for an orphan. */
+  const runRecord = await readSyncRun().catch(() => null);
+  const live = syncLiveness(stored, runRecord);
 
   // An orphaned cursor: the worker that owned the crawl is gone, so there is
   // nothing to abort, but the UI still shows "Syncing" and a Stop button that
@@ -9167,7 +9246,10 @@ async function reconcileSyncRunOnWake(cursor, run, verdict) {
    * was asked for and then lost with the worker is neither "the user cancelled"
    * nor "the crawl broke", and reporting it as the latter would send the user
    * off to debug a fault they did not cause. */
-  const live = syncLiveness(fresh);
+  /* `run` was read by the caller and passed in — the same snapshot the verdict
+   * was judged from, so the liveness rule and the eviction verdict cannot
+   * disagree about which clocks they read. */
+  const live = syncLiveness(fresh, run);
   const afterCancel = cancelRequestedWording(verdict, fresh);
   const noPageFor = verdict.ageMs !== null ? ' (no page for ' + Math.round(verdict.ageMs / 1000) + 's)' : '';
   /* THE AUTO-RESUME DECISION'S INPUTS, read off the row BEFORE the heal is
@@ -10290,8 +10372,12 @@ const ROUTES = {
        * eviction used to show a permanent "Syncing" with a Stop button that
        * reported "no library sync is running" — the durable row claimed a run
        * that the (now absent) controller no longer owned. Reconciling on read
-       * means the first paint after an eviction is already truthful. */
-      const live = syncLiveness(storedCursor);
+       * means the first paint after an eviction is already truthful. The run
+       * record is read alongside it because it is liveness evidence too (see
+       * `syncLiveness`): a poll during a rate-limit backoff must see the
+       * alarm's heartbeat, not just the stale page clock. */
+      const runRecord = await readSyncRun().catch(() => null);
+      const live = syncLiveness(storedCursor, runRecord);
       // `!syncController` is checked HERE as well as inside `reconcileStaleCursor`.
       // Opening the popup is enough to trigger the heal, and this is the read every
       // surface performs first, so the guard that matters most is the one a reader
@@ -10591,8 +10677,12 @@ const ROUTES = {
        * The wake-time reconciliation in §13c normally gets there first and emits
        * the terminal push; this is the second line of defence for the cases it
        * cannot judge yet (a cursor-only orphan inside the 90-second grace) and
-       * for a surface that polls while no wake ever happens. */
-      const live = syncLiveness(stored);
+       * for a surface that polls while no wake ever happens. The run record is
+       * read alongside it — it is liveness evidence too (see `syncLiveness`):
+       * this handler runs on every poll, and a poll during a rate-limit
+       * backoff must see the alarm's heartbeat before it may call a row stale. */
+      const runRecord = await readSyncRun().catch(() => null);
+      const live = syncLiveness(stored, runRecord);
       // `!syncController`, the same guard `GET_BOOT` applies and for the same
       // reason: this handler runs on EVERY poll of every open surface, so a poll
       // landing during a rate-limit backoff used to be enough to write
