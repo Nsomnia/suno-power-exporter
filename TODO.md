@@ -34,13 +34,23 @@
   2. `[REFACTOR — P2]` the triplicated sync-dock core, then
      `[REFACTOR — P2]` decompose `content/content.js`,
   3. `[REFACTOR — P3]` decompose `lib/`.
-  THE GATE, non-negotiable: `npm run verify` (98 structural checks + the
+  The gate, non-negotiable: `npm run verify` (structural checks + the
   15-test behavioural harness) must be green after EVERY extraction, one part
   per commit, behaviour-preserving only. The harness is what makes this
   refactor verifiable rather than another unverifiable rewrite — the exact
   mistake that produced 20+ unverified fix iterations is to refactor without
-  it. Highest-value split first: the sync crawl / contract / heal / keepalive
-  quartet, whose stale-`error` bug lived in a seam 4,000 lines wide.
+  it. Highest-value split next: the sync crawl / contract / heal / keepalive
+  quartet (11/11b/11c/11d), whose stale-`error` bug lived in a seam 4,000
+  lines wide.
+
+  PROGRESS: ✔ `04-settings` extracted (commit ef49673) — the pattern is
+  proven: verbatim move, load-time constants move WITH their owning section,
+  everything else call-time; check-build grew to 101 checks (the part
+  registers itself in BUILD_FILES, its MISSING_PARTS probe passes, and the
+  no-shadowing collision guard passes); the harness runs the extracted part
+  through its importScripts shim unchanged. NEXT: 07-offscreen, 09-save,
+  then the sync quartet (11/11b/11c/11d), then 05-auth / 10-ladder / 12-batch,
+  then 16-router / 17-lifecycle last (they touch everything).
 
 - [ ] **[UI — P1] Sidebar stats should be clickable filter chips.** The sidebar's
   stats block currently reads as passive text:
