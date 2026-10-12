@@ -61,6 +61,7 @@ lib/suno.js
 background/background.js
 background/parts/02-diagnostics.js
 background/parts/03-errors.js
+background/parts/04-settings.js
 background/parts/06-messaging.js
 background/parts/08-filenames.js
 background/parts/14-query.js
