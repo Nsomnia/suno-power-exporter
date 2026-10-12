@@ -67,6 +67,7 @@ background/parts/07-offscreen.js
 background/parts/08-filenames.js
 background/parts/09-save.js
 background/parts/10-ladder.js
+background/parts/11-tagging.js
 background/parts/14-query.js
 background/parts/15-quota.js
 content/content.js
